@@ -15,20 +15,20 @@ All paths must be absolute.
 
 | Option | Description |
 | --- | --- |
-| `--prepare` | Validate the configuration and prepare iptables bypass anchors before the daemon starts. |
+| `--prepare` | Validate the configuration and prepare iptables bypass marker chains before the daemon starts. |
 | `--start` | Start the netlink monitor and initial synchronization. |
-| `--config FILE` | Version 2 JSON configuration. |
+| `--config FILE` | Version 3 JSON configuration. |
 | `--pid FILE` | PID file maintained by the caller and daemon. Required by `--start`. |
 | `--log FILE` | Append-only daemon log. Required by `--start`. |
 
 Exit status is `0` on success, `64` for invalid command-line arguments, and `1` for configuration or runtime failure.
 
-## Configuration version 2
+## Configuration version 3
 
 ```json
 {
-  "version": 2,
-  "mode": "tun",
+  "version": 3,
+  "mode": "tproxy",
   "enableIpv6": true,
   "disableSystemIpv6": false,
   "readyPath": "/data/local/tmp/example/asteriskd.ready",
@@ -38,16 +38,17 @@ Exit status is `0` on success, `64` for invalid command-line arguments, and `1` 
   "virtualInterfaces": ["tun0"],
   "hotspotInterfacePrefixes": ["wlan+"],
   "ipv4Bypass": {
-    "anchorChain": "ASTERISKD_LOCAL4",
-    "slotAChain": "ASTERISKD_LOCAL4_A",
-    "slotBChain": "ASTERISKD_LOCAL4_B"
+    "beginChain": "ASTERISKD_LOCAL4_BEGIN",
+    "endChain": "ASTERISKD_LOCAL4_END",
+    "consumerChains": ["ASTERISK_TPROXY_PREROUTING", "ASTERISK_TPROXY_OUTPUT"]
   },
   "ipv6Bypass": {
-    "anchorChain": "ASTERISKD_LOCAL6",
-    "slotAChain": "ASTERISKD_LOCAL6_A",
-    "slotBChain": "ASTERISKD_LOCAL6_B"
+    "beginChain": "ASTERISKD_LOCAL6_BEGIN",
+    "endChain": "ASTERISKD_LOCAL6_END",
+    "consumerChains": ["ASTERISK_TPROXY6_PREROUTING", "ASTERISK_TPROXY6_OUTPUT"]
   },
   "bpfLocalMaps": null,
+  "bpf2socksTc": null,
   "emergencyProcesses": [
     {
       "pidPath": "/data/local/tmp/example/proxy.pid",
@@ -59,7 +60,7 @@ Exit status is `0` on success, `64` for invalid command-line arguments, and `1` 
 
 | Field | Required | Description |
 | --- | --- | --- |
-| `version` | yes | Must be `2`. |
+| `version` | yes | Must be `3`. |
 | `mode` | yes | `tproxy`, `tun`, `tun2socks`, or `bpf2socks`. |
 | `enableIpv6` | yes | Synchronize IPv6 addresses and IPv6 bypass state. |
 | `disableSystemIpv6` | yes | Temporarily disable system IPv6 interfaces and restore their previous values on exit. |
@@ -72,9 +73,10 @@ Exit status is `0` on success, `64` for invalid command-line arguments, and `1` 
 | `ipv4Bypass` | yes | Bypass-chain object or `null`. Required and non-null outside `bpf2socks` mode. |
 | `ipv6Bypass` | yes | Bypass-chain object or `null`. Required and non-null when IPv6 is enabled outside `bpf2socks` mode. |
 | `bpfLocalMaps` | yes | Pinned-map object or `null`. Required and non-null in `bpf2socks` mode. |
+| `bpf2socksTc` | yes | TC attachment object or `null`. Required and non-null in `bpf2socks` mode. |
 | `emergencyProcesses` | yes | Zero to eight validated fallback processes. Use `[]` to disable emergency process termination. |
 
-A bypass object contains `anchorChain`, `slotAChain`, and `slotBChain`. Chain names accept uppercase ASCII letters, digits, `_`, and `-`, and must fit the kernel/iptables name limit used by the daemon.
+A bypass object contains `beginChain`, `endChain`, and one to four `consumerChains`. The App places adjacent jumps to the empty marker chains in each consumer. The daemon owns only the direct host-destination `RETURN` rules between those markers. Chain names accept uppercase ASCII letters, digits, `_`, and `-`, and must fit the kernel/iptables name limit used by the daemon.
 
 A BPF map object contains an absolute `ipv4Path` and either an absolute `ipv6Path` or `null`:
 

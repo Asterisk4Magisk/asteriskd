@@ -42,8 +42,6 @@ void asteriskd_state_init(
     const char *log_path,
     const char *ready_path) {
     memset(state, 0, sizeof(*state));
-    state->active_ipv4_slot = 0;
-    state->active_ipv6_slot = 0;
     if (pid_path != NULL) (void)snprintf(state->pid_path, sizeof(state->pid_path), "%s", pid_path);
     if (log_path != NULL) (void)snprintf(state->log_path, sizeof(state->log_path), "%s", log_path);
     if (ready_path != NULL) (void)snprintf(state->ready_path, sizeof(state->ready_path), "%s", ready_path);

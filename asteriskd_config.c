@@ -131,6 +131,29 @@ static bool json_string_array(
     return true;
 }
 
+static bool json_chain_array(
+    const char *json,
+    const char *key,
+    char values[][ASTERISKD_MAX_CHAIN_NAME],
+    size_t *count) {
+    const char *value = json_value(json, key);
+    if (value == NULL || *value != '[') return false;
+    *count = 0U;
+    value = skip_space(value + 1);
+    while (*value != ']') {
+        if (*count >= ASTERISKD_MAX_BYPASS_CONSUMERS ||
+            !parse_string(value, values[*count], ASTERISKD_MAX_CHAIN_NAME, &value)) {
+            return false;
+        }
+        ++*count;
+        value = skip_space(value);
+        if (*value == ']') break;
+        if (*value != ',') return false;
+        value = skip_space(value + 1);
+    }
+    return true;
+}
+
 static char *find_object_end(char *value) {
     if (value == NULL || *value != '{') return NULL;
     size_t depth = 0U;
@@ -220,13 +243,28 @@ static bool parse_bypass(const char *json, const char *key, struct asteriskd_byp
     if (strncmp(value, "null", 4U) == 0) return true;
     if (*value != '{') return false;
     target->enabled =
-        json_string(value, "anchorChain", target->anchor_chain, sizeof(target->anchor_chain)) &&
-        json_string(value, "slotAChain", target->slot_a_chain, sizeof(target->slot_a_chain)) &&
-        json_string(value, "slotBChain", target->slot_b_chain, sizeof(target->slot_b_chain));
-    return target->enabled &&
-        is_valid_chain_name(target->anchor_chain) &&
-        is_valid_chain_name(target->slot_a_chain) &&
-        is_valid_chain_name(target->slot_b_chain);
+        json_string(value, "beginChain", target->begin_chain, sizeof(target->begin_chain)) &&
+        json_string(value, "endChain", target->end_chain, sizeof(target->end_chain)) &&
+        json_chain_array(value, "consumerChains", target->consumer_chains, &target->consumer_chain_count);
+    if (!target->enabled ||
+        !is_valid_chain_name(target->begin_chain) ||
+        !is_valid_chain_name(target->end_chain) ||
+        strcmp(target->begin_chain, target->end_chain) == 0 ||
+        target->consumer_chain_count == 0U) {
+        return false;
+    }
+    for (size_t index = 0U; index < target->consumer_chain_count; ++index) {
+        const char *chain = target->consumer_chains[index];
+        if (!is_valid_chain_name(chain) ||
+            strcmp(chain, target->begin_chain) == 0 ||
+            strcmp(chain, target->end_chain) == 0) {
+            return false;
+        }
+        for (size_t previous = 0U; previous < index; ++previous) {
+            if (strcmp(chain, target->consumer_chains[previous]) == 0) return false;
+        }
+    }
+    return true;
 }
 
 static bool parse_bpf_maps(const char *json, struct asteriskd_bpf_local_maps *maps) {

@@ -9,11 +9,12 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#define ASTERISKD_CONFIG_VERSION 2U
+#define ASTERISKD_CONFIG_VERSION 3U
 #define ASTERISKD_MAX_PATH 4096U
 #define ASTERISKD_MAX_EMERGENCY_PROCESSES 8U
 #define ASTERISKD_MAX_COMMAND_MARKER 256U
 #define ASTERISKD_MAX_INTERFACES 64U
+#define ASTERISKD_MAX_BYPASS_CONSUMERS 4U
 #define ASTERISKD_MAX_INTERFACE_NAME 64U
 #define ASTERISKD_MAX_ADDRESSES 256U
 #define ASTERISKD_MAX_CHAIN_NAME 29U
@@ -31,9 +32,10 @@ enum asteriskd_mode {
 
 struct asteriskd_bypass_target {
     bool enabled;
-    char anchor_chain[ASTERISKD_MAX_CHAIN_NAME];
-    char slot_a_chain[ASTERISKD_MAX_CHAIN_NAME];
-    char slot_b_chain[ASTERISKD_MAX_CHAIN_NAME];
+    char begin_chain[ASTERISKD_MAX_CHAIN_NAME];
+    char end_chain[ASTERISKD_MAX_CHAIN_NAME];
+    char consumer_chains[ASTERISKD_MAX_BYPASS_CONSUMERS][ASTERISKD_MAX_CHAIN_NAME];
+    size_t consumer_chain_count;
 };
 
 struct asteriskd_bpf_local_maps {
@@ -123,8 +125,6 @@ struct asteriskd_state {
     size_t ipv6_entry_count;
     struct asteriskd_route_localnet_state_entry route_localnet_entries[ASTERISKD_MAX_INTERFACES];
     size_t route_localnet_entry_count;
-    int active_ipv4_slot;
-    int active_ipv6_slot;
     struct asteriskd_address_set synchronized_ipv4_addresses;
     struct asteriskd_address_set synchronized_ipv6_addresses;
     bool has_synchronized_addresses;
@@ -163,11 +163,17 @@ _Noreturn void asteriskd_fail_stop(const struct asteriskd_config *config, struct
 
 int asteriskd_collect_local_addresses(const struct asteriskd_config *config, int family, struct asteriskd_address_set *out);
 int asteriskd_prepare_iptables_bypass(const struct asteriskd_config *config);
-int asteriskd_replace_iptables_bypass(
+int asteriskd_parse_iptables_bypass(
+    const struct asteriskd_bypass_target *target,
+    const char *consumer_chain,
+    int family,
+    const char *rules,
+    struct asteriskd_address_set *addresses,
+    size_t *end_rule_number);
+int asteriskd_reconcile_iptables_bypass(
     const struct asteriskd_bypass_target *target,
     int family,
-    const struct asteriskd_address_set *addresses,
-    int *active_slot);
+    const struct asteriskd_address_set *addresses);
 int asteriskd_replace_lpm4_map(const char *pin_path, const struct asteriskd_address_set *addresses);
 int asteriskd_replace_lpm6_map(const char *pin_path, const struct asteriskd_address_set *addresses);
 int asteriskd_clear_hotspot_ipv6_tc_offload(const struct asteriskd_config *config);
