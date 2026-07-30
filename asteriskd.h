@@ -42,6 +42,15 @@ struct asteriskd_bpf_local_maps {
     char ipv6_path[ASTERISKD_MAX_PATH];
 };
 
+struct asteriskd_bpf2socks_tc {
+    bool enabled;
+    char ingress_path[ASTERISKD_MAX_PATH];
+    char egress_path[ASTERISKD_MAX_PATH];
+    char state_path[ASTERISKD_MAX_PATH];
+    uint32_t preference;
+    uint32_t handle;
+};
+
 struct asteriskd_emergency_process {
     char pid_path[ASTERISKD_MAX_PATH];
     char command_marker[ASTERISKD_MAX_COMMAND_MARKER];
@@ -66,6 +75,7 @@ struct asteriskd_config {
     struct asteriskd_bypass_target ipv4_bypass;
     struct asteriskd_bypass_target ipv6_bypass;
     struct asteriskd_bpf_local_maps bpf_local_maps;
+    struct asteriskd_bpf2socks_tc bpf2socks_tc;
 };
 
 struct asteriskd_address_set {
@@ -99,6 +109,11 @@ struct asteriskd_ipv6_state_entry {
     char original_value;
 };
 
+struct asteriskd_route_localnet_state_entry {
+    char interface_name[ASTERISKD_MAX_INTERFACE_NAME];
+    char original_value;
+};
+
 struct asteriskd_state {
     char pid_path[ASTERISKD_MAX_PATH];
     char log_path[ASTERISKD_MAX_PATH];
@@ -106,6 +121,8 @@ struct asteriskd_state {
     FILE *log_file;
     struct asteriskd_ipv6_state_entry ipv6_entries[ASTERISKD_MAX_INTERFACES];
     size_t ipv6_entry_count;
+    struct asteriskd_route_localnet_state_entry route_localnet_entries[ASTERISKD_MAX_INTERFACES];
+    size_t route_localnet_entry_count;
     int active_ipv4_slot;
     int active_ipv6_slot;
     struct asteriskd_address_set synchronized_ipv4_addresses;
@@ -154,6 +171,10 @@ int asteriskd_replace_iptables_bypass(
 int asteriskd_replace_lpm4_map(const char *pin_path, const struct asteriskd_address_set *addresses);
 int asteriskd_replace_lpm6_map(const char *pin_path, const struct asteriskd_address_set *addresses);
 int asteriskd_clear_hotspot_ipv6_tc_offload(const struct asteriskd_config *config);
+int asteriskd_run_command(char *const arguments[], char *output, size_t output_size);
+int asteriskd_bpf2socks_tc_prepare(const struct asteriskd_config *config);
+int asteriskd_bpf2socks_tc_sync(const struct asteriskd_config *config, struct asteriskd_state *state);
+void asteriskd_bpf2socks_tc_restore(const struct asteriskd_config *config, struct asteriskd_state *state);
 int asteriskd_sync_all(
     const struct asteriskd_config *config,
     struct asteriskd_state *state,

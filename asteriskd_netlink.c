@@ -218,7 +218,8 @@ uint32_t asteriskd_netlink_groups(const struct asteriskd_config *config) {
     uint32_t groups = RTMGRP_IPV4_IFADDR;
     if (config->enable_ipv6 || config->disable_system_ipv6) groups |= RTMGRP_IPV6_IFADDR;
     if (config->disable_system_ipv6 ||
-        (config->enable_ipv6 && config->hotspot_interface_prefix_count > 0U)) {
+        ((config->enable_ipv6 || config->bpf2socks_tc.enabled) &&
+         config->hotspot_interface_prefix_count > 0U)) {
         groups |= RTMGRP_LINK;
     }
     return groups;
@@ -355,6 +356,7 @@ static int write_ready_file(const struct asteriskd_state *state) {
 int asteriskd_prepare(const struct asteriskd_config *config, struct asteriskd_state *state) {
     (void)state;
     if (restore_stale_ipv6_state(config) != 0) return -1;
+    if (asteriskd_bpf2socks_tc_prepare(config) != 0) return -1;
     return asteriskd_prepare_iptables_bypass(config);
 }
 
@@ -402,7 +404,8 @@ int asteriskd_run(const struct asteriskd_config *config, struct asteriskd_state 
             bool synchronize_ipv6_interfaces =
                 config->disable_system_ipv6 && asteriskd_event_batch_has_link_event(&events);
             bool synchronize_hotspot_interfaces =
-                config->enable_ipv6 && asteriskd_event_batch_has_hotspot_interface_event(&events, config);
+                (config->enable_ipv6 || config->bpf2socks_tc.enabled) &&
+                asteriskd_event_batch_has_hotspot_interface_event(&events, config);
             bool addresses_changed = false;
             if (asteriskd_sync_all(
                     config,
@@ -422,6 +425,7 @@ int asteriskd_run(const struct asteriskd_config *config, struct asteriskd_state 
         }
     }
     (void)close(netlink_fd);
+    asteriskd_bpf2socks_tc_restore(config, state);
     asteriskd_restore_ipv6(config, state);
     (void)unlink(state->ready_path);
     (void)unlink(state->pid_path);

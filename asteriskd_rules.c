@@ -16,7 +16,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-static int run_command(char *const arguments[], char *output, size_t output_size) {
+int asteriskd_run_command(char *const arguments[], char *output, size_t output_size) {
     int pipe_fd[2] = {-1, -1};
     if (output != NULL && pipe(pipe_fd) != 0) return -1;
     pid_t child = fork();
@@ -69,7 +69,7 @@ static int iptables_chain_exists(int family, const char *chain) {
     char *arguments[] = {
         (char *)iptables_program(family), "-w", "100", "-t", "mangle", "-S", (char *)chain, NULL,
     };
-    return run_command(arguments, NULL, 0U);
+    return asteriskd_run_command(arguments, NULL, 0U);
 }
 
 static int iptables_ensure_chain(int family, const char *chain) {
@@ -77,28 +77,28 @@ static int iptables_ensure_chain(int family, const char *chain) {
     char *arguments[] = {
         (char *)iptables_program(family), "-w", "100", "-t", "mangle", "-N", (char *)chain, NULL,
     };
-    return run_command(arguments, NULL, 0U);
+    return asteriskd_run_command(arguments, NULL, 0U);
 }
 
 static int iptables_flush_chain(int family, const char *chain) {
     char *arguments[] = {
         (char *)iptables_program(family), "-w", "100", "-t", "mangle", "-F", (char *)chain, NULL,
     };
-    return run_command(arguments, NULL, 0U);
+    return asteriskd_run_command(arguments, NULL, 0U);
 }
 
 static int iptables_append_jump(int family, const char *chain, const char *target) {
     char *arguments[] = {
         (char *)iptables_program(family), "-w", "100", "-t", "mangle", "-A", (char *)chain, "-j", (char *)target, NULL,
     };
-    return run_command(arguments, NULL, 0U);
+    return asteriskd_run_command(arguments, NULL, 0U);
 }
 
 static int iptables_replace_jump(int family, const char *chain, const char *target) {
     char *arguments[] = {
         (char *)iptables_program(family), "-w", "100", "-t", "mangle", "-R", (char *)chain, "1", "-j", (char *)target, NULL,
     };
-    return run_command(arguments, NULL, 0U);
+    return asteriskd_run_command(arguments, NULL, 0U);
 }
 
 static int iptables_append_return(int family, const char *chain, const char *address) {
@@ -112,7 +112,7 @@ static int iptables_append_return(int family, const char *chain, const char *add
         (char *)iptables_program(family), "-w", "100", "-t", "mangle", "-A", (char *)chain,
         "-d", cidr, "-j", "RETURN", NULL,
     };
-    return run_command(arguments, NULL, 0U);
+    return asteriskd_run_command(arguments, NULL, 0U);
 }
 
 static int prepare_target(int family, const struct asteriskd_bypass_target *target) {
@@ -234,7 +234,7 @@ int asteriskd_clear_hotspot_ipv6_tc_offload(const struct asteriskd_config *confi
         if (!matched) continue;
         char output[8192];
         char *show_arguments[] = {"tc", "filter", "show", "dev", entry->d_name, "ingress", "protocol", "ipv6", NULL};
-        if (run_command(show_arguments, output, sizeof(output)) != 0) {
+        if (asteriskd_run_command(show_arguments, output, sizeof(output)) != 0) {
             result = -1;
             break;
         }
@@ -242,7 +242,7 @@ int asteriskd_clear_hotspot_ipv6_tc_offload(const struct asteriskd_config *confi
         char *delete_arguments[] = {
             "tc", "filter", "del", "dev", entry->d_name, "ingress", "protocol", "ipv6", "pref", "2", NULL,
         };
-        if (run_command(delete_arguments, NULL, 0U) != 0) {
+        if (asteriskd_run_command(delete_arguments, NULL, 0U) != 0) {
             result = -1;
             break;
         }
@@ -297,6 +297,10 @@ int asteriskd_sync_all(
     }
     if (config->enable_ipv6 && synchronize_hotspot_interfaces &&
         asteriskd_clear_hotspot_ipv6_tc_offload(config) != 0) {
+        return -1;
+    }
+    if (config->bpf2socks_tc.enabled && synchronize_hotspot_interfaces &&
+        asteriskd_bpf2socks_tc_sync(config, state) != 0) {
         return -1;
     }
     return 0;

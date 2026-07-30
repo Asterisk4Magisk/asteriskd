@@ -246,6 +246,29 @@ static bool parse_bpf_maps(const char *json, struct asteriskd_bpf_local_maps *ma
     return is_absolute_path(maps->ipv4_path) && (maps->ipv6_path[0] == '\0' || is_absolute_path(maps->ipv6_path));
 }
 
+static bool parse_bpf2socks_tc(const char *json, struct asteriskd_bpf2socks_tc *tc) {
+    const char *value = json_value(json, "bpf2socksTc");
+    memset(tc, 0, sizeof(*tc));
+    if (value == NULL) return false;
+    if (strncmp(value, "null", 4U) == 0) return true;
+    if (*value != '{' ||
+        !json_string(value, "ingressPath", tc->ingress_path, sizeof(tc->ingress_path)) ||
+        !json_string(value, "egressPath", tc->egress_path, sizeof(tc->egress_path)) ||
+        !json_string(value, "statePath", tc->state_path, sizeof(tc->state_path)) ||
+        !json_uint(value, "preference", &tc->preference) ||
+        !json_uint(value, "handle", &tc->handle)) {
+        return false;
+    }
+    tc->enabled = true;
+    return is_absolute_path(tc->ingress_path) &&
+        is_absolute_path(tc->egress_path) &&
+        is_absolute_path(tc->state_path) &&
+        tc->preference > 0U &&
+        tc->preference != 2U &&
+        tc->preference <= 65535U &&
+        tc->handle > 0U;
+}
+
 static bool validate_config(const struct asteriskd_config *config) {
     if (config->version != ASTERISKD_CONFIG_VERSION ||
         !is_absolute_path(config->ready_path) ||
@@ -260,7 +283,7 @@ static bool validate_config(const struct asteriskd_config *config) {
         }
     }
     if (config->mode == ASTERISKD_MODE_BPF2SOCKS) {
-        if (!config->bpf_local_maps.enabled) return false;
+        if (!config->bpf_local_maps.enabled || !config->bpf2socks_tc.enabled) return false;
     } else if (!config->ipv4_bypass.enabled || (config->enable_ipv6 && !config->ipv6_bypass.enabled)) {
         return false;
     }
@@ -296,6 +319,7 @@ int asteriskd_load_config(const char *path, struct asteriskd_config *out, char *
         parse_bypass(json, "ipv4Bypass", &out->ipv4_bypass) &&
         parse_bypass(json, "ipv6Bypass", &out->ipv6_bypass) &&
         parse_bpf_maps(json, &out->bpf_local_maps) &&
+        parse_bpf2socks_tc(json, &out->bpf2socks_tc) &&
         parse_emergency_processes(json, out->emergency_processes, &out->emergency_process_count);
     char mode[24] = {0};
     ok = json_string(json, "mode", mode, sizeof(mode)) && ok;

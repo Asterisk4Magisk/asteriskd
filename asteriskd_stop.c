@@ -59,6 +59,7 @@ _Noreturn void asteriskd_fail_stop(
     const char *step) {
     int saved_errno = errno;
     asteriskd_log(state, "fail-stop at %s: %s", step, strerror(saved_errno));
+    asteriskd_bpf2socks_tc_restore(config, state);
     asteriskd_restore_ipv6(config, state);
     char *arguments[] = {"sh", (char *)config->stop_script_path, "--from-asteriskd", NULL};
     execve("/system/bin/sh", arguments, environ);
