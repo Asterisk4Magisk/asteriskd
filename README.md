@@ -65,7 +65,7 @@ Exit status is `0` on success, `64` for invalid command-line arguments, and `1` 
 | Field | Required | Description |
 | --- | --- | --- |
 | `version` | yes | Must be `3`. |
-| `mode` | yes | `tproxy`, `tun`, `tun2socks`, or `bpf2socks`. |
+| `mode` | yes | `tproxy`, `tun`, `tun2socks`, `bpf2socks`, or `ebpf`. |
 | `enableIpv6` | yes | Synchronize IPv6 addresses and IPv6 bypass state. |
 | `disableSystemIpv6` | yes | Temporarily disable system IPv6 interfaces and restore their previous values on exit. |
 | `readyPath` | yes | Absolute ready-marker path written after the initial synchronization. |
@@ -74,10 +74,10 @@ Exit status is `0` on success, `64` for invalid command-line arguments, and `1` 
 | `ignoredInterfaces` | yes | Exact interface names excluded from address tracking; up to 64 entries. |
 | `virtualInterfaces` | yes | Exact virtual interface names excluded from local-address bypass collection; up to 64 entries. |
 | `hotspotInterfacePrefixes` | yes | Interface selectors; a final `+` enables prefix matching. |
-| `ipv4Bypass` | yes | Bypass-chain object or `null`. Required and non-null outside `bpf2socks` mode. |
-| `ipv6Bypass` | yes | Bypass-chain object or `null`. Required and non-null when IPv6 is enabled outside `bpf2socks` mode. |
-| `bpfLocalMaps` | yes | Pinned-map object or `null`. Required and non-null in `bpf2socks` mode. |
-| `bpf2socksTc` | yes | TC attachment object or `null`. Required and non-null in `bpf2socks` mode. |
+| `ipv4Bypass` | yes | Bypass-chain object or `null`. Required and non-null outside `bpf2socks` and `ebpf` modes; must be `null` in `ebpf` mode. |
+| `ipv6Bypass` | yes | Bypass-chain object or `null`. Required and non-null when IPv6 is enabled outside `bpf2socks` and `ebpf` modes; must be `null` in `ebpf` mode. |
+| `bpfLocalMaps` | yes | Pinned-map object or `null`. Required and non-null in `bpf2socks` mode; must be `null` in `ebpf` mode. |
+| `bpf2socksTc` | yes | TC attachment object or `null`. Required and non-null in `bpf2socks` mode; must be `null` in `ebpf` mode. |
 | `emergencyProcesses` | yes | Zero to eight validated fallback processes. Use `[]` to disable emergency process termination. |
 
 A bypass object contains `beginChain`, `endChain`, and one to four `consumerChains`. The App places adjacent jumps to the empty marker chains in each consumer. The daemon owns only the direct host-destination `RETURN` rules between those markers. Chain names accept uppercase ASCII letters, digits, `_`, and `-`, and must fit the kernel/iptables name limit used by the daemon.
@@ -95,7 +95,7 @@ Each emergency entry contains an absolute `pidPath` and a non-empty `commandMark
 
 ## Platform requirements and safety
 
-The executable needs root privileges, netlink access, iptables/ip6tables availability for bypass modes, and BPF map access for `bpf2socks` mode. `/proc`, `/sys/class/net`, `/proc/sys/net/ipv6/conf`, and `/system/bin/sh` are Android/Linux platform interfaces rather than application-specific paths.
+The executable needs root privileges and netlink access, plus iptables/ip6tables availability for bypass modes and BPF map access for `bpf2socks` mode. In `ebpf` mode it performs lifecycle monitoring and optional system IPv6 disabling without synchronizing bypass rules, pinned maps, or TC attachments. `/proc`, `/sys/class/net`, `/proc/sys/net/ipv6/conf`, and `/system/bin/sh` are Android/Linux platform interfaces rather than application-specific paths.
 
 The stop script and emergency markers are security boundaries. Generate them from trusted absolute runtime paths and do not accept untrusted configuration.
 

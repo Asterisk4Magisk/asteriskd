@@ -448,6 +448,7 @@ int asteriskd_sync_all(
     if (config->disable_system_ipv6 && synchronize_ipv6_interfaces) {
         if (asteriskd_disable_system_ipv6_for_sync(config, state) != 0) return -1;
     }
+    if (config->mode == ASTERISKD_MODE_EBPF) return 0;
     struct asteriskd_address_set ipv4_addresses;
     if (asteriskd_collect_local_addresses(config, AF_INET, &ipv4_addresses) != 0) return -1;
     struct asteriskd_address_set ipv6_addresses;

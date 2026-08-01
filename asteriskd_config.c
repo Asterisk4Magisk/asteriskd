@@ -374,6 +374,11 @@ static bool validate_config(const struct asteriskd_config *config) {
     }
     if (config->mode == ASTERISKD_MODE_BPF2SOCKS) {
         if (!config->bpf_local_maps.enabled || !config->bpf2socks_tc.enabled) return false;
+    } else if (config->mode == ASTERISKD_MODE_EBPF) {
+        if (config->ipv4_bypass.enabled || config->ipv6_bypass.enabled ||
+            config->bpf_local_maps.enabled || config->bpf2socks_tc.enabled) {
+            return false;
+        }
     } else if (!config->ipv4_bypass.enabled || (config->enable_ipv6 && !config->ipv6_bypass.enabled)) {
         return false;
     }
@@ -421,6 +426,8 @@ int asteriskd_load_config(const char *path, struct asteriskd_config *out, char *
         out->mode = ASTERISKD_MODE_TUN2SOCKS;
     } else if (strcmp(mode, "bpf2socks") == 0) {
         out->mode = ASTERISKD_MODE_BPF2SOCKS;
+    } else if (strcmp(mode, "ebpf") == 0) {
+        out->mode = ASTERISKD_MODE_EBPF;
     } else {
         ok = false;
     }

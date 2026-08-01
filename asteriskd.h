@@ -28,6 +28,7 @@ enum asteriskd_mode {
     ASTERISKD_MODE_TUN,
     ASTERISKD_MODE_TUN2SOCKS,
     ASTERISKD_MODE_BPF2SOCKS,
+    ASTERISKD_MODE_EBPF,
 };
 
 struct asteriskd_bypass_target {
