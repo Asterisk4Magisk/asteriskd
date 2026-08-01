@@ -92,6 +92,49 @@ bool asteriskd_event_batch_has_hotspot_interface_event(
     return false;
 }
 
+bool asteriskd_hotspot_ipv6_event_requests_dnsmasq_rebuild(
+    const struct asteriskd_config *config,
+    enum asteriskd_event_action action,
+    int family,
+    const char *interface_name) {
+    if (config == NULL || !config->disable_system_ipv6 ||
+        action != ASTERISKD_EVENT_ADDED || family != AF_INET6 || interface_name == NULL) {
+        return false;
+    }
+    for (size_t index = 0U; index < config->hotspot_interface_prefix_count; ++index) {
+        if (asteriskd_interface_matches_prefix(interface_name, config->hotspot_interface_prefixes[index])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool asteriskd_ipv6_security_target(const char *interface_name) {
+    return interface_name != NULL && interface_name[0] != '\0' &&
+        strcmp(interface_name, "all") != 0 &&
+        strcmp(interface_name, "default") != 0 &&
+        strcmp(interface_name, "lo") != 0 &&
+        strchr(interface_name, '/') == NULL;
+}
+
+bool asteriskd_ipv6_persisted_state_name(const char *interface_name) {
+    return interface_name != NULL &&
+        (strcmp(interface_name, "default") == 0 || asteriskd_ipv6_security_target(interface_name));
+}
+
+bool asteriskd_ipv6_requires_write(char original_value, char current_value) {
+    (void)original_value;
+    return current_value != '1';
+}
+
+bool asteriskd_ipv6_event_requires_enforcement(
+    enum asteriskd_event_action action,
+    int family,
+    const char *interface_name) {
+    return action == ASTERISKD_EVENT_ADDED && family == AF_INET6 &&
+        asteriskd_ipv6_security_target(interface_name);
+}
+
 static const char *action_name(enum asteriskd_event_action action) {
     switch (action) {
         case ASTERISKD_EVENT_ADDED: return "added";

@@ -60,7 +60,9 @@ _Noreturn void asteriskd_fail_stop(
     int saved_errno = errno;
     asteriskd_log(state, "fail-stop at %s: %s", step, strerror(saved_errno));
     asteriskd_bpf2socks_tc_restore(config, state);
-    asteriskd_restore_ipv6(config, state);
+    // Unexpected failures stop proxy routing but keep IPv6 disabled. The
+    // persisted originals are adopted on restart or restored by a later
+    // intentional stop.
     char *arguments[] = {"sh", (char *)config->stop_script_path, "--from-asteriskd", NULL};
     execve("/system/bin/sh", arguments, environ);
     asteriskd_log(state, "fail-stop exec failed: %s", strerror(errno));

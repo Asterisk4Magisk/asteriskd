@@ -55,14 +55,66 @@ static const char *skip_space(const char *value) {
     return value;
 }
 
+static const char *skip_json_string(const char *value) {
+    if (value == NULL || *value != '"') return NULL;
+    for (const char *cursor = value + 1; *cursor != '\0'; ++cursor) {
+        if (*cursor == '\\' || (unsigned char)*cursor < 0x20U) return NULL;
+        if (*cursor == '"') return cursor + 1;
+    }
+    return NULL;
+}
+
+static const char *skip_json_value(const char *value) {
+    value = skip_space(value);
+    if (*value == '"') return skip_json_string(value);
+    if (*value != '{' && *value != '[') {
+        while (*value != '\0' && *value != ',' && *value != '}' && *value != ']') ++value;
+        return value;
+    }
+    char opening = *value;
+    char closing = opening == '{' ? '}' : ']';
+    size_t depth = 0U;
+    for (const char *cursor = value; *cursor != '\0'; ++cursor) {
+        if (*cursor == '"') {
+            cursor = skip_json_string(cursor);
+            if (cursor == NULL) return NULL;
+            --cursor;
+        } else if (*cursor == opening) {
+            ++depth;
+        } else if (*cursor == closing) {
+            if (depth == 0U) return NULL;
+            --depth;
+            if (depth == 0U) return cursor + 1;
+        }
+    }
+    return NULL;
+}
+
 static const char *json_value(const char *json, const char *key) {
-    char needle[96];
-    int count = snprintf(needle, sizeof(needle), "\"%s\"", key);
-    if (count <= 0 || (size_t)count >= sizeof(needle)) return NULL;
-    const char *value = strstr(json, needle);
-    if (value == NULL) return NULL;
-    value = strchr(value + strlen(needle), ':');
-    return value == NULL ? NULL : skip_space(value + 1);
+    if (json == NULL || key == NULL) return NULL;
+    const char *cursor = skip_space(json);
+    if (*cursor != '{') return NULL;
+    cursor = skip_space(cursor + 1);
+    while (*cursor != '\0' && *cursor != '}') {
+        if (*cursor != '"') return NULL;
+        const char *name = cursor + 1;
+        const char *name_end = strchr(name, '"');
+        if (name_end == NULL || memchr(name, '\\', (size_t)(name_end - name)) != NULL) return NULL;
+        cursor = skip_space(name_end + 1);
+        if (*cursor != ':') return NULL;
+        const char *value = skip_space(cursor + 1);
+        if (strlen(key) == (size_t)(name_end - name) &&
+            memcmp(name, key, (size_t)(name_end - name)) == 0) {
+            return value;
+        }
+        cursor = skip_json_value(value);
+        if (cursor == NULL) return NULL;
+        cursor = skip_space(cursor);
+        if (*cursor == '}') return NULL;
+        if (*cursor != ',') return NULL;
+        cursor = skip_space(cursor + 1);
+    }
+    return NULL;
 }
 
 static bool json_uint(const char *json, const char *key, uint32_t *out) {

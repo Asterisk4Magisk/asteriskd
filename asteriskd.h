@@ -109,6 +109,7 @@ struct asteriskd_event_batch {
 struct asteriskd_ipv6_state_entry {
     char interface_name[ASTERISKD_MAX_INTERFACE_NAME];
     char original_value;
+    unsigned int interface_index;
 };
 
 struct asteriskd_route_localnet_state_entry {
@@ -128,6 +129,9 @@ struct asteriskd_state {
     struct asteriskd_address_set synchronized_ipv4_addresses;
     struct asteriskd_address_set synchronized_ipv6_addresses;
     bool has_synchronized_addresses;
+    bool hotspot_dnsmasq_rebuild_pending;
+    char hotspot_dnsmasq_interface[ASTERISKD_MAX_INTERFACE_NAME];
+    unsigned int hotspot_dnsmasq_interface_index;
 };
 
 int asteriskd_load_config(const char *path, struct asteriskd_config *out, char *message, size_t message_size);
@@ -152,6 +156,11 @@ bool asteriskd_event_batch_has_link_event(const struct asteriskd_event_batch *ba
 bool asteriskd_event_batch_has_hotspot_interface_event(
     const struct asteriskd_event_batch *batch,
     const struct asteriskd_config *config);
+bool asteriskd_hotspot_ipv6_event_requests_dnsmasq_rebuild(
+    const struct asteriskd_config *config,
+    enum asteriskd_event_action action,
+    int family,
+    const char *interface_name);
 void asteriskd_format_event_batch(const struct asteriskd_event_batch *batch, char *output, size_t output_size);
 void asteriskd_log_event_batch(struct asteriskd_state *state, const struct asteriskd_event_batch *batch);
 
@@ -159,6 +168,19 @@ int asteriskd_prepare(const struct asteriskd_config *config, struct asteriskd_st
 int asteriskd_run(const struct asteriskd_config *config, struct asteriskd_state *state);
 void asteriskd_restore_ipv6(const struct asteriskd_config *config, struct asteriskd_state *state);
 int asteriskd_disable_system_ipv6_for_sync(const struct asteriskd_config *config, struct asteriskd_state *state);
+int asteriskd_enforce_system_ipv6_interface(
+    const struct asteriskd_config *config,
+    struct asteriskd_state *state,
+    const char *interface_name,
+    unsigned int interface_index);
+void asteriskd_retire_system_ipv6_interface(
+    const struct asteriskd_config *config,
+    struct asteriskd_state *state,
+    const char *interface_name,
+    unsigned int interface_index);
+int asteriskd_load_persisted_ipv6_state(
+    const struct asteriskd_config *config,
+    struct asteriskd_state *state);
 _Noreturn void asteriskd_fail_stop(const struct asteriskd_config *config, struct asteriskd_state *state, const char *step);
 
 int asteriskd_collect_local_addresses(const struct asteriskd_config *config, int family, struct asteriskd_address_set *out);
@@ -178,6 +200,10 @@ int asteriskd_replace_lpm4_map(const char *pin_path, const struct asteriskd_addr
 int asteriskd_replace_lpm6_map(const char *pin_path, const struct asteriskd_address_set *addresses);
 int asteriskd_clear_hotspot_ipv6_tc_offload(const struct asteriskd_config *config);
 int asteriskd_run_command(char *const arguments[], char *output, size_t output_size);
+int asteriskd_rebuild_tether_dnsmasq(
+    struct asteriskd_state *state,
+    const char *interface_name,
+    unsigned int interface_index);
 int asteriskd_bpf2socks_tc_prepare(const struct asteriskd_config *config);
 int asteriskd_bpf2socks_tc_sync(const struct asteriskd_config *config, struct asteriskd_state *state);
 void asteriskd_bpf2socks_tc_restore(const struct asteriskd_config *config, struct asteriskd_state *state);
@@ -189,6 +215,13 @@ int asteriskd_sync_all(
     bool *addresses_changed);
 
 bool asteriskd_should_track_interface(const struct asteriskd_config *config, const char *interface_name);
+bool asteriskd_ipv6_security_target(const char *interface_name);
+bool asteriskd_ipv6_persisted_state_name(const char *interface_name);
+bool asteriskd_ipv6_requires_write(char original_value, char current_value);
+bool asteriskd_ipv6_event_requires_enforcement(
+    enum asteriskd_event_action action,
+    int family,
+    const char *interface_name);
 bool asteriskd_interface_matches_prefix(const char *interface_name, const char *prefix);
 uint32_t asteriskd_netlink_groups(const struct asteriskd_config *config);
 

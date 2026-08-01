@@ -2,6 +2,10 @@
 
 `asteriskd` is a small root daemon for Android that watches netlink address and interface events, keeps local-address bypass rules or pinned eBPF maps synchronized, and restores IPv6 state during shutdown or fail-stop handling.
 
+When `disableSystemIpv6` is enabled, IPv6 security enforcement is separate from the normal debounced rule synchronization. `RTM_NEWLINK` and IPv6 `RTM_NEWADDR` messages re-disable the exact interface immediately. The daemon performs no periodic IPv6 audit: while idle it blocks indefinitely in `poll()`. A full interface reconciliation runs only at startup or after an explicit route-netlink integrity failure such as `ENOBUFS` or `MSG_TRUNC`.
+
+Hotspot IPv6 additions are coalesced through the existing network-event debounce. On ROMs where a netd-managed dnsmasq and `/system/bin/ndc` are available, one `ndc tether stop`/`start` rebuild clears stale IPv6 DNS listeners after the hotspot interface is disabled. Unsupported or inactive tethering implementations skip this recovery without disabling the core IPv6 fast path. The netd tether operation is global and can briefly interrupt DNS for simultaneous tethering transports.
+
 The source root is intentionally build-system agnostic. A parent Android project is expected to compile every top-level `.c` file as one PIE executable and package it under a name such as `libasteriskd.so`. The `tests` directory is not part of the production translation units.
 
 ## Command line
@@ -66,7 +70,7 @@ Exit status is `0` on success, `64` for invalid command-line arguments, and `1` 
 | `disableSystemIpv6` | yes | Temporarily disable system IPv6 interfaces and restore their previous values on exit. |
 | `readyPath` | yes | Absolute ready-marker path written after the initial synchronization. |
 | `stopScriptPath` | yes | Absolute shell script path executed with `--from-asteriskd` after fail-stop recovery. |
-| `statePath` | yes | Absolute file used to persist IPv6 values that must be restored. |
+| `statePath` | yes | Absolute file used to persist IPv6 values that must be restored. When a restarted daemon still requests IPv6 disabling, it adopts these originals without temporarily restoring IPv6. |
 | `ignoredInterfaces` | yes | Exact interface names excluded from address tracking; up to 64 entries. |
 | `virtualInterfaces` | yes | Exact virtual interface names excluded from local-address bypass collection; up to 64 entries. |
 | `hotspotInterfacePrefixes` | yes | Interface selectors; a final `+` enables prefix matching. |
