@@ -1,107 +1,158 @@
-# asteriskd
+# asteriskd v2
 
-`asteriskd` is a small root daemon for Android that watches netlink address and interface events, keeps local-address bypass rules or pinned eBPF maps synchronized, and restores IPv6 state during shutdown or fail-stop handling.
+`asteriskd` is the single foreground root supervisor for AsteriskNG, AsteriskBOX,
+and AsteriskMETA. It owns the selected core process, required helper, optional
+matcher, daemon-managed routing/firewall/BPF/TC state, recovery journal, network
+reconciliation, structured log, and the local control socket for the whole
+runtime lifetime.
 
-When `disableSystemIpv6` is enabled, IPv6 security enforcement is separate from the normal debounced rule synchronization. `RTM_NEWLINK` and IPv6 `RTM_NEWADDR` messages re-disable the exact interface immediately. The daemon performs no periodic IPv6 audit: while idle it blocks indefinitely in `poll()`. A full interface reconciliation runs only at startup or after an explicit route-netlink integrity failure such as `ENOBUFS` or `MSG_TRUNC`.
+The supervisor does not daemonize and does not restart a failed child. A core or
+required-helper exit causes a fail-stop: new traffic entry is removed first,
+owned effects are restored in reverse order, and the foreground command exits
+nonzero. A clean explicit stop exits zero only after the durable state is
+canonical stopped.
 
-Hotspot IPv6 additions are coalesced through the existing network-event debounce. On ROMs where a netd-managed dnsmasq and `/system/bin/ndc` are available, one `ndc tether stop`/`start` rebuild clears stale IPv6 DNS listeners after the hotspot interface is disabled. Unsupported or inactive tethering implementations skip this recovery without disabling the core IPv6 fast path. The netd tether operation is global and can briefly interrupt DNS for simultaneous tethering transports.
+The source root is build-system agnostic. The Android parent project compiles
+every top-level `.c` file as one PIE executable; `tests/` is host-only.
 
-The source root is intentionally build-system agnostic. A parent Android project is expected to compile every top-level `.c` file as one PIE executable and package it under a name such as `libasteriskd.so`. The `tests` directory is not part of the production translation units.
-
-## Command line
+## CLI
 
 ```text
-asteriskd --prepare --config FILE
-asteriskd --start --config FILE --pid FILE --log FILE
+asteriskd start --config ABSOLUTE_PATH
+asteriskd status
+asteriskd stop
+asteriskd watch
+asteriskd recover --config ABSOLUTE_CONFIG_PATH
+asteriskd sync --file ABSOLUTE_PATH
+asteriskd sync --directory ABSOLUTE_PATH
 ```
 
-All paths must be absolute.
+`start`, `status`, `stop`, `watch`, and `recover` require effective UID 0.
+`status` and `stop` write exactly one protocol-v1 JSON response line. `watch`
+writes an initial response and then JSON event lines until the final event or
+disconnect. `recover` writes exactly one dedicated `recoveryResult` line after
+its command grammar is accepted. CLI usage errors write only to stderr and exit
+64.
 
-| Option | Description |
-| --- | --- |
-| `--prepare` | Validate the configuration and prepare iptables bypass marker chains before the daemon starts. |
-| `--start` | Start the netlink monitor and initial synchronization. |
-| `--config FILE` | Version 3 JSON configuration. |
-| `--pid FILE` | PID file maintained by the caller and daemon. Required by `--start`. |
-| `--log FILE` | Append-only daemon log. Required by `--start`. |
+`sync` is a private publication primitive. It performs component-wise
+no-symlink traversal, verifies the exact final file/directory type, calls
+`fsync(2)`, and never writes or truncates the destination.
 
-Exit status is `0` on success, `64` for invalid command-line arguments, and `1` for configuration or runtime failure.
+`start` and `recover` open and verify the config-parent directory themselves.
+They do not accept inherited publication descriptors and do not acquire a
+filesystem lock. Applications perform a read-only status preflight, recover
+the old state, and publish through same-directory fsync plus atomic rename. The
+abstract control-socket bind is the cross-process single-instance authority.
 
-## Configuration version 3
+## Control plane
 
-```json
-{
-  "version": 3,
-  "mode": "tproxy",
-  "enableIpv6": true,
-  "disableSystemIpv6": false,
-  "readyPath": "/data/local/tmp/example/asteriskd.ready",
-  "stopScriptPath": "/data/local/tmp/example/stop.sh",
-  "statePath": "/data/local/tmp/example/asteriskd.state",
-  "ignoredInterfaces": ["lo"],
-  "virtualInterfaces": ["tun0"],
-  "hotspotInterfacePrefixes": ["wlan+"],
-  "ipv4Bypass": {
-    "beginChain": "ASTERISKD_LOCAL4_BEGIN",
-    "endChain": "ASTERISKD_LOCAL4_END",
-    "consumerChains": ["ASTERISK_TPROXY_PREROUTING", "ASTERISK_TPROXY_OUTPUT"]
-  },
-  "ipv6Bypass": {
-    "beginChain": "ASTERISKD_LOCAL6_BEGIN",
-    "endChain": "ASTERISKD_LOCAL6_END",
-    "consumerChains": ["ASTERISK_TPROXY6_PREROUTING", "ASTERISK_TPROXY6_OUTPUT"]
-  },
-  "bpfLocalMaps": null,
-  "bpf2socksTc": null,
-  "emergencyProcesses": [
-    {
-      "pidPath": "/data/local/tmp/example/proxy.pid",
-      "commandMarker": "/data/local/tmp/example/proxy-config.json"
-    }
-  ]
-}
-```
+The only endpoint is the Linux abstract Unix-domain socket
+`@asteriskd.control`. Peer credentials must report UID 0. The protocol is
+newline-delimited UTF-8 JSON, version 1, with closed request/response/event
+objects. Each connection sends one request. Limits are enforced for request
+size, client count, per-client output, incomplete-input timeout, and stalled
+watch output.
 
-| Field | Required | Description |
+Public methods are `status`, `stop`, and `watch`. `start`, `recover`, and `sync`
+are CLI operations, not server methods. A valid bound peer blocks publication
+regardless of whether its snapshot phase is starting, running, stopping, or
+failed.
+
+Snapshots expose semantic state only: phase, owner/core/mode, supervisor/core/
+helper PIDs, matcher status, daemon-rule generation/categories, IPv4/IPv6
+readiness, and a sanitized error. Private iptables names, BPF pin paths, argv,
+environment, and configuration content are never exposed.
+
+## Configuration v2
+
+The configuration is strict UTF-8 JSON (`schemaVersion: 2`) with a maximum size
+of 8 MiB. Every object is closed: unknown, duplicate, or missing keys are
+invalid, including keys whose value is nullable. Validation completes before
+the logger, state, socket, child, or external network effects are created.
+
+Top-level sections are:
+
+- `schemaVersion`, `owner`, `coreType`, and `mode`;
+- `paths` for the core executable/config, working directory, state, and log;
+- `core` for the readiness timeout and optional Mihomo AGE secret;
+- `modeOptions` for the tproxy port or TUN name;
+- `network` for IPv6 intent, DNS/fake-DNS, interface selectors, private CIDRs,
+  UID policy, and inline canonical direct CIDRs;
+- nullable `helper` (`hev-socks5-tunnel` or `bpf2socks`);
+- nullable `matcher`, containing only its executable path.
+
+Direct CIDRs are inline immutable snapshots. The supervisor renders matcher and
+bpf2socks policy/config into sealed anonymous descriptors and passes
+`/proc/self/fd/N`; it never creates policy, helper-config, direct-CIDR, PID,
+ready, stop-script, or boot-log runtime artifacts.
+
+Supported combinations:
+
+| Owner | Core | Runnable modes |
 | --- | --- | --- |
-| `version` | yes | Must be `3`. |
-| `mode` | yes | `tproxy`, `tun`, `tun2socks`, `bpf2socks`, or `ebpf`. |
-| `enableIpv6` | yes | Synchronize IPv6 addresses and IPv6 bypass state. |
-| `disableSystemIpv6` | yes | Temporarily disable system IPv6 interfaces and restore their previous values on exit. |
-| `readyPath` | yes | Absolute ready-marker path written after the initial synchronization. |
-| `stopScriptPath` | yes | Absolute shell script path executed with `--from-asteriskd` after fail-stop recovery. |
-| `statePath` | yes | Absolute file used to persist IPv6 values that must be restored. When a restarted daemon still requests IPv6 disabling, it adopts these originals without temporarily restoring IPv6. |
-| `ignoredInterfaces` | yes | Exact interface names excluded from address tracking; up to 64 entries. |
-| `virtualInterfaces` | yes | Exact virtual interface names excluded from local-address bypass collection; up to 64 entries. |
-| `hotspotInterfacePrefixes` | yes | Interface selectors; a final `+` enables prefix matching. |
-| `ipv4Bypass` | yes | Bypass-chain object or `null`. Required and non-null outside `bpf2socks` and `ebpf` modes; must be `null` in `ebpf` mode. |
-| `ipv6Bypass` | yes | Bypass-chain object or `null`. Required and non-null when IPv6 is enabled outside `bpf2socks` and `ebpf` modes; must be `null` in `ebpf` mode. |
-| `bpfLocalMaps` | yes | Pinned-map object or `null`. Required and non-null in `bpf2socks` mode; must be `null` in `ebpf` mode. |
-| `bpf2socksTc` | yes | TC attachment object or `null`. Required and non-null in `bpf2socks` mode; must be `null` in `ebpf` mode. |
-| `emergencyProcesses` | yes | Zero to eight validated fallback processes. Use `[]` to disable emergency process termination. |
+| `asteriskng` | `xray` | `tproxy`, `tun2socks`, `bpf2socks` |
+| `asteriskbox` | `sing-box` | `tproxy`, `tun`, `tun2socks`, `bpf2socks`, `ebpf` |
+| `asteriskmeta` | `mihomo` | `tproxy`, `tun`, `tun2socks`, `bpf2socks` |
 
-A bypass object contains `beginChain`, `endChain`, and one to four `consumerChains`. The App places adjacent jumps to the empty marker chains in each consumer. The daemon owns only the direct host-destination `RETURN` rules between those markers. Chain names accept uppercase ASCII letters, digits, `_`, and `-`, and must fit the kernel/iptables name limit used by the daemon.
+`ebpf` is a standalone mode, not the optional matcher. It is parsed for every
+owner/core pair, but only AsteriskBOX/sing-box is runnable today. In that mode
+sing-box owns its cgroup BPF, route, shared-interface TC, UID/direct policy, and
+`route_localnet`; daemon rule state remains inactive. A crash or forced kill
+retains a core-owned recovery boundary for a later sing-box cleanup start.
 
-A BPF map object contains an absolute `ipv4Path` and either an absolute `ipv6Path` or `null`:
+The matcher is an independent required overlay for `tproxy`, `tun`, or
+`tun2socks`. If configured, capability setup, one-shot loading, complete pin
+verification, or policy-map verification failure aborts startup; there is no
+silent fallback to non-matcher rules.
 
-```json
-{
-  "ipv4Path": "/sys/fs/bpf/example/local_addr_v4",
-  "ipv6Path": "/sys/fs/bpf/example/local_addr_v6"
-}
-```
+## Lifecycle, readiness, and recovery
 
-Each emergency entry contains an absolute `pidPath` and a non-empty `commandMarker` of at most 255 bytes. It is used only if execution of the normal stop script fails. Before signaling a PID, the daemon verifies that `/proc/PID/cmdline` contains the marker; it sends `SIGTERM` first and `SIGKILL` only if the process remains alive.
+The durable phases are `starting`, `applying-rules`, `running`, `stopping`,
+`stopped`, and `failed`; validation/acquisition/initial recovery are live-only
+until the existing state has been classified. Core readiness is adapter-specific
+and identity-bound. TUN/HEV and bpf2socks modes require the core SOCKS listener
+before helper readiness. BOX `ebpf` requires the same verified core identity to
+survive a fixed 1000 ms window and does not wait for a shared interface.
 
-## Platform requirements and safety
+All external mutations use an intent-before-effect, verify, applied-after-effect
+write-ahead journal. State replacement is temp-file + file fsync + rename +
+parent-directory fsync. Cleanup signals a persisted PID only after the complete
+`/proc` identity (PID/PGID/start ticks/executable device+inode/full argv)
+matches. PID-only or substring matching is forbidden.
 
-The executable needs root privileges and netlink access, plus iptables/ip6tables availability for bypass modes and BPF map access for `bpf2socks` mode. In `ebpf` mode it performs lifecycle monitoring and optional system IPv6 disabling without synchronizing bypass rules, pinned maps, or TC attachments. `/proc`, `/sys/class/net`, `/proc/sys/net/ipv6/conf`, and `/system/bin/sh` are Android/Linux platform interfaces rather than application-specific paths.
+`recover` classifies state before opening the config, log, or control socket.
+Missing or canonical-stopped state is a no-side-effect clean result. Dirty
+trusted state requires the intact old configuration, binds the control address,
+and performs the same ownership-safe reverse cleanup used by normal shutdown.
+Invalid, incompatible, ambiguous, or foreign evidence is preserved and returns
+`recovery-required`.
 
-The stop script and emergency markers are security boundaries. Generate them from trusted absolute runtime paths and do not accept untrusted configuration.
+## Network and logging
 
-## Parent-project integration
+One reactor owns signals, control clients, child setup/log/pidfd events,
+route-netlink input, debounce deadlines, readiness, action commands, and stop
+deadlines. Netlink subscribes before the initial snapshot, drains to `EAGAIN`,
+and performs a full reconcile after the 1500 ms trailing debounce or any
+integrity loss. System-IPv6 disablement uses immediate per-interface WAL writes.
 
-Mount the repository root directly at `asteriskd/src/main/native`. Keep Android ABI selection, NDK discovery, compiler flags, packaging, and task wiring in the parent project.
+The daemon is the only writer of `asteriskd.log`. It opens the file through a
+no-symlink path, anchors ownership to the pre-existing app-owned log directory,
+forces mode 0600, and emits bounded JSONL. Child stdout/stderr are framed,
+UTF-8-repaired, control-escaped, truncated at the fixed limit, and redacted for
+the exact AGE secret before persistence.
+
+The only persistent runtime artifacts are the app-published core config and
+`asteriskd.json`, daemon-owned `asteriskd.state`, app-owned `startup.sh` when
+boot is enabled, and the single app-level `asteriskd.log`.
+
+## Verification and device boundary
+
+Host tests use explicit fake backends and compile with
+`-Wall -Wextra -Werror -std=c17`. Production sources must also compile for
+Android API 24 on arm64-v8a, armeabi-v7a, x86, and x86_64. Host tests cannot
+prove rooted-device SELinux, abstract-UDS peer credentials, inherited OFD
+locking, `/proc` identity races, netlink/BPF/TC kernel ABI, or filesystem label
+behavior; those remain mandatory device integration checks.
 
 ## License
 
