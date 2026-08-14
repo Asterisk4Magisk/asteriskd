@@ -884,13 +884,17 @@ static int system_action_post_setup(
     return 1;
 }
 
+#define ASTERISKD_ACTION_IDENTITY_RETRY_ATTEMPTS 10U
+#define ASTERISKD_ACTION_IDENTITY_RETRY_NANOSECONDS 1000000L
+
 static int system_action_post_identity(
     int identity_result, int reap_result,
     const struct asteriskd_child_setup_stream *setup,
     bool reaped, const struct asteriskd_child_exit_status *status,
     int *exit_status) {
     if (identity_result == 0) return 0;
-    if (reap_result <= 0) return ASTERISKD_CONFIG_INVALID;
+    if (reap_result == 0) return ASTERISKD_CONFIG_NOT_READY;
+    if (reap_result < 0) return ASTERISKD_CONFIG_INVALID;
     int post_setup = system_action_post_setup(setup, reaped, status, exit_status);
     return post_setup > 0 ? post_setup : ASTERISKD_CONFIG_INVALID;
 }
@@ -1904,12 +1908,29 @@ static int system_action_run_spec(struct asteriskd_system_supervisor *system,
             system->action_process.pid, ASTERISKD_CHILD_HELPER,
             ASTERISKD_CHILD_TYPE_BPF2SOCKS, spec, &system->action_identity,
             error, sizeof(error));
-    if (identity_result != 0) {
+    for (unsigned int attempt = 0U; identity_result != 0; ++attempt) {
         int post_identity = system_action_post_identity(
             identity_result, system_action_reap_now(system), &system->action_setup,
             system->action_reaped, &system->action_exit, &completed_exit);
         if (post_identity > 0) goto early_exit;
+        if (post_identity != ASTERISKD_CONFIG_NOT_READY ||
+            attempt + 1U >= ASTERISKD_ACTION_IDENTITY_RETRY_ATTEMPTS) goto failed;
+#if defined(__linux__) || defined(__ANDROID__)
+        struct timespec retry_delay = {
+            .tv_sec = 0,
+            .tv_nsec = ASTERISKD_ACTION_IDENTITY_RETRY_NANOSECONDS,
+        };
+        while (nanosleep(&retry_delay, &retry_delay) != 0) {
+            if (errno != EINTR) goto failed;
+        }
+#else
         goto failed;
+#endif
+        identity_result = asteriskd_process_identity_read(
+            asteriskd_system_process_identity_backend(),
+            system->action_process.pid, ASTERISKD_CHILD_HELPER,
+            ASTERISKD_CHILD_TYPE_BPF2SOCKS, spec, &system->action_identity,
+            error, sizeof(error));
     }
     system->action_identity_ready = true;
     failure_phase = "exit-clock";

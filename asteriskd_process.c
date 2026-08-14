@@ -611,8 +611,10 @@ int asteriskd_readiness_poll(
     if (!identity_valid) return ASTERISKD_READINESS_CHILD_LOST;
     bool ready = false;
     if (tracker->role == ASTERISKD_CHILD_CORE && config->mode == ASTERISKD_MODE_TPROXY) {
+        const char *host = config->core_type == ASTERISKD_CORE_MIHOMO ?
+            "127.0.0.1" : "0.0.0.0";
         if (backend->listener_owned(
-                backend->context, identity, "0.0.0.0", config->transparent_port, &ready) != 0) {
+                backend->context, identity, host, config->transparent_port, &ready) != 0) {
             return ASTERISKD_READINESS_IO;
         }
     } else if (tracker->role == ASTERISKD_CHILD_CORE && config->mode == ASTERISKD_MODE_TUN) {
