@@ -64,6 +64,7 @@ struct asteriskd_recovery_record;
 #define ASTERISKD_PROCESS_TERM_GRACE_MILLIS 3000U
 #define ASTERISKD_PROCESS_KILL_REAP_MILLIS 1000U
 #define ASTERISKD_PROCESS_EBPF_STABILITY_MILLIS 1000U
+#define ASTERISKD_READINESS_POLL_INTERVAL_MILLIS 100U
 #define ASTERISKD_ANONYMOUS_CREATE_CLOEXEC UINT32_C(0x1)
 #define ASTERISKD_ANONYMOUS_CREATE_ALLOW_SEALING UINT32_C(0x2)
 #define ASTERISKD_ANONYMOUS_SEAL_WRITE UINT32_C(0x1)
@@ -829,6 +830,9 @@ struct asteriskd_readiness_backend {
     int (*interface_exists)(void *, const char *, bool *);
 };
 
+int asteriskd_readiness_preflight(
+    const struct asteriskd_config *, enum asteriskd_child_role,
+    const struct asteriskd_readiness_backend *);
 int asteriskd_readiness_init(
     const struct asteriskd_config *, enum asteriskd_child_role, uint64_t,
     const struct asteriskd_readiness_backend *, struct asteriskd_readiness_tracker *);
@@ -1435,6 +1439,9 @@ int asteriskd_test_start_failure_detail(
     int, const char *, struct asteriskd_runtime_delta *);
 int asteriskd_test_capability_path_search_result(bool, bool);
 int asteriskd_test_capability_inspect_error(int);
+int asteriskd_test_periodic_deadline(int64_t, int64_t, uint32_t, int64_t *);
+bool asteriskd_test_startup_components_verified(
+    bool, bool, bool, bool, bool, bool, bool, bool, bool);
 #endif
 
 enum asteriskd_reactor_wait_result {
@@ -2265,10 +2272,33 @@ struct asteriskd_interface_address {
     char address[64U];
 };
 
+enum asteriskd_local_bypass_operation_kind {
+    ASTERISKD_LOCAL_BYPASS_INSERT,
+    ASTERISKD_LOCAL_BYPASS_DELETE,
+};
+
+struct asteriskd_local_bypass_operation {
+    enum asteriskd_local_bypass_operation_kind kind;
+    size_t rule_number;
+    char address[64U];
+};
+
+#define ASTERISKD_LOCAL_BYPASS_MAX_OPERATIONS (ASTERISKD_MAX_ADDRESSES * 2U)
+
+struct asteriskd_local_bypass_plan {
+    struct asteriskd_local_bypass_operation
+        operations[ASTERISKD_LOCAL_BYPASS_MAX_OPERATIONS];
+    size_t operation_count;
+};
+
 int asteriskd_local_address_set_build(
     const struct asteriskd_config *, int,
     const struct asteriskd_interface_address *, size_t,
     struct asteriskd_address_set *, char *, size_t);
+int asteriskd_local_bypass_plan_build(
+    int, const char *, const char *, const char *,
+    const char *, size_t, const struct asteriskd_address_set *,
+    struct asteriskd_local_bypass_plan *, char *, size_t);
 
 #define ASTERISKD_ADDRESS_IPV4 4
 #define ASTERISKD_ADDRESS_IPV6 6

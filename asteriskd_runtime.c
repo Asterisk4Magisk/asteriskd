@@ -83,6 +83,49 @@ void asteriskd_deadline_min(
     }
 }
 
+static int runtime_periodic_deadline(
+    int64_t now, int64_t caller_deadline, uint32_t interval,
+    int64_t *iteration_deadline) {
+    if (now < 0 || caller_deadline < 0 || interval == 0U || iteration_deadline == NULL) return -1;
+    *iteration_deadline = caller_deadline;
+    if (now >= caller_deadline) return 0;
+    if (now <= INT64_MAX - (int64_t)interval) {
+        int64_t periodic = now + (int64_t)interval;
+        if (periodic < caller_deadline) *iteration_deadline = periodic;
+    }
+    return 0;
+}
+
+static bool runtime_startup_components_verified(
+    bool core_identity_ready, bool core_reaped,
+    bool helper_required, bool helper_identity_ready, bool helper_reaped,
+    bool matcher_required, bool matcher_verified,
+    bool rules_initialized, bool rules_verified) {
+    return core_identity_ready && !core_reaped &&
+        (!helper_required || (helper_identity_ready && !helper_reaped)) &&
+        (!matcher_required || matcher_verified) && rules_initialized && rules_verified;
+}
+
+#if defined(ASTERISKD_TESTING)
+int asteriskd_test_periodic_deadline(
+    int64_t now, int64_t caller_deadline, uint32_t interval,
+    int64_t *iteration_deadline) {
+    return runtime_periodic_deadline(
+        now, caller_deadline, interval, iteration_deadline);
+}
+
+bool asteriskd_test_startup_components_verified(
+    bool core_identity_ready, bool core_reaped,
+    bool helper_required, bool helper_identity_ready, bool helper_reaped,
+    bool matcher_required, bool matcher_verified,
+    bool rules_initialized, bool rules_verified) {
+    return runtime_startup_components_verified(
+        core_identity_ready, core_reaped,
+        helper_required, helper_identity_ready, helper_reaped,
+        matcher_required, matcher_verified, rules_initialized, rules_verified);
+}
+#endif
+
 void asteriskd_runtime_delta_init(struct asteriskd_runtime_delta *delta) {
     if (delta == NULL) return;
     memset(delta, 0, sizeof(*delta));
@@ -1075,12 +1118,19 @@ struct asteriskd_system_supervisor {
     struct asteriskd_rules_runtime rules_runtime;
     struct asteriskd_rules_backend rules_backend;
     bool rules_initialized;
+    bool rules_verified;
+    bool local_address_snapshot_active;
+    struct asteriskd_address_set local_ipv4_snapshot;
+    struct asteriskd_address_set local_ipv6_snapshot;
     bool has_global_ipv6_address;
     bool recovery_only;
     bool recovery_cancelled;
     bool recovery_kill_escalated;
     bool cleanup_in_progress;
 };
+
+static int system_collect_local_address_set(
+    struct asteriskd_system_supervisor *, int, struct asteriskd_address_set *);
 
 static const char *system_pin_path(
     struct asteriskd_system_supervisor *, enum asteriskd_pin_id);
@@ -1547,6 +1597,8 @@ static int system_accept_pump_delta(struct asteriskd_system_supervisor *system,
 
 static int system_pump_condition(struct asteriskd_system_supervisor *,
     const struct asteriskd_deadline *, asteriskd_runtime_predicate);
+static int system_pump_condition_periodic(struct asteriskd_system_supervisor *,
+    const struct asteriskd_deadline *, uint32_t, asteriskd_runtime_predicate);
 static bool system_stop_done(void *);
 
 static int system_effect_save(
@@ -1587,6 +1639,11 @@ static int system_effect_start_core(
             &system->loaded_config.config, (const char *const *)environ,
             &system->core_spec, error, sizeof(error)) != 0) return -1;
     system->core_spec_ready = true;
+    if (asteriskd_system_process_backends_init(&system->process_context,
+            &system->core_spec, NULL, &system->readiness_backend,
+            &system->stop_backend) != 0 ||
+        asteriskd_readiness_preflight(&system->loaded_config.config,
+            ASTERISKD_CHILD_CORE, &system->readiness_backend) != 0) return -1;
     if (asteriskd_process_spawn_system(
             &system->core_spec, &system->core_process, error, sizeof(error)) != 0) return -1;
     system->core_spawned = true;
@@ -1644,8 +1701,8 @@ static int system_effect_wait_core(void *opaque) {
         .armed = true,
         .monotonic_milliseconds = (int64_t)system->readiness.deadline_milliseconds,
     };
-    int pumped = system_pump_condition(
-        system, &deadline, system_core_readiness_done);
+    int pumped = system_pump_condition_periodic(system, &deadline,
+        ASTERISKD_READINESS_POLL_INTERVAL_MILLIS, system_core_readiness_done);
     if (pumped == 0 && system->readiness_result == ASTERISKD_READINESS_READY) return 0;
     return system->readiness_result == ASTERISKD_READINESS_TIMEOUT
         ? ASTERISKD_RUNTIME_EFFECT_READINESS_TIMEOUT : -1;
@@ -1661,6 +1718,11 @@ static int system_start_helper_process(
             asteriskd_system_anonymous_file_backend(), &system->helper_launch,
             error, sizeof(error)) != 0) return -1;
     system->helper_launch_ready = true;
+    if (asteriskd_system_process_backends_init(&system->process_context,
+            &system->core_spec, &system->helper_launch.process,
+            &system->readiness_backend, &system->stop_backend) != 0 ||
+        asteriskd_readiness_preflight(&system->loaded_config.config,
+            ASTERISKD_CHILD_HELPER, &system->readiness_backend) != 0) return -1;
     if (asteriskd_process_spawn_system(&system->helper_launch.process,
             &system->helper_process, error, sizeof(error)) != 0) return -1;
     system->helper_spawned = true;
@@ -1728,8 +1790,8 @@ static int system_effect_wait_helper(void *opaque) {
         .armed = true,
         .monotonic_milliseconds = (int64_t)system->helper_readiness.deadline_milliseconds,
     };
-    int pumped = system_pump_condition(
-        system, &deadline, system_helper_readiness_done);
+    int pumped = system_pump_condition_periodic(system, &deadline,
+        ASTERISKD_READINESS_POLL_INTERVAL_MILLIS, system_helper_readiness_done);
     if (pumped == 0 && system->helper_readiness_result == ASTERISKD_READINESS_READY) return 0;
     return system->helper_readiness_result == ASTERISKD_READINESS_TIMEOUT
         ? ASTERISKD_RUNTIME_EFFECT_READINESS_TIMEOUT : -1;
@@ -1763,6 +1825,24 @@ static int system_pump_condition(struct asteriskd_system_supervisor *system,
             now >= deadline->monotonic_milliseconds) return -1;
         struct asteriskd_runtime_delta delta;
         if (asteriskd_runtime_pump_once(system->runtime, deadline, &delta) != 0) return -1;
+        if (system_accept_pump_delta(system, &delta) != 0) return -1;
+    }
+}
+
+static int system_pump_condition_periodic(struct asteriskd_system_supervisor *system,
+    const struct asteriskd_deadline *deadline, uint32_t interval,
+    asteriskd_runtime_predicate predicate) {
+    if (deadline == NULL || !deadline->armed || predicate == NULL) return -1;
+    for (;;) {
+        if (predicate(system)) return 0;
+        int64_t now = 0;
+        if (system_runtime_clock(system, &now) != 0 ||
+            now >= deadline->monotonic_milliseconds) return -1;
+        struct asteriskd_deadline iteration = {.armed = true};
+        if (runtime_periodic_deadline(now, deadline->monotonic_milliseconds,
+                interval, &iteration.monotonic_milliseconds) != 0) return -1;
+        struct asteriskd_runtime_delta delta;
+        if (asteriskd_runtime_pump_once(system->runtime, &iteration, &delta) != 0) return -1;
         if (system_accept_pump_delta(system, &delta) != 0) return -1;
     }
 }
@@ -2326,53 +2406,36 @@ static int system_append_dns_tproxy(struct asteriskd_system_supervisor *system,
 
 static int system_populate_local_chain(struct asteriskd_system_supervisor *system,
     enum asteriskd_ip_family family, const char *chain) {
-    struct ifaddrs *addresses = NULL;
-    if (getifaddrs(&addresses) != 0) return -1;
-    struct asteriskd_interface_address candidates[ASTERISKD_MAX_ADDRESSES];
-    size_t count = 0U;
-    int result = 0;
-    for (const struct ifaddrs *item = addresses; item != NULL; item = item->ifa_next) {
-        int native_family = family == ASTERISKD_IP_FAMILY_IPV4 ? AF_INET : AF_INET6;
-        if (item->ifa_addr == NULL || item->ifa_addr->sa_family != native_family) continue;
-        if (count >= ASTERISKD_MAX_ADDRESSES) {
-            result = -1;
-            break;
-        }
-        void *source = family == ASTERISKD_IP_FAMILY_IPV4
-            ? (void *)&((struct sockaddr_in *)item->ifa_addr)->sin_addr
-            : (void *)&((struct sockaddr_in6 *)item->ifa_addr)->sin6_addr;
-        if (inet_ntop(native_family, source, candidates[count].address,
-                sizeof(candidates[count].address)) == NULL ||
-            snprintf(candidates[count].interface_name,
-                sizeof(candidates[count].interface_name), "%s", item->ifa_name) <= 0) {
-            result = -1;
-            break;
-        }
-        ++count;
+    int address_family = family == ASTERISKD_IP_FAMILY_IPV4
+        ? ASTERISKD_ADDRESS_IPV4 : ASTERISKD_ADDRESS_IPV6;
+    struct asteriskd_address_set live;
+    const struct asteriskd_address_set *set = NULL;
+    if (system->local_address_snapshot_active) {
+        set = family == ASTERISKD_IP_FAMILY_IPV4
+            ? &system->local_ipv4_snapshot : &system->local_ipv6_snapshot;
+    } else if (system_collect_local_address_set(system, address_family, &live) == 0) {
+        set = &live;
     }
-    if (result == 0) {
-        struct asteriskd_address_set set;
-        char error[128U];
-        int address_family = family == ASTERISKD_IP_FAMILY_IPV4
-            ? ASTERISKD_ADDRESS_IPV4 : ASTERISKD_ADDRESS_IPV6;
-        if (asteriskd_local_address_set_build(&system->loaded_config.config,
-                address_family, candidates, count, &set, error, sizeof(error)) != 0) {
-            result = -1;
-        } else {
-            char cidr[ASTERISKD_MAX_CIDR];
-            for (size_t index = 0U; index < set.count; ++index) {
-                int written = snprintf(cidr, sizeof(cidr), "%s/%u", set.values[index],
-                    family == ASTERISKD_IP_FAMILY_IPV4 ? 32U : 128U);
-                if (written <= 0 || (size_t)written >= sizeof(cidr) ||
-                    system_append_return_cidr(system, family, chain, cidr) != 0) {
-                    result = -1;
-                    break;
-                }
-            }
-        }
+    if (set == NULL || set->family != address_family) return -1;
+    char cidr[ASTERISKD_MAX_CIDR];
+    for (size_t index = 0U; index < set->count; ++index) {
+        int written = snprintf(cidr, sizeof(cidr), "%s/%u", set->values[index],
+            family == ASTERISKD_IP_FAMILY_IPV4 ? 32U : 128U);
+        if (written <= 0 || (size_t)written >= sizeof(cidr) ||
+            system_append_return_cidr(system, family, chain, cidr) != 0) return -1;
     }
-    freeifaddrs(addresses);
-    return result;
+    return 0;
+}
+
+static int system_append_local_bypass_interval(
+    struct asteriskd_system_supervisor *system,
+    enum asteriskd_ip_family family,
+    const char *consumer_chain,
+    const char *local_begin,
+    const char *local_end) {
+    return system_append_jump(system, family, consumer_chain, local_begin) == 0 &&
+        system_populate_local_chain(system, family, consumer_chain) == 0 &&
+        system_append_jump(system, family, consumer_chain, local_end) == 0 ? 0 : -1;
 }
 
 static int system_append_policy_output(struct asteriskd_system_supervisor *system,
@@ -2416,8 +2479,8 @@ static int system_populate_common_output_prefix(
     if (config->enable_local_dns && system_append_dns_mark(system, family, chain, true) != 0) {
         return -1;
     }
-    if (system_append_jump(system, family, chain, local_begin) != 0 ||
-        system_append_jump(system, family, chain, local_end) != 0) return -1;
+    if (system_append_local_bypass_interval(
+            system, family, chain, local_begin, local_end) != 0) return -1;
     for (size_t remaining = config->proxy_private_cidr_count; remaining > 0U; --remaining) {
         const char *cidr = config->proxy_private_cidrs[remaining - 1U];
         if (!system_cidr_matches_family(cidr, family)) continue;
@@ -2437,8 +2500,8 @@ static int system_populate_tproxy_prerouting(
     const char *chain, const char *local_begin, const char *local_end) {
     const struct asteriskd_config *config = &system->loaded_config.config;
     if (config->enable_local_dns && system_append_dns_tproxy(system, family, chain) != 0) return -1;
-    if (system_append_jump(system, family, chain, local_begin) != 0 ||
-        system_append_jump(system, family, chain, local_end) != 0) return -1;
+    if (system_append_local_bypass_interval(
+            system, family, chain, local_begin, local_end) != 0) return -1;
     for (size_t prefix_remaining = config->hotspot_interface_prefix_count;
          prefix_remaining > 0U; --prefix_remaining) {
         const char *interface_name = config->hotspot_interface_prefixes[prefix_remaining - 1U];
@@ -2512,8 +2575,8 @@ static int system_populate_tun_prerouting(
     if (config->enable_local_dns && system_append_dns_mark(system, family, chain, false) != 0) {
         return -1;
     }
-    if (system_append_jump(system, family, chain, local_begin) != 0 ||
-        system_append_jump(system, family, chain, local_end) != 0) return -1;
+    if (system_append_local_bypass_interval(
+            system, family, chain, local_begin, local_end) != 0) return -1;
     for (size_t remaining = config->proxy_private_cidr_count; remaining > 0U; --remaining) {
         const char *cidr = config->proxy_private_cidrs[remaining - 1U];
         if (!system_cidr_matches_family(cidr, family)) continue;
@@ -2606,8 +2669,7 @@ static int system_populate_private_chain(
     const char *local_end = family == ASTERISKD_IP_FAMILY_IPV4
         ? "ASTERISKD_LOCAL4_END" : "ASTERISKD_LOCAL6_END";
     if (group->chain_id == ASTERISKD_CHAIN_LOCAL_BYPASS) {
-        return strstr(chain, "_BEGIN") != NULL
-            ? system_populate_local_chain(system, family, chain) : 0;
+        return 0;
     }
     if (group->chain_id == ASTERISKD_CHAIN_TPROXY) {
         if (strstr(chain, "DUMMY") != NULL) return system_populate_dummy_chain(system, chain);
@@ -2683,9 +2745,18 @@ static int system_verify_private_chain_contents(
     if (system_xtables_run(system, group->family, group->table,
             "-S", chain, NULL, 0U, true, &exit_status) != 0 ||
         exit_status != 0 || system->action_stdout_overflow) return -1;
-    return asteriskd_xtables_private_chain_shape_valid(
-        system->action_stdout, system->action_stdout_length,
-        chain, expected_rule_count) ? 0 : -1;
+    if (asteriskd_xtables_private_chain_shape_valid(
+            system->action_stdout, system->action_stdout_length,
+            chain, expected_rule_count)) return 0;
+    char message[256U];
+    int written = snprintf(message, sizeof(message),
+        "private chain shape mismatch: chain=%s expectedRules=%zu outputBytes=%zu",
+        chain, expected_rule_count, system->action_stdout_length);
+    if (written > 0 && (size_t)written < sizeof(message)) {
+        (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
+            ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+    }
+    return -1;
 }
 
 static int system_verify_private_group_contents(
@@ -3881,7 +3952,8 @@ static int system_start_and_verify_bpf2(struct asteriskd_system_supervisor *syst
         .monotonic_milliseconds = now +
             (int64_t)system->loaded_config.config.readiness_timeout_milliseconds,
     };
-    return system_pump_condition(system, &deadline, system_bpf2_pins_ready) == 0 &&
+    return system_pump_condition_periodic(system, &deadline,
+            ASTERISKD_READINESS_POLL_INTERVAL_MILLIS, system_bpf2_pins_ready) == 0 &&
         system->bpf2_verified && !system->helper_reaped ? 0 : -1;
 }
 
@@ -4939,6 +5011,149 @@ static int system_collect_local_address_set(
         family, candidates, count, set, error, sizeof(error)) == 0 ? 0 : -1;
 }
 
+static bool system_uses_iptables_local_bypass(
+    const struct asteriskd_system_supervisor *system) {
+    enum asteriskd_mode mode = system->loaded_config.config.mode;
+    return mode == ASTERISKD_MODE_TPROXY || mode == ASTERISKD_MODE_TUN ||
+        mode == ASTERISKD_MODE_TUN2SOCKS;
+}
+
+static int system_capture_local_address_snapshot(
+    struct asteriskd_system_supervisor *system) {
+    system->local_address_snapshot_active = false;
+    memset(&system->local_ipv4_snapshot, 0, sizeof(system->local_ipv4_snapshot));
+    memset(&system->local_ipv6_snapshot, 0, sizeof(system->local_ipv6_snapshot));
+    if (!system_uses_iptables_local_bypass(system)) return 0;
+    if (system_collect_local_address_set(system, ASTERISKD_ADDRESS_IPV4,
+            &system->local_ipv4_snapshot) != 0) return -1;
+    if (system->loaded_config.config.enable_ipv6) {
+        if (system_collect_local_address_set(system, ASTERISKD_ADDRESS_IPV6,
+                &system->local_ipv6_snapshot) != 0) return -1;
+    } else {
+        system->local_ipv6_snapshot.family = ASTERISKD_ADDRESS_IPV6;
+    }
+    system->local_address_snapshot_active = true;
+    return 0;
+}
+
+static void system_clear_local_address_snapshot(
+    struct asteriskd_system_supervisor *system) {
+    system->local_address_snapshot_active = false;
+    memset(&system->local_ipv4_snapshot, 0, sizeof(system->local_ipv4_snapshot));
+    memset(&system->local_ipv6_snapshot, 0, sizeof(system->local_ipv6_snapshot));
+}
+
+static int system_apply_local_bypass_plan(
+    struct asteriskd_system_supervisor *system,
+    enum asteriskd_ip_family family,
+    const char *consumer_chain,
+    const struct asteriskd_local_bypass_plan *plan) {
+    for (size_t index = 0U; index < plan->operation_count; ++index) {
+        const struct asteriskd_local_bypass_operation *operation = &plan->operations[index];
+        char cidr[ASTERISKD_MAX_CIDR];
+        int written = snprintf(cidr, sizeof(cidr), "%s/%u", operation->address,
+            family == ASTERISKD_IP_FAMILY_IPV4 ? 32U : 128U);
+        if (written <= 0 || (size_t)written >= sizeof(cidr)) return -1;
+        if (operation->kind == ASTERISKD_LOCAL_BYPASS_INSERT) {
+            char position[24U];
+            written = snprintf(position, sizeof(position), "%zu", operation->rule_number);
+            const char *arguments[] = {position, "-d", cidr, "-j", "RETURN"};
+            if (written <= 0 || (size_t)written >= sizeof(position) ||
+                system_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE,
+                    "-I", consumer_chain, arguments,
+                    sizeof(arguments) / sizeof(arguments[0])) != 0) return -1;
+        } else if (operation->kind == ASTERISKD_LOCAL_BYPASS_DELETE) {
+            const char *arguments[] = {"-d", cidr, "-j", "RETURN"};
+            if (system_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE,
+                    "-D", consumer_chain, arguments,
+                    sizeof(arguments) / sizeof(arguments[0])) != 0) return -1;
+        } else {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int system_reconcile_local_bypass_consumer(
+    struct asteriskd_system_supervisor *system,
+    enum asteriskd_ip_family family,
+    const char *consumer_chain,
+    const char *begin_chain,
+    const char *end_chain,
+    const struct asteriskd_address_set *desired) {
+    int exit_status = -1;
+    if (system_xtables_run(system, family, ASTERISKD_IP_TABLE_MANGLE,
+            "-S", consumer_chain, NULL, 0U, true, &exit_status) != 0 ||
+        exit_status != 0 || system->action_stdout_overflow) return -1;
+    struct asteriskd_local_bypass_plan plan;
+    char error[160U];
+    int address_family = family == ASTERISKD_IP_FAMILY_IPV4
+        ? ASTERISKD_ADDRESS_IPV4 : ASTERISKD_ADDRESS_IPV6;
+    if (asteriskd_local_bypass_plan_build(address_family, consumer_chain,
+            begin_chain, end_chain, system->action_stdout, system->action_stdout_length,
+            desired, &plan, error, sizeof(error)) != 0) {
+        char message[256U];
+        int written = snprintf(message, sizeof(message),
+            "local bypass plan failed: chain=%s detail=%s", consumer_chain, error);
+        if (written > 0 && (size_t)written < sizeof(message)) {
+            (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
+                ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+        }
+        return -1;
+    }
+    return system_apply_local_bypass_plan(system, family, consumer_chain, &plan);
+}
+
+static int system_reconcile_iptables_local_family(
+    struct asteriskd_system_supervisor *system,
+    enum asteriskd_ip_family family) {
+    const struct asteriskd_private_chain_group *local_group = NULL;
+    const struct asteriskd_private_chain_group *consumer_group = NULL;
+    enum asteriskd_chain_id consumer_id = system->loaded_config.config.mode ==
+        ASTERISKD_MODE_TPROXY ? ASTERISKD_CHAIN_TPROXY : ASTERISKD_CHAIN_ROUTING;
+    for (size_t index = 0U; index < system->rules_runtime.plan.private_group_count; ++index) {
+        const struct asteriskd_private_chain_group *group =
+            &system->rules_runtime.plan.private_groups[index];
+        if (group->family != family || group->table != ASTERISKD_IP_TABLE_MANGLE) continue;
+        if (group->chain_id == ASTERISKD_CHAIN_LOCAL_BYPASS) local_group = group;
+        else if (group->chain_id == consumer_id) consumer_group = group;
+    }
+    if (local_group == NULL || local_group->name_count != 2U || consumer_group == NULL) return -1;
+    const char *begin_chain = NULL;
+    const char *end_chain = NULL;
+    for (size_t index = 0U; index < local_group->name_count; ++index) {
+        const char *name = local_group->names[index];
+        if (strstr(name, "_BEGIN") != NULL) begin_chain = name;
+        else if (strstr(name, "_END") != NULL) end_chain = name;
+    }
+    if (begin_chain == NULL || end_chain == NULL) return -1;
+    int address_family = family == ASTERISKD_IP_FAMILY_IPV4
+        ? ASTERISKD_ADDRESS_IPV4 : ASTERISKD_ADDRESS_IPV6;
+    const struct asteriskd_address_set *desired = family == ASTERISKD_IP_FAMILY_IPV4
+        ? &system->local_ipv4_snapshot : &system->local_ipv6_snapshot;
+    if (!system->local_address_snapshot_active || desired->family != address_family) return -1;
+    for (size_t index = 0U; index < consumer_group->name_count; ++index) {
+        const char *consumer = consumer_group->names[index];
+        if (strstr(consumer, "PREROUTING") == NULL && strstr(consumer, "OUTPUT") == NULL) {
+            continue;
+        }
+        if (system_reconcile_local_bypass_consumer(system, family, consumer,
+                begin_chain, end_chain, desired) != 0) return -1;
+    }
+    return 0;
+}
+
+static int system_reconcile_iptables_local_bypass(
+    struct asteriskd_system_supervisor *system) {
+    if (!system_uses_iptables_local_bypass(system)) return 0;
+    if (!system->local_address_snapshot_active) return -1;
+    if (system_reconcile_iptables_local_family(
+            system, ASTERISKD_IP_FAMILY_IPV4) != 0) return -1;
+    return !system->loaded_config.config.enable_ipv6 ||
+        system_reconcile_iptables_local_family(
+            system, ASTERISKD_IP_FAMILY_IPV6) == 0 ? 0 : -1;
+}
+
 static int system_reconcile_bpf2_local_maps(
     struct asteriskd_system_supervisor *system) {
     if (system->loaded_config.config.mode != ASTERISKD_MODE_BPF2SOCKS) return 0;
@@ -5645,6 +5860,7 @@ static int system_effect_rules(void *opaque, bool *active,
     uint64_t *generation, uint32_t *categories) {
     struct asteriskd_system_supervisor *system = opaque;
     if (active == NULL || generation == NULL || categories == NULL) return -1;
+    system->rules_verified = false;
     if (!system->rules_initialized) system_rules_backend_init(system);
     if (system_detect_global_ipv6(&system->has_global_ipv6_address) != 0) return -1;
     if (system->network_opened && !system->network.no_op) {
@@ -5658,7 +5874,9 @@ static int system_effect_rules(void *opaque, bool *active,
             system_detect_global_ipv6(&system->has_global_ipv6_address) != 0) return -1;
     }
     const char *failed_stage = NULL;
-    if (asteriskd_rules_install(&system->rules_runtime,
+    if (system_capture_local_address_snapshot(system) != 0) {
+        failed_stage = "local-address-snapshot";
+    } else if (asteriskd_rules_install(&system->rules_runtime,
             &system->loaded_config.config, system->has_global_ipv6_address,
             &system->rules_backend) != 0) {
         failed_stage = "install";
@@ -5680,6 +5898,7 @@ static int system_effect_rules(void *opaque, bool *active,
         }
         return -1;
     }
+    system->rules_verified = true;
     if (system->loaded_config.config.mode == ASTERISKD_MODE_EBPF) {
         *active = false;
         *generation = 0U;
@@ -5696,12 +5915,38 @@ static int system_effect_reconcile(void *opaque, bool *active,
     uint64_t *generation, uint32_t *categories) {
     struct asteriskd_system_supervisor *system = opaque;
     if (active == NULL || generation == NULL || categories == NULL ||
-        !system->rules_initialized ||
-        system_recover_retired_interface_records(system) != 0 ||
-        asteriskd_rules_reconcile(&system->rules_runtime, &system->rules_backend) != 0 ||
-        system_reconcile_bpf2_local_maps(system) != 0 ||
-        system_reconcile_hotspot_tc(system) != 0 ||
-        asteriskd_rules_verify(&system->rules_runtime, &system->rules_backend) != 0) return -1;
+        !system->rules_initialized) return -1;
+    system->rules_verified = false;
+    const char *failed_stage = NULL;
+    if (system_capture_local_address_snapshot(system) != 0) {
+        failed_stage = "local-address-snapshot";
+    } else if (system_recover_retired_interface_records(system) != 0) {
+        failed_stage = "retired-interface-recovery";
+    } else if (system_reconcile_iptables_local_bypass(system) != 0) {
+        failed_stage = "iptables-local-bypass";
+    } else if (asteriskd_rules_reconcile(
+            &system->rules_runtime, &system->rules_backend) != 0) {
+        failed_stage = "rules-reconcile";
+    } else if (system_reconcile_bpf2_local_maps(system) != 0) {
+        failed_stage = "bpf2-local-map";
+    } else if (system_reconcile_hotspot_tc(system) != 0) {
+        failed_stage = "hotspot-tc";
+    } else if (asteriskd_rules_verify(
+            &system->rules_runtime, &system->rules_backend) != 0) {
+        failed_stage = "rules-verify";
+    }
+    system_clear_local_address_snapshot(system);
+    if (failed_stage != NULL) {
+        char message[160U];
+        int written = snprintf(message, sizeof(message),
+            "rules reconcile failed: stage=%s", failed_stage);
+        if (written > 0 && (size_t)written < sizeof(message)) {
+            (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
+                ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+        }
+        return -1;
+    }
+    system->rules_verified = true;
     if (system->loaded_config.config.mode == ASTERISKD_MODE_EBPF) {
         *active = false;
         *generation = 0U;
@@ -5723,12 +5968,14 @@ static int system_effect_network_immediate(void *opaque) {
 
 static int system_effect_verify(void *opaque) {
     struct asteriskd_system_supervisor *system = opaque;
-    if (!system->core_identity_ready || system->core_reaped) return -1;
-    if (system->loaded_config.config.helper.type != ASTERISKD_HELPER_NONE &&
-        (!system->helper_identity_ready || system->helper_reaped)) return -1;
-    if (system->loaded_config.config.matcher.enabled && !system->matcher_verified) return -1;
-    return system->rules_initialized && asteriskd_rules_verify(
-        &system->rules_runtime, &system->rules_backend) == 0 ? 0 : -1;
+    int result = runtime_startup_components_verified(
+        system->core_identity_ready, system->core_reaped,
+        system->loaded_config.config.helper.type != ASTERISKD_HELPER_NONE,
+        system->helper_identity_ready, system->helper_reaped,
+        system->loaded_config.config.matcher.enabled, system->matcher_verified,
+        system->rules_initialized, system->rules_verified) ? 0 : -1;
+    system_clear_local_address_snapshot(system);
+    return result;
 }
 
 static bool system_stop_done(void *opaque) {

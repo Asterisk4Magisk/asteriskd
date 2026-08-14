@@ -561,6 +561,28 @@ static const char *readiness_interface_name(
     return NULL;
 }
 
+static bool readiness_role_valid(
+    const struct asteriskd_config *config, enum asteriskd_child_role role) {
+    return role == ASTERISKD_CHILD_CORE ||
+        (role == ASTERISKD_CHILD_HELPER &&
+            (config->mode == ASTERISKD_MODE_TUN2SOCKS ||
+             config->mode == ASTERISKD_MODE_BPF2SOCKS));
+}
+
+int asteriskd_readiness_preflight(
+    const struct asteriskd_config *config,
+    enum asteriskd_child_role role,
+    const struct asteriskd_readiness_backend *backend) {
+    if (config == NULL || backend == NULL || backend->interface_exists == NULL ||
+        !readiness_role_valid(config, role)) return ASTERISKD_CONFIG_INVALID;
+    const char *interface_name = readiness_interface_name(config, role);
+    if (interface_name == NULL) return 0;
+    bool exists = false;
+    if (backend->interface_exists(
+            backend->context, interface_name, &exists) != 0) return ASTERISKD_READINESS_IO;
+    return exists ? ASTERISKD_READINESS_CONFLICT : 0;
+}
+
 int asteriskd_readiness_init(
     const struct asteriskd_config *config,
     enum asteriskd_child_role role,
@@ -571,19 +593,9 @@ int asteriskd_readiness_init(
     if (config == NULL || tracker == NULL || backend == NULL ||
         backend->identity_valid == NULL || backend->listener_owned == NULL ||
         backend->interface_exists == NULL ||
-        (role != ASTERISKD_CHILD_CORE && role != ASTERISKD_CHILD_HELPER) ||
-        (role == ASTERISKD_CHILD_HELPER &&
-            config->mode != ASTERISKD_MODE_TUN2SOCKS &&
-            config->mode != ASTERISKD_MODE_BPF2SOCKS) ||
+        !readiness_role_valid(config, role) ||
         now_milliseconds > UINT64_MAX - config->readiness_timeout_milliseconds) {
         return ASTERISKD_CONFIG_INVALID;
-    }
-    const char *interface_name = readiness_interface_name(config, role);
-    if (interface_name != NULL) {
-        bool exists = false;
-        if (backend->interface_exists(
-                backend->context, interface_name, &exists) != 0) return ASTERISKD_READINESS_IO;
-        if (exists) return ASTERISKD_READINESS_CONFLICT;
     }
     tracker->role = role;
     tracker->mode = config->mode;
