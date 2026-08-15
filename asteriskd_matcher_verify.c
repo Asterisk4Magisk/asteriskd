@@ -225,13 +225,16 @@ static int pin_shape(
     }
 }
 
-int asteriskd_matcher_verify(
+static int verify_pins(
     const struct asteriskd_config *config, const struct asteriskd_matcher_pin_plan *plan,
     const struct asteriskd_bpf_program_backend *backend,
-    struct asteriskd_matcher_verification *verification, char *error, size_t error_capacity) {
+    const struct asteriskd_bpf_pin_ownership_backend *ownership,
+    bool allow_absent, struct asteriskd_matcher_verification *verification,
+    char *error, size_t error_capacity) {
     if (verification != NULL) memset(verification, 0, sizeof(*verification));
     if (error != NULL && error_capacity != 0U) error[0] = '\0';
     if (config == NULL || plan == NULL || verification == NULL || !config->matcher.enabled ||
+        (allow_absent && (ownership == NULL || ownership->probe == NULL)) ||
         !backend_valid(backend) || plan->pin_count != (config->enable_ipv6 ? 4U : 2U)) {
         verify_error(error, error_capacity, "invalid matcher verification input");
         return ASTERISKD_CONFIG_INVALID;
@@ -242,6 +245,14 @@ int asteriskd_matcher_verify(
     uint32_t direct_v4_id = 0U;
     uint32_t direct_v6_id = 0U;
     for (size_t index = 0U; index < plan->pin_count; ++index) {
+        uint64_t expected_object_id = 0U;
+        if (allow_absent) {
+            bool exists = true;
+            if (ownership->probe(ownership->context, plan->pins[index].path,
+                    &exists, &expected_object_id) != 0 ||
+                (!exists && expected_object_id != 0U)) goto mismatch;
+            if (!exists) continue;
+        }
         bool output = false;
         enum matcher_map_role direct_role;
         if (pin_shape(plan->pins[index].pin_id, &output, &direct_role) != 0) goto mismatch;
@@ -254,7 +265,8 @@ int asteriskd_matcher_verify(
         if (backend->program_info(backend->context, program_fd, &info) != 0 ||
             info.object_id == 0U || info.type != ASTERISKD_BPF_PROGRAM_TYPE_SOCKET_FILTER ||
             strcmp(info.name, plan->pins[index].program_name) != 0 || !tag_nonzero(info.tag) ||
-            info.map_count > ASTERISKD_BPF_PROGRAM_MAX_MAPS) goto program_done;
+            info.map_count > ASTERISKD_BPF_PROGRAM_MAX_MAPS ||
+            (allow_absent && info.object_id != expected_object_id)) goto program_done;
         bool needs_uid = output && config->app_policy_mode != ASTERISKD_APP_POLICY_GLOBAL;
         bool needs_direct = config->direct_cidrs != NULL;
         size_t expected_maps = (needs_uid ? 1U : 0U) + (needs_direct ? 1U : 0U);
@@ -273,9 +285,10 @@ int asteriskd_matcher_verify(
                 verify_map(config, backend, id, direct_role) != 0) goto program_done;
             *known = id;
         }
-        result.pins[index].pin_id = plan->pins[index].pin_id;
-        result.pins[index].object_id = info.object_id;
-        memcpy(result.pins[index].tag, info.tag, sizeof(info.tag));
+        struct asteriskd_matcher_verified_pin *verified = &result.pins[result.pin_count];
+        verified->pin_id = plan->pins[index].pin_id;
+        verified->object_id = info.object_id;
+        memcpy(verified->tag, info.tag, sizeof(info.tag));
         ++result.pin_count;
         item_result = 0;
 
@@ -290,4 +303,21 @@ program_done:
 mismatch:
     verify_error(error, error_capacity, "matcher pin or map verification failed");
     return ASTERISKD_CONFIG_IO;
+}
+
+int asteriskd_matcher_verify(
+    const struct asteriskd_config *config, const struct asteriskd_matcher_pin_plan *plan,
+    const struct asteriskd_bpf_program_backend *backend,
+    struct asteriskd_matcher_verification *verification, char *error, size_t error_capacity) {
+    return verify_pins(config, plan, backend, NULL, false,
+        verification, error, error_capacity);
+}
+
+int asteriskd_matcher_verify_residue(
+    const struct asteriskd_config *config, const struct asteriskd_matcher_pin_plan *plan,
+    const struct asteriskd_bpf_program_backend *backend,
+    const struct asteriskd_bpf_pin_ownership_backend *ownership,
+    struct asteriskd_matcher_verification *verification, char *error, size_t error_capacity) {
+    return verify_pins(config, plan, backend, ownership, true,
+        verification, error, error_capacity);
 }

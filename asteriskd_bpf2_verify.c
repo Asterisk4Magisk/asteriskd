@@ -131,14 +131,17 @@ static int verify_program_pin(
     return result;
 }
 
-int asteriskd_bpf2_verify(
+static int verify_pins(
     const struct asteriskd_config *config, const struct asteriskd_bpf2_pin_plan *plan,
     const struct asteriskd_bpf_program_backend *backend,
-    struct asteriskd_bpf2_verification *verification, char *error, size_t error_capacity) {
+    const struct asteriskd_bpf_pin_ownership_backend *ownership,
+    bool allow_absent, struct asteriskd_bpf2_verification *verification,
+    char *error, size_t error_capacity) {
     if (verification != NULL) memset(verification, 0, sizeof(*verification));
     if (error != NULL && error_capacity != 0U) error[0] = '\0';
     size_t expected_count = config != NULL && config->enable_ipv6 ? 4U : 3U;
     if (config == NULL || plan == NULL || verification == NULL || !backend_valid(backend) ||
+        (allow_absent && (ownership == NULL || ownership->probe == NULL)) ||
         config->mode != ASTERISKD_MODE_BPF2SOCKS ||
         config->helper.type != ASTERISKD_HELPER_BPF2SOCKS || plan->pin_count != expected_count) {
         set_error(error, error_capacity, "invalid bpf2socks pin verification input");
@@ -147,12 +150,24 @@ int asteriskd_bpf2_verify(
     struct asteriskd_bpf2_verification result;
     memset(&result, 0, sizeof(result));
     for (size_t index = 0U; index < plan->pin_count; ++index) {
-        struct asteriskd_bpf2_verified_pin *verified = &result.pins[index];
+        uint64_t expected_object_id = 0U;
+        if (allow_absent) {
+            bool exists = true;
+            if (ownership->probe(ownership->context, plan->pins[index].path,
+                    &exists, &expected_object_id) != 0 ||
+                (!exists && expected_object_id != 0U)) {
+                set_error(error, error_capacity, "bpf2socks residue probe failed");
+                return ASTERISKD_CONFIG_IO;
+            }
+            if (!exists) continue;
+        }
+        struct asteriskd_bpf2_verified_pin *verified = &result.pins[result.pin_count];
         verified->pin_id = plan->pins[index].pin_id;
         int pin_result = plan->pins[index].program ?
             verify_program_pin(&plan->pins[index], backend, &verified->object_id, verified->tag) :
             verify_map_pin(&plan->pins[index], backend, &verified->object_id);
-        if (pin_result != 0) {
+        if (pin_result != 0 ||
+            (allow_absent && verified->object_id != expected_object_id)) {
             set_error(error, error_capacity, "bpf2socks pin verification failed");
             return pin_result;
         }
@@ -160,4 +175,21 @@ int asteriskd_bpf2_verify(
     }
     *verification = result;
     return 0;
+}
+
+int asteriskd_bpf2_verify(
+    const struct asteriskd_config *config, const struct asteriskd_bpf2_pin_plan *plan,
+    const struct asteriskd_bpf_program_backend *backend,
+    struct asteriskd_bpf2_verification *verification, char *error, size_t error_capacity) {
+    return verify_pins(config, plan, backend, NULL, false,
+        verification, error, error_capacity);
+}
+
+int asteriskd_bpf2_verify_residue(
+    const struct asteriskd_config *config, const struct asteriskd_bpf2_pin_plan *plan,
+    const struct asteriskd_bpf_program_backend *backend,
+    const struct asteriskd_bpf_pin_ownership_backend *ownership,
+    struct asteriskd_bpf2_verification *verification, char *error, size_t error_capacity) {
+    return verify_pins(config, plan, backend, ownership, true,
+        verification, error, error_capacity);
 }

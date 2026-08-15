@@ -2441,6 +2441,35 @@ int asteriskd_wal_apply(
     return wal_apply_records(store, state, record, 1U, false, backend, context, error, error_size);
 }
 
+int asteriskd_wal_apply_batch(
+    struct asteriskd_state_store *store,
+    struct asteriskd_state_document *state,
+    struct asteriskd_recovery_record *records,
+    size_t record_count,
+    const struct asteriskd_wal_effect_backend *backend,
+    void *context,
+    char *error,
+    size_t error_size) {
+    if (records == NULL || record_count < 2U) {
+        set_error(error, error_size, "invalid WAL batch");
+        return ASTERISKD_STATE_INVALID;
+    }
+    for (size_t index = 0U; index < record_count; ++index) {
+        enum asteriskd_recovery_kind kind = records[index].kind;
+        if (kind != ASTERISKD_RECOVERY_IPTABLES_CHAIN &&
+            kind != ASTERISKD_RECOVERY_IPTABLES_RULE &&
+            kind != ASTERISKD_RECOVERY_IP_RULE &&
+            kind != ASTERISKD_RECOVERY_ROUTE &&
+            kind != ASTERISKD_RECOVERY_DUMMY_INTERFACE) {
+            set_error(error, error_size, "unsupported WAL batch resource");
+            return ASTERISKD_STATE_INVALID;
+        }
+    }
+    return wal_apply_records(
+        store, state, records, record_count, false,
+        backend, context, error, error_size);
+}
+
 static bool pin_batch_valid(
     enum asteriskd_wal_pin_batch_kind kind,
     const struct asteriskd_state_document *state,

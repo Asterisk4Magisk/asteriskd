@@ -1326,6 +1326,7 @@ int asteriskd_ip_route_output_classify(
 
 struct asteriskd_rules_backend {
     void *ctx;
+    int (*wal_apply_plan)(void *, const struct asteriskd_rule_transaction_plan *);
     int (*wal_apply_private)(void *, const struct asteriskd_private_chain_group *);
     int (*wal_apply_route)(void *, const struct asteriskd_route_effect *);
     int (*wal_apply_hook)(void *, const struct asteriskd_traffic_hook_group *);
@@ -1354,6 +1355,8 @@ struct asteriskd_rules_runtime {
 void asteriskd_rules_runtime_init(struct asteriskd_rules_runtime *);
 bool asteriskd_xtables_private_chain_shape_valid(
     const char *, size_t, const char *, size_t);
+int asteriskd_xtables_private_chain_counts(
+    const char *, size_t, const char *, size_t *, size_t *);
 size_t asteriskd_xtables_hook_arguments(
     const struct asteriskd_traffic_hook *, const char **);
 int asteriskd_xtables_rule_output_count(
@@ -1665,6 +1668,10 @@ void asteriskd_state_store_close(struct asteriskd_state_store *);
 int asteriskd_wal_apply(
     struct asteriskd_state_store *, struct asteriskd_state_document *,
     struct asteriskd_recovery_record *, const struct asteriskd_wal_effect_backend *, void *, char *, size_t);
+int asteriskd_wal_apply_batch(
+    struct asteriskd_state_store *, struct asteriskd_state_document *,
+    struct asteriskd_recovery_record *, size_t,
+    const struct asteriskd_wal_effect_backend *, void *, char *, size_t);
 int asteriskd_wal_apply_pin_batch(
     struct asteriskd_state_store *, struct asteriskd_state_document *,
     enum asteriskd_wal_pin_batch_kind, struct asteriskd_recovery_record *, size_t,
@@ -1935,6 +1942,7 @@ enum asteriskd_cli_command {
 struct asteriskd_cli_invocation {
     enum asteriskd_cli_command command;
     enum asteriskd_sync_target sync_target;
+    bool watch_until_running;
     char path[ASTERISKD_MAX_PATH];
 };
 
@@ -2011,6 +2019,12 @@ struct asteriskd_control_client_backend {
     ptrdiff_t (*read_fd)(void *, int, void *, size_t);
     ptrdiff_t (*write_fd)(void *, int, const void *, size_t);
     int (*close_fd)(void *, int);
+};
+
+enum asteriskd_control_sink_result {
+    ASTERISKD_CONTROL_SINK_ERROR = -1,
+    ASTERISKD_CONTROL_SINK_CONTINUE = 0,
+    ASTERISKD_CONTROL_SINK_STOP = 1,
 };
 
 typedef int (*asteriskd_control_line_sink)(void *, const char *, size_t);
@@ -2420,6 +2434,16 @@ int asteriskd_bpf2_pin_preflight(
     const struct asteriskd_bpf_pin_ownership_backend *, char *, size_t);
 int asteriskd_bpf_pin_cleanup_owned(
     const char *, uint64_t, const struct asteriskd_bpf_pin_ownership_backend *, char *, size_t);
+int asteriskd_matcher_verify_residue(
+    const struct asteriskd_config *, const struct asteriskd_matcher_pin_plan *,
+    const struct asteriskd_bpf_program_backend *,
+    const struct asteriskd_bpf_pin_ownership_backend *,
+    struct asteriskd_matcher_verification *, char *, size_t);
+int asteriskd_bpf2_verify_residue(
+    const struct asteriskd_config *, const struct asteriskd_bpf2_pin_plan *,
+    const struct asteriskd_bpf_program_backend *,
+    const struct asteriskd_bpf_pin_ownership_backend *,
+    struct asteriskd_bpf2_verification *, char *, size_t);
 const struct asteriskd_bpf_pin_ownership_backend *
     asteriskd_system_bpf_pin_ownership_backend(void);
 int asteriskd_bpf2_verify(

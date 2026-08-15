@@ -1029,6 +1029,38 @@ enum system_tc_netlink_query_kind {
     SYSTEM_TC_NETLINK_QUERY_QDISC,
 };
 
+struct system_text_batch {
+    unsigned char *bytes;
+    size_t length;
+    size_t capacity;
+};
+
+struct system_rule_command_batch {
+    struct system_text_batch xtables;
+    struct system_text_batch ip[ASTERISKD_IP_FAMILY_COUNT];
+    bool active;
+};
+
+enum system_rule_snapshot_phase {
+    SYSTEM_RULE_SNAPSHOT_NONE,
+    SYSTEM_RULE_SNAPSHOT_BEFORE_APPLY,
+    SYSTEM_RULE_SNAPSHOT_NEEDS_VERIFY,
+    SYSTEM_RULE_SNAPSHOT_AFTER_APPLY,
+};
+
+struct system_rule_view {
+    char *bytes;
+    size_t length;
+    bool present;
+};
+
+struct system_rule_snapshot {
+    struct system_rule_view xtables[ASTERISKD_IP_FAMILY_COUNT][ASTERISKD_IP_TABLE_COUNT];
+    struct system_rule_view ip_rules[ASTERISKD_IP_FAMILY_COUNT];
+    struct system_rule_view ip_routes[ASTERISKD_IP_FAMILY_COUNT];
+    enum system_rule_snapshot_phase phase;
+};
+
 struct asteriskd_system_supervisor {
     struct asteriskd_loaded_config loaded_config;
     struct asteriskd_logger logger;
@@ -1102,6 +1134,8 @@ struct asteriskd_system_supervisor {
     bool action_stdout_overflow;
     char action_stdout[65536U];
     size_t action_stdout_length;
+    struct system_rule_command_batch rule_commands;
+    struct system_rule_snapshot rule_snapshot;
     bool verify_private_rules;
     size_t verified_private_rule_count;
     struct asteriskd_system_process_context process_context;
@@ -2105,6 +2139,186 @@ static int system_action_run_argv(struct asteriskd_system_supervisor *system,
     return result;
 }
 
+#define SYSTEM_RULE_BATCH_MAX_BYTES (8U * 1024U * 1024U)
+
+static void system_text_batch_destroy(struct system_text_batch *batch) {
+    if (batch == NULL) return;
+    free(batch->bytes);
+    memset(batch, 0, sizeof(*batch));
+}
+
+static int system_text_batch_append(
+    struct system_text_batch *batch, const void *bytes, size_t length) {
+    if (batch == NULL || (length != 0U && bytes == NULL) ||
+        length > SYSTEM_RULE_BATCH_MAX_BYTES - batch->length) return -1;
+    size_t required = batch->length + length;
+    if (required > batch->capacity) {
+        size_t capacity = batch->capacity == 0U ? 4096U : batch->capacity;
+        while (capacity < required) {
+            if (capacity > SYSTEM_RULE_BATCH_MAX_BYTES / 2U) {
+                capacity = SYSTEM_RULE_BATCH_MAX_BYTES;
+                break;
+            }
+            capacity *= 2U;
+        }
+        unsigned char *resized = realloc(batch->bytes, capacity);
+        if (resized == NULL) return -1;
+        batch->bytes = resized;
+        batch->capacity = capacity;
+    }
+    if (length != 0U) memcpy(batch->bytes + batch->length, bytes, length);
+    batch->length = required;
+    return 0;
+}
+
+static int system_text_batch_append_byte(
+    struct system_text_batch *batch, unsigned char byte) {
+    return system_text_batch_append(batch, &byte, 1U);
+}
+
+static int system_rule_batch_append_shell_argument(
+    struct system_text_batch *batch, const char *argument) {
+    if (argument == NULL || argument[0] == '\0' ||
+        system_text_batch_append_byte(batch, '\'') != 0) return -1;
+    for (size_t index = 0U; argument[index] != '\0'; ++index) {
+        unsigned char byte = (unsigned char)argument[index];
+        if (byte == '\n' || byte == '\r' || byte == '\0') return -1;
+        if (byte == '\'') {
+            static const char escaped[] = "'\\''";
+            if (system_text_batch_append(
+                    batch, escaped, sizeof(escaped) - 1U) != 0) return -1;
+        } else if (system_text_batch_append_byte(batch, byte) != 0) {
+            return -1;
+        }
+    }
+    return system_text_batch_append_byte(batch, '\'');
+}
+
+static int system_rule_batch_append_shell_command(
+    struct system_text_batch *batch, const char *const *argv) {
+    if (batch == NULL || argv == NULL || argv[0] == NULL) return -1;
+    for (size_t index = 0U; argv[index] != NULL; ++index) {
+        if (index != 0U && system_text_batch_append_byte(batch, ' ') != 0) return -1;
+        if (system_rule_batch_append_shell_argument(batch, argv[index]) != 0) return -1;
+    }
+    return system_text_batch_append_byte(batch, '\n');
+}
+
+static int system_rule_batch_append_ip_command(
+    struct system_text_batch *batch,
+    const char *const *arguments, size_t argument_count) {
+    if (batch == NULL || arguments == NULL || argument_count == 0U) return -1;
+    for (size_t index = 0U; index < argument_count; ++index) {
+        const char *argument = arguments[index];
+        if (argument == NULL || argument[0] == '\0') return -1;
+        if (index != 0U && system_text_batch_append_byte(batch, ' ') != 0) return -1;
+        for (size_t byte_index = 0U; argument[byte_index] != '\0'; ++byte_index) {
+            unsigned char byte = (unsigned char)argument[byte_index];
+            if (byte <= 0x20U || byte >= 0x7fU ||
+                system_text_batch_append_byte(batch, byte) != 0) return -1;
+        }
+    }
+    return system_text_batch_append_byte(batch, '\n');
+}
+
+static void system_rule_batch_destroy(struct system_rule_command_batch *batch) {
+    if (batch == NULL) return;
+    system_text_batch_destroy(&batch->xtables);
+    for (size_t index = 0U; index < ASTERISKD_IP_FAMILY_COUNT; ++index) {
+        system_text_batch_destroy(&batch->ip[index]);
+    }
+    batch->active = false;
+}
+
+static int system_rule_batch_begin(struct system_rule_command_batch *batch) {
+    static const char header[] = "set -eu\n";
+    if (batch == NULL || batch->active) return -1;
+    system_rule_batch_destroy(batch);
+    batch->active = true;
+    if (system_text_batch_append(
+            &batch->xtables, header, sizeof(header) - 1U) == 0) return 0;
+    system_rule_batch_destroy(batch);
+    return -1;
+}
+
+static int system_action_run_document(
+    struct asteriskd_system_supervisor *system,
+    const char *const *argv,
+    const struct system_text_batch *batch,
+    int *exit_status) {
+    if (system == NULL || argv == NULL || batch == NULL || batch->length == 0U ||
+        exit_status == NULL) return -1;
+    const struct asteriskd_anonymous_file_backend *backend =
+        asteriskd_system_anonymous_file_backend();
+    struct asteriskd_anonymous_document document = {
+        .bytes = batch->bytes,
+        .length = batch->length,
+    };
+    struct asteriskd_anonymous_file file;
+    memset(&file, 0, sizeof(file));
+    char error[128U];
+    if (asteriskd_anonymous_file_create(
+            backend, "asteriskd-rule-batch", &document,
+            &file, error, sizeof(error)) != 0) return -1;
+    struct asteriskd_process_spec spec;
+    memset(&spec, 0, sizeof(spec));
+    int result = -1;
+    if (system_action_spec(argv, &spec) == 0) {
+        spec.inherited_fds[0] = file.fd;
+        spec.inherited_fd_targets[0] = 3;
+        spec.inherited_fd_count = 1U;
+        result = system_action_run_spec(system, &spec, false, exit_status);
+    }
+    asteriskd_process_spec_destroy(&spec);
+    if (asteriskd_anonymous_file_close(backend, &file) != 0) result = -1;
+    return result;
+}
+
+static int system_rule_batch_reset_xtables(
+    struct system_rule_command_batch *batch) {
+    static const char header[] = "set -eu\n";
+    system_text_batch_destroy(&batch->xtables);
+    return system_text_batch_append(
+        &batch->xtables, header, sizeof(header) - 1U);
+}
+
+static int system_rule_batch_flush_xtables(
+    struct asteriskd_system_supervisor *system) {
+    struct system_rule_command_batch *batch = &system->rule_commands;
+    static const size_t header_length = sizeof("set -eu\n") - 1U;
+    if (!batch->active || batch->xtables.length < header_length) return -1;
+    if (batch->xtables.length == header_length) return 0;
+    const char *argv[] = {"/system/bin/sh", "/proc/self/fd/3", NULL};
+    int exit_status = -1;
+    int result = system_action_run_document(
+        system, argv, &batch->xtables, &exit_status);
+    if (result != 0 || exit_status != 0) return -1;
+    return system_rule_batch_reset_xtables(batch);
+}
+
+static int system_rule_batch_flush_ip(
+    struct asteriskd_system_supervisor *system) {
+    struct system_rule_command_batch *batch = &system->rule_commands;
+    if (!batch->active) return -1;
+    for (size_t index = 0U; index < ASTERISKD_IP_FAMILY_COUNT; ++index) {
+        struct system_text_batch *commands = &batch->ip[index];
+        if (commands->length == 0U) continue;
+        const char *argv[] = {
+            "/system/bin/ip",
+            index == ASTERISKD_IP_FAMILY_IPV4 ? "-4" : "-6",
+            "-batch",
+            "/proc/self/fd/3",
+            NULL,
+        };
+        int exit_status = -1;
+        if (system_action_run_document(
+                system, argv, commands, &exit_status) != 0 ||
+            exit_status != 0) return -1;
+        system_text_batch_destroy(commands);
+    }
+    return 0;
+}
+
 static int system_capability_find(
     void *opaque, const char *name, char *path, size_t capacity) {
     (void)opaque;
@@ -2227,6 +2441,20 @@ static int system_xtables(struct asteriskd_system_supervisor *system,
         arguments, argument_count, false, exit_status);
 }
 
+static int system_xtables_table(
+    struct asteriskd_system_supervisor *system,
+    enum asteriskd_ip_family family,
+    enum asteriskd_ip_table table,
+    int *exit_status) {
+    const char *executable = system_xtables_path(family);
+    const char *table_name = system_table_name(table);
+    if (executable == NULL || table_name == NULL || exit_status == NULL) return -1;
+    const char *argv[] = {
+        executable, "-w", "100", "-t", table_name, "-S", NULL,
+    };
+    return system_action_run_argv(system, argv, true, exit_status);
+}
+
 static int system_xtables_zero(struct asteriskd_system_supervisor *system,
     enum asteriskd_ip_family family, enum asteriskd_ip_table table,
     const char *operation, const char *chain, const char *const *arguments,
@@ -2235,6 +2463,40 @@ static int system_xtables_zero(struct asteriskd_system_supervisor *system,
     if (system->verify_private_rules) {
         if (strcmp(operation, "-A") != 0) return -1;
         effective_operation = "-C";
+        if (system->rule_snapshot.phase == SYSTEM_RULE_SNAPSHOT_BEFORE_APPLY ||
+            system->rule_snapshot.phase == SYSTEM_RULE_SNAPSHOT_AFTER_APPLY) {
+            const struct system_rule_view *view =
+                &system->rule_snapshot.xtables[family][table];
+            size_t matches = 0U;
+            size_t position = 0U;
+            if (!view->present || asteriskd_xtables_rule_output_locate(
+                    view->bytes, view->length, chain, arguments, argument_count,
+                    &matches, &position) != 0 || matches != 1U) return -1;
+            ++system->verified_private_rule_count;
+            return 0;
+        }
+    }
+    if (system->rule_commands.active) {
+        const char *executable = system_xtables_path(family);
+        const char *table_name = system_table_name(table);
+        if (system->verify_private_rules || executable == NULL || table_name == NULL ||
+            argument_count > 24U || (argument_count != 0U && arguments == NULL)) return -1;
+        const char *argv[32U];
+        size_t count = 0U;
+        argv[count++] = executable;
+        argv[count++] = "-w";
+        argv[count++] = "100";
+        argv[count++] = "-t";
+        argv[count++] = table_name;
+        argv[count++] = operation;
+        argv[count++] = chain;
+        for (size_t index = 0U; index < argument_count; ++index) {
+            if (arguments[index] == NULL || arguments[index][0] == '\0') return -1;
+            argv[count++] = arguments[index];
+        }
+        argv[count] = NULL;
+        return system_rule_batch_append_shell_command(
+            &system->rule_commands.xtables, argv);
     }
     int exit_status = -1;
     int run_result = system_xtables(system, family, table, effective_operation, chain,
@@ -2269,9 +2531,33 @@ static int system_append_jump(struct asteriskd_system_supervisor *system,
         "-A", chain, arguments, 2U);
 }
 
+static int system_canonical_cidr(enum asteriskd_ip_family family,
+    const char *cidr, char *canonical, size_t capacity) {
+    if (cidr == NULL || canonical == NULL || capacity == 0U) return -1;
+    const char *slash = strrchr(cidr, '/');
+    size_t address_length = slash == NULL ? 0U : (size_t)(slash - cidr);
+    if (address_length == 0U || address_length >= INET6_ADDRSTRLEN) return -1;
+    char address[INET6_ADDRSTRLEN];
+    memcpy(address, cidr, address_length);
+    address[address_length] = '\0';
+    int native_family = family == ASTERISKD_IP_FAMILY_IPV4 ? AF_INET : AF_INET6;
+    union {
+        struct in_addr ipv4;
+        struct in6_addr ipv6;
+    } parsed;
+    char normalized[INET6_ADDRSTRLEN];
+    if (inet_pton(native_family, address, &parsed) != 1 ||
+        inet_ntop(native_family, &parsed, normalized, sizeof(normalized)) == NULL) return -1;
+    int written = snprintf(canonical, capacity, "%s%s", normalized, slash);
+    return written > 0 && (size_t)written < capacity ? 0 : -1;
+}
+
 static int system_append_return_cidr(struct asteriskd_system_supervisor *system,
     enum asteriskd_ip_family family, const char *chain, const char *cidr) {
-    const char *arguments[] = {"-d", cidr, "-j", "RETURN"};
+    char canonical[ASTERISKD_MAX_CIDR];
+    if (system_canonical_cidr(
+            family, cidr, canonical, sizeof(canonical)) != 0) return -1;
+    const char *arguments[] = {"-d", canonical, "-j", "RETURN"};
     return system_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE,
         "-A", chain, arguments, 4U);
 }
@@ -2305,6 +2591,17 @@ static int system_append_mark(struct asteriskd_system_supervisor *system,
     const char *bpf_path) {
     const char *arguments[24U];
     size_t count = 0U;
+    char canonical_destination[ASTERISKD_MAX_CIDR];
+    if (destination != NULL) {
+        if (system_canonical_cidr(family, destination, canonical_destination,
+                sizeof(canonical_destination)) != 0) return -1;
+        arguments[count++] = "-d";
+        arguments[count++] = canonical_destination;
+    }
+    if (input_interface != NULL) {
+        arguments[count++] = "-i";
+        arguments[count++] = input_interface;
+    }
     arguments[count++] = "-p";
     arguments[count++] = protocol;
     if (uid != NULL) {
@@ -2312,14 +2609,6 @@ static int system_append_mark(struct asteriskd_system_supervisor *system,
         arguments[count++] = "owner";
         arguments[count++] = "--uid-owner";
         arguments[count++] = uid;
-    }
-    if (input_interface != NULL) {
-        arguments[count++] = "-i";
-        arguments[count++] = input_interface;
-    }
-    if (destination != NULL) {
-        arguments[count++] = "-d";
-        arguments[count++] = destination;
     }
     if (bpf_path != NULL) {
         arguments[count++] = "-m";
@@ -2344,16 +2633,19 @@ static int system_append_tproxy(struct asteriskd_system_supervisor *system,
             (unsigned)system->loaded_config.config.transparent_port) <= 0) return -1;
     const char *arguments[24U];
     size_t count = 0U;
-    arguments[count++] = "-p";
-    arguments[count++] = protocol;
+    char canonical_destination[ASTERISKD_MAX_CIDR];
+    if (destination != NULL) {
+        if (system_canonical_cidr(family, destination, canonical_destination,
+                sizeof(canonical_destination)) != 0) return -1;
+        arguments[count++] = "-d";
+        arguments[count++] = canonical_destination;
+    }
     if (input_interface != NULL) {
         arguments[count++] = "-i";
         arguments[count++] = input_interface;
     }
-    if (destination != NULL) {
-        arguments[count++] = "-d";
-        arguments[count++] = destination;
-    }
+    arguments[count++] = "-p";
+    arguments[count++] = protocol;
     if (require_mark) {
         arguments[count++] = "-m";
         arguments[count++] = "mark";
@@ -2741,17 +3033,32 @@ static int system_verify_private_chain_contents(
     system->verified_private_rule_count = 0U;
     if (populated != 0) return -1;
 
-    int exit_status = -1;
-    if (system_xtables_run(system, group->family, group->table,
-            "-S", chain, NULL, 0U, true, &exit_status) != 0 ||
-        exit_status != 0 || system->action_stdout_overflow) return -1;
+    const char *observed = system->action_stdout;
+    size_t observed_length = system->action_stdout_length;
+    bool snapshot_active =
+        system->rule_snapshot.phase == SYSTEM_RULE_SNAPSHOT_BEFORE_APPLY ||
+        system->rule_snapshot.phase == SYSTEM_RULE_SNAPSHOT_AFTER_APPLY;
+    if (snapshot_active) {
+        const struct system_rule_view *view =
+            &system->rule_snapshot.xtables[group->family][group->table];
+        if (!view->present) return -1;
+        observed = view->bytes;
+        observed_length = view->length;
+    } else {
+        int exit_status = -1;
+        if (system_xtables_run(system, group->family, group->table,
+                "-S", chain, NULL, 0U, true, &exit_status) != 0 ||
+            exit_status != 0 || system->action_stdout_overflow) return -1;
+        observed = system->action_stdout;
+        observed_length = system->action_stdout_length;
+    }
     if (asteriskd_xtables_private_chain_shape_valid(
-            system->action_stdout, system->action_stdout_length,
+            observed, observed_length,
             chain, expected_rule_count)) return 0;
     char message[256U];
     int written = snprintf(message, sizeof(message),
         "private chain shape mismatch: chain=%s expectedRules=%zu outputBytes=%zu",
-        chain, expected_rule_count, system->action_stdout_length);
+        chain, expected_rule_count, observed_length);
     if (written > 0 && (size_t)written < sizeof(message)) {
         (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
             ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
@@ -2772,18 +3079,39 @@ static int system_verify_private_group_contents(
 static int system_remove_private_group(struct asteriskd_system_supervisor *system,
     const struct asteriskd_private_chain_group *group) {
     int result = 0;
+    bool snapshot_active =
+        system->rule_snapshot.phase == SYSTEM_RULE_SNAPSHOT_BEFORE_APPLY ||
+        system->rule_snapshot.phase == SYSTEM_RULE_SNAPSHOT_AFTER_APPLY;
+    const struct system_rule_view *view =
+        &system->rule_snapshot.xtables[group->family][group->table];
     for (size_t remaining = group->name_count; remaining > 0U; --remaining) {
         const char *name = group->names[remaining - 1U];
-        int exit_status = -1;
-        if (system_xtables(system, group->family, group->table,
-                "-S", name, NULL, 0U, &exit_status) != 0) {
-            result = -1;
-            continue;
-        }
-        if (exit_status == 1) continue;
-        if (exit_status != 0) {
-            result = -1;
-            continue;
+        if (snapshot_active) {
+            size_t declarations = 0U;
+            size_t rules = 0U;
+            if (!view->present || asteriskd_xtables_private_chain_counts(
+                    view->bytes, view->length, name,
+                    &declarations, &rules) != 0 || declarations > 1U) {
+                result = -1;
+                continue;
+            }
+            if (declarations == 0U && rules == 0U) continue;
+            if (declarations != 1U) {
+                result = -1;
+                continue;
+            }
+        } else {
+            int exit_status = -1;
+            if (system_xtables(system, group->family, group->table,
+                    "-S", name, NULL, 0U, &exit_status) != 0) {
+                result = -1;
+                continue;
+            }
+            if (exit_status == 1) continue;
+            if (exit_status != 0) {
+                result = -1;
+                continue;
+            }
         }
         if (system_xtables_zero(system, group->family, group->table,
                 "-F", name, NULL, 0U) != 0 ||
@@ -2819,13 +3147,28 @@ static int system_hook_match_count(struct asteriskd_system_supervisor *system,
     const char *chain = system_builtin_name(hook->builtin_chain);
     const char *arguments[ASTERISKD_XTABLES_MAX_HOOK_ARGUMENTS];
     size_t count = asteriskd_xtables_hook_arguments(hook, arguments);
-    int exit_status = -1;
-    if (chain == NULL || count == 0U || matches == NULL || position == NULL ||
-        system_xtables_run(system, group->family, group->table,
-            "-S", chain, NULL, 0U, true, &exit_status) != 0 ||
-        exit_status != 0 || system->action_stdout_overflow) return -1;
+    if (chain == NULL || count == 0U || matches == NULL || position == NULL) return -1;
+    const char *observed = system->action_stdout;
+    size_t observed_length = system->action_stdout_length;
+    bool snapshot_active =
+        system->rule_snapshot.phase == SYSTEM_RULE_SNAPSHOT_BEFORE_APPLY ||
+        system->rule_snapshot.phase == SYSTEM_RULE_SNAPSHOT_AFTER_APPLY;
+    if (snapshot_active) {
+        const struct system_rule_view *view =
+            &system->rule_snapshot.xtables[group->family][group->table];
+        if (!view->present) return -1;
+        observed = view->bytes;
+        observed_length = view->length;
+    } else {
+        int exit_status = -1;
+        if (system_xtables_run(system, group->family, group->table,
+                "-S", chain, NULL, 0U, true, &exit_status) != 0 ||
+            exit_status != 0 || system->action_stdout_overflow) return -1;
+        observed = system->action_stdout;
+        observed_length = system->action_stdout_length;
+    }
     return asteriskd_xtables_rule_output_locate(
-        system->action_stdout, system->action_stdout_length,
+        observed, observed_length,
         chain, arguments, count, matches, position);
 }
 
@@ -2861,12 +3204,8 @@ static int system_remove_hook_group(struct asteriskd_system_supervisor *system,
             matches > 1U || (matches == 1U && position == 0U)) {
             result = -1;
         } else if (matches == 1U) {
-            char position_text[24U];
-            int written = snprintf(position_text, sizeof(position_text), "%zu", position);
-            const char *delete_arguments[] = {position_text};
-            if (written <= 0 || (size_t)written >= sizeof(position_text) ||
-                system_xtables_zero(system, group->family, group->table,
-                    "-D", chain, delete_arguments, 1U) != 0) result = -1;
+            if (system_xtables_zero(system, group->family, group->table,
+                    "-D", chain, arguments, count) != 0) result = -1;
         }
     }
     return result;
@@ -2903,7 +3242,22 @@ static int system_probe_private_group(struct asteriskd_system_supervisor *system
     bool *any_present) {
     *all_present = true;
     *any_present = false;
+    bool snapshot_active =
+        system->rule_snapshot.phase == SYSTEM_RULE_SNAPSHOT_BEFORE_APPLY ||
+        system->rule_snapshot.phase == SYSTEM_RULE_SNAPSHOT_AFTER_APPLY;
+    const struct system_rule_view *view =
+        &system->rule_snapshot.xtables[group->family][group->table];
     for (size_t index = 0U; index < group->name_count; ++index) {
+        if (snapshot_active) {
+            size_t declarations = 0U;
+            size_t rules = 0U;
+            if (!view->present || asteriskd_xtables_private_chain_counts(
+                    view->bytes, view->length, group->names[index],
+                    &declarations, &rules) != 0) return -1;
+            if (declarations != 0U || rules != 0U) *any_present = true;
+            if (declarations != 1U) *all_present = false;
+            continue;
+        }
         int exit_status = -1;
         if (system_xtables(system, group->family, group->table, "-S",
                 group->names[index], NULL, 0U, &exit_status) != 0 ||
@@ -2933,9 +3287,109 @@ static int system_ip_command(struct asteriskd_system_supervisor *system,
 
 static int system_ip_zero(struct asteriskd_system_supervisor *system,
     enum asteriskd_ip_family family, const char *const *arguments, size_t argument_count) {
+    if (system->rule_commands.active) {
+        if (family < ASTERISKD_IP_FAMILY_IPV4 ||
+            family >= ASTERISKD_IP_FAMILY_COUNT) return -1;
+        return system_rule_batch_append_ip_command(
+            &system->rule_commands.ip[family], arguments, argument_count);
+    }
     int exit_status = -1;
     return system_ip_command(system, family, arguments, argument_count,
         false, &exit_status) == 0 && exit_status == 0 ? 0 : -1;
+}
+
+static void system_rule_view_destroy(struct system_rule_view *view) {
+    if (view == NULL) return;
+    free(view->bytes);
+    memset(view, 0, sizeof(*view));
+}
+
+static void system_rule_snapshot_destroy(struct system_rule_snapshot *snapshot) {
+    if (snapshot == NULL) return;
+    for (size_t family = 0U; family < ASTERISKD_IP_FAMILY_COUNT; ++family) {
+        for (size_t table = 0U; table < ASTERISKD_IP_TABLE_COUNT; ++table) {
+            system_rule_view_destroy(&snapshot->xtables[family][table]);
+        }
+        system_rule_view_destroy(&snapshot->ip_rules[family]);
+        system_rule_view_destroy(&snapshot->ip_routes[family]);
+    }
+    snapshot->phase = SYSTEM_RULE_SNAPSHOT_NONE;
+}
+
+static int system_rule_view_capture(
+    const struct asteriskd_system_supervisor *system,
+    struct system_rule_view *view) {
+    if (system == NULL || view == NULL || system->action_stdout_overflow) return -1;
+    system_rule_view_destroy(view);
+    if (system->action_stdout_length != 0U) {
+        view->bytes = malloc(system->action_stdout_length);
+        if (view->bytes == NULL) return -1;
+        memcpy(view->bytes, system->action_stdout, system->action_stdout_length);
+    }
+    view->length = system->action_stdout_length;
+    view->present = true;
+    return 0;
+}
+
+static int system_rule_snapshot_capture(
+    struct asteriskd_system_supervisor *system,
+    const struct asteriskd_rule_transaction_plan *plan,
+    enum system_rule_snapshot_phase phase) {
+    if (system == NULL || plan == NULL ||
+        (phase != SYSTEM_RULE_SNAPSHOT_BEFORE_APPLY &&
+         phase != SYSTEM_RULE_SNAPSHOT_AFTER_APPLY)) return -1;
+    bool tables[ASTERISKD_IP_FAMILY_COUNT][ASTERISKD_IP_TABLE_COUNT];
+    bool rules[ASTERISKD_IP_FAMILY_COUNT];
+    bool routes[ASTERISKD_IP_FAMILY_COUNT];
+    memset(tables, 0, sizeof(tables));
+    memset(rules, 0, sizeof(rules));
+    memset(routes, 0, sizeof(routes));
+    for (size_t index = 0U; index < plan->private_group_count; ++index) {
+        const struct asteriskd_private_chain_group *group = &plan->private_groups[index];
+        tables[group->family][group->table] = true;
+    }
+    for (size_t index = 0U; index < plan->hook_group_count; ++index) {
+        const struct asteriskd_traffic_hook_group *group = &plan->hook_groups[index];
+        tables[group->family][group->table] = true;
+    }
+    for (size_t index = 0U; index < plan->route_count; ++index) {
+        const struct asteriskd_route_effect *effect = &plan->routes[index];
+        if (effect->kind == ASTERISKD_ROUTE_EFFECT_IP_RULE) rules[effect->family] = true;
+        if (effect->kind == ASTERISKD_ROUTE_EFFECT_ROUTE) routes[effect->family] = true;
+    }
+    system_rule_snapshot_destroy(&system->rule_snapshot);
+    for (size_t family = 0U; family < ASTERISKD_IP_FAMILY_COUNT; ++family) {
+        for (size_t table = 0U; table < ASTERISKD_IP_TABLE_COUNT; ++table) {
+            if (!tables[family][table]) continue;
+            int exit_status = -1;
+            if (system_xtables_table(system, (enum asteriskd_ip_family)family,
+                    (enum asteriskd_ip_table)table, &exit_status) != 0 ||
+                exit_status != 0 || system_rule_view_capture(system,
+                    &system->rule_snapshot.xtables[family][table]) != 0) goto failed;
+        }
+        if (rules[family]) {
+            const char *arguments[] = {"rule", "show"};
+            int exit_status = -1;
+            if (system_ip_command(system, (enum asteriskd_ip_family)family,
+                    arguments, 2U, true, &exit_status) != 0 ||
+                exit_status != 0 || system_rule_view_capture(system,
+                    &system->rule_snapshot.ip_rules[family]) != 0) goto failed;
+        }
+        if (routes[family]) {
+            const char *arguments[] = {"route", "show", "table", "all"};
+            int exit_status = -1;
+            if (system_ip_command(system, (enum asteriskd_ip_family)family,
+                    arguments, 4U, true, &exit_status) != 0 ||
+                exit_status != 0 || system_rule_view_capture(system,
+                    &system->rule_snapshot.ip_routes[family]) != 0) goto failed;
+        }
+    }
+    system->rule_snapshot.phase = phase;
+    return 0;
+
+failed:
+    system_rule_snapshot_destroy(&system->rule_snapshot);
+    return -1;
 }
 
 static int system_tc_command(struct asteriskd_system_supervisor *system,
@@ -3745,6 +4199,19 @@ static int system_classify_route_effect(struct asteriskd_system_supervisor *syst
                 ? ASTERISKD_RULES_SLOT_OWNED : ASTERISKD_RULES_SLOT_FOREIGN;
         return 0;
     }
+    if (system->rule_snapshot.phase == SYSTEM_RULE_SNAPSHOT_BEFORE_APPLY ||
+        system->rule_snapshot.phase == SYSTEM_RULE_SNAPSHOT_AFTER_APPLY) {
+        const struct system_rule_view *view =
+            effect->kind == ASTERISKD_ROUTE_EFFECT_IP_RULE
+                ? &system->rule_snapshot.ip_rules[effect->family]
+                : &system->rule_snapshot.ip_routes[effect->family];
+        if (!view->present) return -1;
+        return effect->kind == ASTERISKD_ROUTE_EFFECT_IP_RULE
+            ? asteriskd_ip_rule_output_classify(
+                view->bytes, view->length, effect, state)
+            : asteriskd_ip_route_output_classify(
+                view->bytes, view->length, effect, state);
+    }
     char table[16U];
     char priority[16U];
     if (snprintf(table, sizeof(table), "%" PRIu32, effect->table) <= 0 ||
@@ -4125,6 +4592,14 @@ static int system_wal_probe_original(void *opaque,
     return -1;
 }
 
+static bool system_rule_recovery_kind(enum asteriskd_recovery_kind kind) {
+    return kind == ASTERISKD_RECOVERY_IPTABLES_CHAIN ||
+        kind == ASTERISKD_RECOVERY_IPTABLES_RULE ||
+        kind == ASTERISKD_RECOVERY_IP_RULE ||
+        kind == ASTERISKD_RECOVERY_ROUTE ||
+        kind == ASTERISKD_RECOVERY_DUMMY_INTERFACE;
+}
+
 static int system_wal_apply(void *opaque, const struct asteriskd_recovery_record *records,
     size_t count, char *error, size_t error_size) {
     struct asteriskd_system_supervisor *system = opaque;
@@ -4144,7 +4619,72 @@ static int system_wal_apply(void *opaque, const struct asteriskd_recovery_record
         records[0].resource.tc_filter.ownership == ASTERISKD_TC_OWNERSHIP_FOREIGN_SNAPSHOT) {
         return system_tc_delete_foreign_filter(system, &records[0].resource.tc_filter);
     }
-    if (count == 1U && records[0].kind == ASTERISKD_RECOVERY_IPTABLES_CHAIN) {
+    bool rule_batch = system_rule_recovery_kind(records[0].kind);
+    for (size_t index = 0U; rule_batch && index < count; ++index) {
+        enum asteriskd_recovery_kind kind = records[index].kind;
+        rule_batch = kind == ASTERISKD_RECOVERY_IPTABLES_CHAIN ||
+            kind == ASTERISKD_RECOVERY_IPTABLES_RULE ||
+            kind == ASTERISKD_RECOVERY_IP_RULE ||
+            kind == ASTERISKD_RECOVERY_ROUTE ||
+            kind == ASTERISKD_RECOVERY_DUMMY_INTERFACE;
+    }
+    if (rule_batch) {
+        enum asteriskd_recovery_kind previous_kind = ASTERISKD_RECOVERY_KIND_COUNT;
+        if (system_rule_batch_begin(&system->rule_commands) != 0) return -1;
+        for (size_t index = 0U; index < count; ++index) {
+            const struct asteriskd_recovery_record *record = &records[index];
+            bool route = record->kind == ASTERISKD_RECOVERY_IP_RULE ||
+                record->kind == ASTERISKD_RECOVERY_ROUTE ||
+                record->kind == ASTERISKD_RECOVERY_DUMMY_INTERFACE;
+            bool previous_route = previous_kind == ASTERISKD_RECOVERY_IP_RULE ||
+                previous_kind == ASTERISKD_RECOVERY_ROUTE ||
+                previous_kind == ASTERISKD_RECOVERY_DUMMY_INTERFACE;
+            if (route && !previous_route &&
+                system_rule_batch_flush_xtables(system) != 0) goto rule_batch_failed;
+            if (record->kind == ASTERISKD_RECOVERY_IPTABLES_RULE && previous_route &&
+                system_rule_batch_flush_ip(system) != 0) goto rule_batch_failed;
+            int result = -1;
+            if (record->kind == ASTERISKD_RECOVERY_IPTABLES_CHAIN) {
+                const struct asteriskd_private_chain_group *group =
+                    system_find_private_group(system, &record->resource.iptables_chain);
+                result = group == NULL ? -1 : system_create_private_group(system, group);
+            } else if (record->kind == ASTERISKD_RECOVERY_IPTABLES_RULE) {
+                const struct asteriskd_traffic_hook_group *group =
+                    system_find_hook_group(system, &record->resource.iptables_rule);
+                result = group == NULL ? -1 : system_apply_hook_group(system, group);
+            } else if (record->kind == ASTERISKD_RECOVERY_IP_RULE ||
+                record->kind == ASTERISKD_RECOVERY_ROUTE ||
+                record->kind == ASTERISKD_RECOVERY_DUMMY_INTERFACE) {
+                const struct asteriskd_route_effect *effect =
+                    system_find_route_effect(system, record);
+                result = effect == NULL ? -1 : system_apply_route_effect(system, effect);
+            }
+            if (result != 0) {
+                if (error != NULL && error_size != 0U) {
+                    (void)snprintf(error, error_size,
+                        "rule WAL batch apply failed at index %zu", index);
+                }
+                goto rule_batch_failed;
+            }
+            previous_kind = record->kind;
+        }
+        if (previous_kind == ASTERISKD_RECOVERY_IP_RULE ||
+            previous_kind == ASTERISKD_RECOVERY_ROUTE ||
+            previous_kind == ASTERISKD_RECOVERY_DUMMY_INTERFACE) {
+            if (system_rule_batch_flush_ip(system) != 0) goto rule_batch_failed;
+        } else if (system_rule_batch_flush_xtables(system) != 0) {
+            goto rule_batch_failed;
+        }
+        system_rule_batch_destroy(&system->rule_commands);
+        system_rule_snapshot_destroy(&system->rule_snapshot);
+        system->rule_snapshot.phase = SYSTEM_RULE_SNAPSHOT_NEEDS_VERIFY;
+        return 0;
+rule_batch_failed:
+        system_rule_batch_destroy(&system->rule_commands);
+        system_rule_snapshot_destroy(&system->rule_snapshot);
+        return -1;
+    }
+    if (records[0].kind == ASTERISKD_RECOVERY_IPTABLES_CHAIN) {
         const struct asteriskd_private_chain_group *group =
             system_find_private_group(system, &records[0].resource.iptables_chain);
         if (group != NULL && system_create_private_group(system, group) == 0) return 0;
@@ -4215,6 +4755,10 @@ static int system_wal_verify_applied(void *opaque,
     struct asteriskd_system_supervisor *system = opaque;
     if (record == NULL || delta == NULL) return -1;
     memset(delta, 0, sizeof(*delta));
+    if (system_rule_recovery_kind(record->kind) &&
+        system->rule_snapshot.phase == SYSTEM_RULE_SNAPSHOT_NEEDS_VERIFY &&
+        system_rule_snapshot_capture(system, &system->rules_runtime.plan,
+            SYSTEM_RULE_SNAPSHOT_AFTER_APPLY) != 0) return -1;
     if (record->kind == ASTERISKD_RECOVERY_SYSCTL) {
         uint8_t value = 0U;
         return system_sysctl_read(&record->resource.sysctl, &value) == 0 &&
@@ -4654,6 +5198,46 @@ static const struct asteriskd_recovery_record *system_durable_rule_record(
     return NULL;
 }
 
+static int system_rules_wal_apply_plan(
+    void *opaque, const struct asteriskd_rule_transaction_plan *plan) {
+    struct asteriskd_system_supervisor *system = opaque;
+    if (plan == NULL || plan->no_op) return plan != NULL ? 0 : -1;
+    struct asteriskd_recovery_record records[
+        ASTERISKD_RULE_TRANSACTION_MAX_GROUPS * 2U +
+        ASTERISKD_RULE_TRANSACTION_MAX_ROUTES];
+    size_t count = 0U;
+    for (size_t index = 0U; index < plan->private_group_count; ++index) {
+        records[count++] = plan->private_groups[index].recovery;
+    }
+    for (size_t index = 0U; index < plan->route_count; ++index) {
+        if (system_route_record(system, &plan->routes[index], &records[count]) != 0) return -1;
+        ++count;
+    }
+    for (size_t index = 0U; index < plan->hook_group_count; ++index) {
+        records[count++] = plan->hook_groups[index].recovery;
+    }
+    if (count == 0U) return -1;
+    if (system_rule_snapshot_capture(
+            system, plan, SYSTEM_RULE_SNAPSHOT_BEFORE_APPLY) != 0) return -1;
+    char error[256U] = {0};
+    int applied = count == 1U
+        ? asteriskd_wal_apply(&system->store, &system->state, records,
+            &system_wal_backend, system, error, sizeof(error))
+        : asteriskd_wal_apply_batch(&system->store, &system->state, records, count,
+            &system_wal_backend, system, error, sizeof(error));
+    if (applied == ASTERISKD_STATE_OK) return 0;
+    system_rule_snapshot_destroy(&system->rule_snapshot);
+    char message[384U];
+    int written = snprintf(message, sizeof(message),
+        "rule transaction WAL failed: result=%d records=%zu detail=%s",
+        applied, count, error[0] == '\0' ? "unavailable" : error);
+    if (written > 0 && (size_t)written < sizeof(message)) {
+        (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
+            ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+    }
+    return -1;
+}
+
 static int system_rules_wal_apply_private(
     void *opaque, const struct asteriskd_private_chain_group *group) {
     struct asteriskd_system_supervisor *system = opaque;
@@ -4811,6 +5395,7 @@ static void system_rules_backend_init(struct asteriskd_system_supervisor *system
     asteriskd_rules_runtime_init(&system->rules_runtime);
     system->rules_backend = (struct asteriskd_rules_backend){
         .ctx = system,
+        .wal_apply_plan = system_rules_wal_apply_plan,
         .wal_apply_private = system_rules_wal_apply_private,
         .wal_apply_route = system_rules_wal_apply_route,
         .wal_apply_hook = system_rules_wal_apply_hook,
@@ -5816,8 +6401,208 @@ static int system_prepare_ebpf_boundary(
     return 0;
 }
 
+static int system_stopped_iptables_residue_inspect(
+    struct asteriskd_system_supervisor *system,
+    const struct asteriskd_rule_transaction_plan *plan,
+    bool *present) {
+    if (system == NULL || plan == NULL || present == NULL) return -1;
+    *present = false;
+    for (size_t group_index = 0U;
+            group_index < plan->private_group_count; ++group_index) {
+        const struct asteriskd_private_chain_group *group =
+            &plan->private_groups[group_index];
+        const struct system_rule_view *view =
+            &system->rule_snapshot.xtables[group->family][group->table];
+        if (!view->present) return -1;
+        for (size_t name_index = 0U; name_index < group->name_count; ++name_index) {
+            size_t declarations = 0U;
+            size_t rules = 0U;
+            const char *name = group->names[name_index];
+            if (asteriskd_xtables_private_chain_counts(
+                    view->bytes, view->length, name,
+                    &declarations, &rules) != 0) return -1;
+            if (declarations == 0U && rules == 0U) continue;
+            if (declarations != 1U ||
+                system_verify_private_chain_contents(system, group, name) != 0) return -1;
+            *present = true;
+        }
+    }
+    for (size_t group_index = 0U;
+            group_index < plan->hook_group_count; ++group_index) {
+        const struct asteriskd_traffic_hook_group *group =
+            &plan->hook_groups[group_index];
+        for (size_t hook_index = 0U; hook_index < group->hook_count; ++hook_index) {
+            size_t matches = 0U;
+            size_t position = 0U;
+            if (system_hook_match_count(system, group, &group->hooks[hook_index],
+                    &matches, &position) != 0 || matches > 1U) return -1;
+            if (matches == 1U) *present = true;
+        }
+    }
+    return 0;
+}
+
+static int system_cleanup_stopped_iptables_residue(
+    struct asteriskd_system_supervisor *system) {
+    if (!system->rules_initialized) system_rules_backend_init(system);
+    if (system_detect_global_ipv6(&system->has_global_ipv6_address) != 0 ||
+        asteriskd_rule_transaction_plan_build(
+            &system->loaded_config.config, system->has_global_ipv6_address,
+            &system->rules_runtime.plan) != 0) return -1;
+    const struct asteriskd_rule_transaction_plan *plan = &system->rules_runtime.plan;
+    if (plan->no_op) return 0;
+    struct asteriskd_rule_transaction_plan snapshot_plan = *plan;
+    snapshot_plan.route_count = 0U;
+    if (system_rule_snapshot_capture(system, &snapshot_plan,
+            SYSTEM_RULE_SNAPSHOT_BEFORE_APPLY) != 0) return -1;
+    bool present = false;
+    if (system_stopped_iptables_residue_inspect(system, plan, &present) != 0) goto failed;
+    if (!present) {
+        system_rule_snapshot_destroy(&system->rule_snapshot);
+        return 0;
+    }
+    if (system_rule_batch_begin(&system->rule_commands) != 0) goto failed;
+    for (size_t remaining = plan->hook_group_count; remaining > 0U; --remaining) {
+        if (system_remove_hook_group(
+                system, &plan->hook_groups[remaining - 1U]) != 0) goto failed;
+    }
+    for (size_t remaining = plan->private_group_count; remaining > 0U; --remaining) {
+        if (system_remove_private_group(
+                system, &plan->private_groups[remaining - 1U]) != 0) goto failed;
+    }
+    if (system_rule_batch_flush_xtables(system) != 0) goto failed;
+    system_rule_batch_destroy(&system->rule_commands);
+    if (system_rule_snapshot_capture(system, &snapshot_plan,
+            SYSTEM_RULE_SNAPSHOT_AFTER_APPLY) != 0) goto failed;
+    present = false;
+    if (system_stopped_iptables_residue_inspect(system, plan, &present) != 0 || present) {
+        goto failed;
+    }
+    system_rule_snapshot_destroy(&system->rule_snapshot);
+    (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_INFO,
+        ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC,
+        "removed verified asteriskd iptables residue from stopped state");
+    return 0;
+
+failed:
+    system_rule_batch_destroy(&system->rule_commands);
+    system_rule_snapshot_destroy(&system->rule_snapshot);
+    return -1;
+}
+
+static int system_cleanup_stopped_bpf2_tc_interface(
+    struct asteriskd_system_supervisor *system,
+    const char *name, uint32_t index) {
+    struct asteriskd_tc_filter_resource filter;
+    memset(&filter, 0, sizeof(filter));
+    filter.ownership = ASTERISKD_TC_OWNERSHIP_DAEMON;
+    filter.inverse = ASTERISKD_TC_INVERSE_REMOVE;
+    filter.interface_index = index;
+    filter.program_type = ASTERISKD_PROGRAM_TYPE_SCHED_CLS;
+    if (snprintf(filter.interface_name,
+            sizeof(filter.interface_name), "%s", name) <= 0) return -1;
+    filter.filter_id = ASTERISKD_FILTER_HOTSPOT_EGRESS;
+    filter.direction = ASTERISKD_TC_DIRECTION_EGRESS;
+    filter.program_id = ASTERISKD_PROGRAM_BPF2SOCKS_EGRESS;
+    if (system_tc_remove_filter(system, &filter) != 0) return -1;
+    filter.filter_id = ASTERISKD_FILTER_HOTSPOT_INGRESS;
+    filter.direction = ASTERISKD_TC_DIRECTION_INGRESS;
+    filter.program_id = ASTERISKD_PROGRAM_BPF2SOCKS_INGRESS;
+    return system_tc_remove_filter(system, &filter);
+}
+
+static int system_cleanup_stopped_bpf2_tc(
+    struct asteriskd_system_supervisor *system) {
+    struct ifaddrs *addresses = NULL;
+    if (getifaddrs(&addresses) != 0) return -1;
+    char handled[ASTERISKD_MAX_ADDRESSES][ASTERISKD_MAX_INTERFACE_NAME];
+    size_t handled_count = 0U;
+    int result = 0;
+    for (const struct ifaddrs *entry = addresses; entry != NULL; entry = entry->ifa_next) {
+        if (entry->ifa_name == NULL || !system_hotspot_interface_selected(
+                &system->loaded_config.config, entry->ifa_name)) continue;
+        bool duplicate = false;
+        for (size_t index = 0U; index < handled_count; ++index) {
+            if (strcmp(handled[index], entry->ifa_name) == 0) duplicate = true;
+        }
+        if (duplicate) continue;
+        uint32_t interface_index = if_nametoindex(entry->ifa_name);
+        if (handled_count >= ASTERISKD_MAX_ADDRESSES || interface_index == 0U ||
+            snprintf(handled[handled_count], sizeof(handled[handled_count]),
+                "%s", entry->ifa_name) <= 0 ||
+            system_cleanup_stopped_bpf2_tc_interface(
+                system, entry->ifa_name, interface_index) != 0) {
+            result = -1;
+            break;
+        }
+        ++handled_count;
+    }
+    freeifaddrs(addresses);
+    return result;
+}
+
+static int system_cleanup_stopped_bpf_residue(
+    struct asteriskd_system_supervisor *system) {
+    const struct asteriskd_bpf_program_backend *program_backend =
+        asteriskd_system_bpf_program_backend();
+    const struct asteriskd_bpf_pin_ownership_backend *ownership_backend =
+        asteriskd_system_bpf_pin_ownership_backend();
+    char error[256U];
+    bool removed = false;
+    if (system->loaded_config.config.matcher.enabled) {
+        if (asteriskd_matcher_pin_plan_build(
+                &system->loaded_config.config, &system->matcher_pin_plan) != 0) return -1;
+        system->matcher_plan_ready = true;
+        struct asteriskd_matcher_verification verification;
+        if (asteriskd_matcher_verify_residue(
+                &system->loaded_config.config, &system->matcher_pin_plan,
+                program_backend, ownership_backend, &verification,
+                error, sizeof(error)) != 0) return -1;
+        for (size_t index = 0U; index < verification.pin_count; ++index) {
+            const char *path = system_pin_path(system, verification.pins[index].pin_id);
+            if (path == NULL || asteriskd_bpf_pin_cleanup_owned(
+                    path, verification.pins[index].object_id,
+                    ownership_backend, error, sizeof(error)) != 0) return -1;
+            removed = true;
+        }
+    }
+    if (system->loaded_config.config.mode == ASTERISKD_MODE_BPF2SOCKS) {
+        if (asteriskd_bpf2_pin_plan_build(
+                &system->loaded_config.config, &system->bpf2_pin_plan) != 0) return -1;
+        system->bpf2_plan_ready = true;
+        if (asteriskd_bpf2_verify_residue(
+                &system->loaded_config.config, &system->bpf2_pin_plan,
+                program_backend, ownership_backend, &system->bpf2_verification,
+                error, sizeof(error)) != 0) return -1;
+        system->bpf2_verified = true;
+        if (system->bpf2_verification.pin_count != 0U &&
+            system_cleanup_stopped_bpf2_tc(system) != 0) return -1;
+        for (size_t index = 0U;
+                index < system->bpf2_verification.pin_count; ++index) {
+            const struct asteriskd_bpf2_verified_pin *pin =
+                &system->bpf2_verification.pins[index];
+            const char *path = system_pin_path(system, pin->pin_id);
+            if (path == NULL || asteriskd_bpf_pin_cleanup_owned(
+                    path, pin->object_id, ownership_backend,
+                    error, sizeof(error)) != 0) return -1;
+            removed = true;
+        }
+        memset(&system->bpf2_verification, 0, sizeof(system->bpf2_verification));
+        system->bpf2_verified = false;
+    }
+    if (removed) {
+        (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_INFO,
+            ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC,
+            "removed verified asteriskd BPF residue from stopped state");
+    }
+    return 0;
+}
+
 static int system_recover_state(struct asteriskd_system_supervisor *system) {
-    if (asteriskd_state_is_canonical_stopped(&system->state)) return 0;
+    if (asteriskd_state_is_canonical_stopped(&system->state)) {
+        return system_cleanup_stopped_iptables_residue(system) == 0
+            ? system_cleanup_stopped_bpf_residue(system) : -1;
+    }
     system->cleanup_in_progress = true;
     if (system_has_ebpf_boundary(&system->state)) {
         if (system_prepare_ebpf_boundary(system) != 0) return -1;
@@ -5888,6 +6673,7 @@ static int system_effect_rules(void *opaque, bool *active,
             &system->rules_runtime, &system->rules_backend) != 0) {
         failed_stage = "verify";
     }
+    system_rule_snapshot_destroy(&system->rule_snapshot);
     if (failed_stage != NULL) {
         char message[160U];
         int written = snprintf(message, sizeof(message),
@@ -6055,20 +6841,51 @@ static int system_effect_quiesce(void *opaque) {
         return system_effect_stop_core(opaque);
     }
     if (!system->rules_initialized) return 0;
-    int result = 0;
+    bool cleanup_required = false;
+    for (size_t index = 0U;
+            index < system->rules_runtime.plan.hook_group_count; ++index) {
+        if (system->rules_runtime.hook_cleanup_required[index]) {
+            cleanup_required = true;
+            break;
+        }
+    }
+    if (!cleanup_required) return 0;
+    struct asteriskd_rule_transaction_plan snapshot_plan =
+        system->rules_runtime.plan;
+    snapshot_plan.private_group_count = 0U;
+    snapshot_plan.route_count = 0U;
+    if (system_rule_snapshot_capture(system, &snapshot_plan,
+            SYSTEM_RULE_SNAPSHOT_BEFORE_APPLY) != 0 ||
+        system_rule_batch_begin(&system->rule_commands) != 0) goto failed;
     for (size_t remaining = system->rules_runtime.plan.hook_group_count;
             remaining > 0U; --remaining) {
         size_t index = remaining - 1U;
         if (system->rules_runtime.hook_cleanup_required[index]) {
             if (system_remove_hook_group(system,
-                    &system->rules_runtime.plan.hook_groups[index]) != 0) {
-                result = -1;
-            } else {
-                system->rules_runtime.hook_cleanup_required[index] = false;
-            }
+                    &system->rules_runtime.plan.hook_groups[index]) != 0) goto failed;
         }
     }
-    return result;
+    if (system_rule_batch_flush_xtables(system) != 0) goto failed;
+    system_rule_batch_destroy(&system->rule_commands);
+    if (system_rule_snapshot_capture(system, &snapshot_plan,
+            SYSTEM_RULE_SNAPSHOT_AFTER_APPLY) != 0) goto failed;
+    for (size_t index = 0U;
+            index < system->rules_runtime.plan.hook_group_count; ++index) {
+        if (!system->rules_runtime.hook_cleanup_required[index]) continue;
+        bool all_present = false;
+        bool any_present = false;
+        if (system_probe_hook_group(system,
+                &system->rules_runtime.plan.hook_groups[index],
+                &all_present, &any_present) != 0 || any_present) goto failed;
+        system->rules_runtime.hook_cleanup_required[index] = false;
+    }
+    system_rule_snapshot_destroy(&system->rule_snapshot);
+    return 0;
+
+failed:
+    system_rule_batch_destroy(&system->rule_commands);
+    system_rule_snapshot_destroy(&system->rule_snapshot);
+    return -1;
 }
 
 static int system_effect_remove_rules(void *opaque) {
@@ -6174,6 +6991,8 @@ static bool system_control_drained(void *opaque) {
 }
 
 static void system_runtime_cleanup(struct asteriskd_system_supervisor *system) {
+    system_rule_batch_destroy(&system->rule_commands);
+    system_rule_snapshot_destroy(&system->rule_snapshot);
     system_foreign_tc_netlink_close(system);
     if (system->control != NULL) {
         asteriskd_control_server_destroy(system->control);

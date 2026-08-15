@@ -270,6 +270,12 @@ int asteriskd_cli_parse(
         else goto invalid;
         return 0;
     }
+    if (argc == 3 && argv[2] != NULL &&
+        strcmp(argv[1], "watch") == 0 && strcmp(argv[2], "--until-running") == 0) {
+        invocation->command = ASTERISKD_CLI_WATCH;
+        invocation->watch_until_running = true;
+        return 0;
+    }
     if (argc != 4 || argv[2] == NULL || argv[3] == NULL) goto invalid;
     enum asteriskd_sync_target path_target;
     bool config_path = false;
@@ -1816,7 +1822,11 @@ enum asteriskd_control_client_result asteriskd_control_client_run_with_backend(
                         backend, context, &fd, ASTERISKD_CONTROL_CLIENT_PROTOCOL_ERROR, response);
                 }
                 line[line_length] = '\n';
-                if (sink != NULL && sink(sink_context, line, line_length + 1U) != 0) {
+                int sink_result = sink == NULL
+                    ? ASTERISKD_CONTROL_SINK_CONTINUE
+                    : sink(sink_context, line, line_length + 1U);
+                if (sink_result < ASTERISKD_CONTROL_SINK_CONTINUE ||
+                    sink_result > ASTERISKD_CONTROL_SINK_STOP) {
                     asteriskd_control_response_destroy(&decoded);
                     return control_client_close_result(
                         backend, context, &fd, ASTERISKD_CONTROL_CLIENT_IO_ERROR, response);
@@ -1827,6 +1837,10 @@ enum asteriskd_control_client_result asteriskd_control_client_run_with_backend(
                 watch_stream = method == ASTERISKD_CONTROL_METHOD_WATCH &&
                     response->result.code == ASTERISKD_CONTROL_RESULT_OK;
                 line_length = 0U;
+                if (sink_result == ASTERISKD_CONTROL_SINK_STOP) {
+                    return control_client_close_result(
+                        backend, context, &fd, ASTERISKD_CONTROL_CLIENT_OK, response);
+                }
                 if (!watch_stream) {
                     if (index + 1U != (size_t)count) {
                         return control_client_close_result(
@@ -1858,7 +1872,11 @@ enum asteriskd_control_client_result asteriskd_control_client_run_with_backend(
                     backend, context, &fd, ASTERISKD_CONTROL_CLIENT_PROTOCOL_ERROR, response);
             }
             line[line_length] = '\n';
-            if (sink != NULL && sink(sink_context, line, line_length + 1U) != 0) {
+            int sink_result = sink == NULL
+                ? ASTERISKD_CONTROL_SINK_CONTINUE
+                : sink(sink_context, line, line_length + 1U);
+            if (sink_result < ASTERISKD_CONTROL_SINK_CONTINUE ||
+                sink_result > ASTERISKD_CONTROL_SINK_STOP) {
                 asteriskd_control_event_destroy(&event);
                 return control_client_close_result(
                     backend, context, &fd, ASTERISKD_CONTROL_CLIENT_IO_ERROR, response);
@@ -1866,6 +1884,10 @@ enum asteriskd_control_client_result asteriskd_control_client_run_with_backend(
             asteriskd_control_event_destroy(&event);
             final_event_received = terminal;
             line_length = 0U;
+            if (sink_result == ASTERISKD_CONTROL_SINK_STOP) {
+                return control_client_close_result(
+                    backend, context, &fd, ASTERISKD_CONTROL_CLIENT_OK, response);
+            }
         }
     }
 }
@@ -2009,14 +2031,45 @@ struct control_cli_sink {
     const struct asteriskd_cli_backend *backend;
     void *context;
     size_t lines;
+    bool until_running;
 };
+
+static bool control_cli_watch_complete(
+    bool initial,
+    const char *line,
+    size_t length) {
+    if (length == 0U || line[length - 1U] != '\n') return false;
+    if (initial) {
+        struct asteriskd_control_response response;
+        memset(&response, 0, sizeof(response));
+        if (asteriskd_control_decode_response_payload(line, length - 1U, &response) != 0) {
+            return false;
+        }
+        bool complete = response.result.has_snapshot &&
+            (response.result.snapshot.phase == ASTERISKD_PHASE_RUNNING ||
+                response.result.snapshot.phase == ASTERISKD_PHASE_FAILED ||
+                response.result.snapshot.phase == ASTERISKD_PHASE_STOPPED);
+        asteriskd_control_response_destroy(&response);
+        return complete;
+    }
+    struct asteriskd_control_event event;
+    memset(&event, 0, sizeof(event));
+    if (asteriskd_control_decode_event_payload(line, length - 1U, &event) != 0) return false;
+    bool complete = event.snapshot.phase == ASTERISKD_PHASE_RUNNING ||
+        event.snapshot.phase == ASTERISKD_PHASE_FAILED ||
+        event.snapshot.phase == ASTERISKD_PHASE_STOPPED;
+    asteriskd_control_event_destroy(&event);
+    return complete;
+}
 
 static int control_cli_line_sink(void *context, const char *line, size_t length) {
     struct control_cli_sink *sink = context;
     if (sink == NULL || sink->backend->write_stdout(
-            sink->context, line, length) != 0) return -1;
+            sink->context, line, length) != 0) return ASTERISKD_CONTROL_SINK_ERROR;
+    bool initial = sink->lines == 0U;
     ++sink->lines;
-    return 0;
+    return sink->until_running && control_cli_watch_complete(initial, line, length)
+        ? ASTERISKD_CONTROL_SINK_STOP : ASTERISKD_CONTROL_SINK_CONTINUE;
 }
 
 static int control_cli_write_response(
@@ -2072,7 +2125,8 @@ static int control_cli_usage(
     const struct asteriskd_cli_backend *backend,
     void *context) {
     static const char usage[] =
-        "usage: asteriskd start --config ABSOLUTE_PATH | status | stop | watch | "
+        "usage: asteriskd start --config ABSOLUTE_PATH | status | stop | "
+        "watch [--until-running] | "
         "sync --file|--directory ABSOLUTE_PATH | recover --config ABSOLUTE_CONFIG_PATH\n";
     (void)backend->write_stderr(context, usage, sizeof(usage) - 1U);
     return 64;
@@ -2082,8 +2136,13 @@ static int control_cli_run_control(
     const struct asteriskd_cli_backend *backend,
     void *context,
     enum asteriskd_control_method method,
-    const char *request_id) {
-    struct control_cli_sink sink = {.backend = backend, .context = context};
+    const char *request_id,
+    bool until_running) {
+    struct control_cli_sink sink = {
+        .backend = backend,
+        .context = context,
+        .until_running = until_running,
+    };
     struct asteriskd_control_response response;
     memset(&response, 0, sizeof(response));
     enum asteriskd_control_client_result result = backend->control_client(
@@ -2150,15 +2209,16 @@ int asteriskd_cli_main_with_backend(
     }
     if (invocation.command == ASTERISKD_CLI_STATUS) {
         return control_cli_run_control(
-            backend, context, ASTERISKD_CONTROL_METHOD_STATUS, "status");
+            backend, context, ASTERISKD_CONTROL_METHOD_STATUS, "status", false);
     }
     if (invocation.command == ASTERISKD_CLI_STOP) {
         return control_cli_run_control(
-            backend, context, ASTERISKD_CONTROL_METHOD_STOP, "stop");
+            backend, context, ASTERISKD_CONTROL_METHOD_STOP, "stop", false);
     }
     if (invocation.command == ASTERISKD_CLI_WATCH) {
         return control_cli_run_control(
-            backend, context, ASTERISKD_CONTROL_METHOD_WATCH, "watch");
+            backend, context, ASTERISKD_CONTROL_METHOD_WATCH, "watch",
+            invocation.watch_until_running);
     }
 
     if (invocation.command == ASTERISKD_CLI_START) {
