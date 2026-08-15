@@ -6710,9 +6710,17 @@ static int system_effect_reconcile(void *opaque, bool *active,
         failed_stage = "retired-interface-recovery";
     } else if (system_reconcile_iptables_local_bypass(system) != 0) {
         failed_stage = "iptables-local-bypass";
+    } else if (system_rule_snapshot_capture(
+            system, &system->rules_runtime.plan,
+            SYSTEM_RULE_SNAPSHOT_BEFORE_APPLY) != 0) {
+        failed_stage = "rules-snapshot-before-reconcile";
     } else if (asteriskd_rules_reconcile(
             &system->rules_runtime, &system->rules_backend) != 0) {
         failed_stage = "rules-reconcile";
+    } else if (system_rule_snapshot_capture(
+            system, &system->rules_runtime.plan,
+            SYSTEM_RULE_SNAPSHOT_AFTER_APPLY) != 0) {
+        failed_stage = "rules-snapshot-after-reconcile";
     } else if (system_reconcile_bpf2_local_maps(system) != 0) {
         failed_stage = "bpf2-local-map";
     } else if (system_reconcile_hotspot_tc(system) != 0) {
@@ -6721,6 +6729,7 @@ static int system_effect_reconcile(void *opaque, bool *active,
             &system->rules_runtime, &system->rules_backend) != 0) {
         failed_stage = "rules-verify";
     }
+    system_rule_snapshot_destroy(&system->rule_snapshot);
     system_clear_local_address_snapshot(system);
     if (failed_stage != NULL) {
         char message[160U];
