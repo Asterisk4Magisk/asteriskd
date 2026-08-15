@@ -181,15 +181,10 @@ static bool interface_name_valid(const char *name) {
     return true;
 }
 
-static bool interface_matches(const char *name, const char *selector) {
-    size_t length = strlen(selector);
-    return length != 0U && selector[length - 1U] == '+' ?
-        length > 1U && strncmp(name, selector, length - 1U) == 0 : strcmp(name, selector) == 0;
-}
-
 static bool hotspot_interface(const struct asteriskd_config *config, const char *name) {
     for (size_t index = 0U; index < config->hotspot_interface_prefix_count; ++index) {
-        if (interface_matches(name, config->hotspot_interface_prefixes[index])) return true;
+        if (asteriskd_interface_matches_selector(
+                name, config->hotspot_interface_prefixes[index])) return true;
     }
     return false;
 }
@@ -198,7 +193,8 @@ static bool tracked_interface(const struct asteriskd_config *config, const char 
     if (config->mode == ASTERISKD_MODE_EBPF || strcmp(name, "all") == 0 ||
         strcmp(name, "default") == 0 || strcmp(name, "lo") == 0) return false;
     for (size_t index = 0U; index < config->ignored_interface_count; ++index) {
-        if (strcmp(name, config->ignored_interfaces[index]) == 0) return false;
+        if (asteriskd_interface_matches_selector(
+                name, config->ignored_interfaces[index])) return false;
     }
     for (size_t index = 0U; index < config->virtual_interface_count; ++index) {
         if (strcmp(name, config->virtual_interfaces[index]) == 0) return false;

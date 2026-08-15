@@ -40,7 +40,8 @@ static bool excluded_interface(const struct asteriskd_config *config, const char
         return true;
     }
     for (size_t index = 0U; index < config->ignored_interface_count; ++index) {
-        if (strcmp(name, config->ignored_interfaces[index]) == 0) return true;
+        if (asteriskd_interface_matches_selector(
+                name, config->ignored_interfaces[index])) return true;
     }
     for (size_t index = 0U; index < config->virtual_interface_count; ++index) {
         if (strcmp(name, config->virtual_interfaces[index]) == 0) return true;

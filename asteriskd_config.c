@@ -617,8 +617,11 @@ static int parse_network(
         config->has_fake_dns_ipv4_pool = true;
         if (copy_string(document, values[4], config->fake_dns_ipv4_pool, sizeof(config->fake_dns_ipv4_pool)) != 0) return -1;
     }
-    if (parse_string_array(document, values[5], (char *)config->ignored_interfaces, ASTERISKD_MAX_INTERFACE_NAME, ASTERISKD_MAX_INTERFACES, true, false, &config->ignored_interface_count) != 0 ||
-        parse_string_array(document, values[6], (char *)config->virtual_interfaces, ASTERISKD_MAX_INTERFACE_NAME, ASTERISKD_MAX_INTERFACES, true, false, &config->virtual_interface_count) != 0 ||
+    if (parse_string_array(document, values[5], (char *)config->ignored_interfaces, ASTERISKD_MAX_INTERFACE_NAME, ASTERISKD_MAX_INTERFACES, false, false, &config->ignored_interface_count) != 0) return -1;
+    for (size_t index = 0U; index < config->ignored_interface_count; ++index) {
+        if (!asteriskd_interface_selector_valid(config->ignored_interfaces[index])) return -1;
+    }
+    if (parse_string_array(document, values[6], (char *)config->virtual_interfaces, ASTERISKD_MAX_INTERFACE_NAME, ASTERISKD_MAX_INTERFACES, true, false, &config->virtual_interface_count) != 0 ||
         parse_string_array(document, values[7], (char *)config->hotspot_interface_prefixes, ASTERISKD_MAX_INTERFACE_NAME, ASTERISKD_MAX_INTERFACES, true, true, &config->hotspot_interface_prefix_count) != 0 ||
         parse_string_array(document, values[8], (char *)config->proxy_private_cidrs, ASTERISKD_MAX_CIDR, ASTERISKD_MAX_CIDRS, false, false, &config->proxy_private_cidr_count) != 0 ||
         parse_string_array(document, values[9], (char *)config->bypass_private_cidrs, ASTERISKD_MAX_CIDR, ASTERISKD_MAX_CIDRS, false, false, &config->bypass_private_cidr_count) != 0 ||

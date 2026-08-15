@@ -462,6 +462,8 @@ struct asteriskd_lifecycle {
 
 int asteriskd_json_parse(const char *, size_t, struct asteriskd_json_document *, char *, size_t);
 void asteriskd_json_document_destroy(struct asteriskd_json_document *);
+bool asteriskd_interface_selector_valid(const char *);
+bool asteriskd_interface_matches_selector(const char *, const char *);
 int asteriskd_config_parse(const char *, size_t, struct asteriskd_config *, char *, size_t);
 int asteriskd_config_load_direct_cidrs(
     struct asteriskd_config *, const char *, size_t, const char *, size_t);
