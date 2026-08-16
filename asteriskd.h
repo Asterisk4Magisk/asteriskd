@@ -9,10 +9,11 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdatomic.h>
+#include <time.h>
 
 struct asteriskd_recovery_record;
 
-#define ASTERISKD_CONFIG_VERSION 2U
+#define ASTERISKD_CONFIG_VERSION 3U
 #define ASTERISKD_MAX_JSON_SIZE (8U * 1024U * 1024U)
 #define ASTERISKD_JSON_MAX_TOKENS 262144U
 #define ASTERISKD_JSON_MAX_DEPTH 64U
@@ -90,6 +91,9 @@ struct asteriskd_recovery_record;
 #define ASTERISKD_RULE_TRANSACTION_MAX_ROUTES 8U
 #define ASTERISKD_MAX_POLL_SOURCES 64U
 #define ASTERISKD_MAX_NETWORK_IMMEDIATE_REQUESTS 64U
+#define ASTERISKD_MAX_CRON_EXPRESSION 256U
+#define ASTERISKD_MAX_WIFI_IDENTIFIERS 64U
+#define ASTERISKD_MAX_WIFI_SSID_BYTES 32U
 
 #define ASTERISKD_CONFIG_INVALID (-1)
 #define ASTERISKD_CONFIG_UNSUPPORTED_COMBINATION (-2)
@@ -126,6 +130,131 @@ enum asteriskd_json_type {
     ASTERISKD_JSON_FALSE,
     ASTERISKD_JSON_NULL,
 };
+
+struct asteriskd_cron_expression {
+    uint64_t minutes;
+    uint32_t hours;
+    uint32_t days_of_month;
+    uint16_t months;
+    uint8_t days_of_week;
+    bool any_day_of_month;
+    bool any_day_of_week;
+};
+
+int asteriskd_cron_parse(const char *, struct asteriskd_cron_expression *);
+bool asteriskd_cron_matches(
+    const struct asteriskd_cron_expression *, const struct tm *);
+int asteriskd_cron_next(
+    const struct asteriskd_cron_expression *, time_t, time_t *);
+int asteriskd_cron_latest_between(
+    const struct asteriskd_cron_expression *, time_t, time_t, time_t *);
+
+enum asteriskd_service_action {
+    ASTERISKD_SERVICE_ACTION_NONE,
+    ASTERISKD_SERVICE_ACTION_START,
+    ASTERISKD_SERVICE_ACTION_STOP,
+    ASTERISKD_SERVICE_ACTION_SHUTDOWN,
+};
+
+enum asteriskd_wifi_transition {
+    ASTERISKD_WIFI_TRANSITION_BASELINE_CONNECTED,
+    ASTERISKD_WIFI_TRANSITION_BASELINE_DISCONNECTED,
+    ASTERISKD_WIFI_TRANSITION_CONNECTED,
+    ASTERISKD_WIFI_TRANSITION_ROAMED,
+    ASTERISKD_WIFI_TRANSITION_DISCONNECTED,
+};
+
+struct asteriskd_wifi_identity {
+    bool has_ssid;
+    unsigned char ssid[ASTERISKD_MAX_WIFI_SSID_BYTES];
+    size_t ssid_length;
+    bool has_bssid;
+    uint8_t bssid[6U];
+};
+
+struct asteriskd_wifi_ssid_config {
+    unsigned char bytes[ASTERISKD_MAX_WIFI_SSID_BYTES];
+    uint8_t length;
+};
+
+struct asteriskd_wifi_rule_config {
+    bool enabled;
+    struct asteriskd_wifi_ssid_config ssids[ASTERISKD_MAX_WIFI_IDENTIFIERS];
+    size_t ssid_count;
+    uint8_t bssids[ASTERISKD_MAX_WIFI_IDENTIFIERS][6U];
+    size_t bssid_count;
+};
+
+struct asteriskd_schedule_control_config {
+    bool enabled;
+    struct asteriskd_cron_expression start;
+    struct asteriskd_cron_expression stop;
+};
+
+struct asteriskd_wifi_control_config {
+    bool enabled;
+    struct asteriskd_wifi_rule_config connect_start;
+    struct asteriskd_wifi_rule_config connect_stop;
+    struct asteriskd_wifi_rule_config disconnect_start;
+    struct asteriskd_wifi_rule_config disconnect_stop;
+};
+
+struct asteriskd_service_control_config {
+    bool enabled;
+    struct asteriskd_schedule_control_config schedule;
+    struct asteriskd_wifi_control_config wifi;
+};
+
+struct asteriskd_service_control_runtime {
+    const struct asteriskd_service_control_config *config;
+    struct asteriskd_wifi_identity previous_wifi;
+    bool wifi_baseline_established;
+    bool wifi_connected;
+    bool desired_running;
+    time_t last_evaluated_time;
+};
+
+void asteriskd_service_control_init(
+    struct asteriskd_service_control_runtime *,
+    const struct asteriskd_service_control_config *, bool, time_t);
+void asteriskd_service_control_set_service_running(
+    struct asteriskd_service_control_runtime *, bool);
+bool asteriskd_wifi_rule_matches(
+    const struct asteriskd_wifi_rule_config *,
+    const struct asteriskd_wifi_identity *);
+enum asteriskd_service_action asteriskd_service_control_on_wifi(
+    struct asteriskd_service_control_runtime *,
+    enum asteriskd_wifi_transition,
+    const struct asteriskd_wifi_identity *);
+enum asteriskd_service_action asteriskd_service_control_reconcile_time(
+    struct asteriskd_service_control_runtime *, time_t);
+
+struct asteriskd_wifi_monitor {
+    int fd;
+    uint16_t family_id;
+    uint32_t sequence;
+    struct asteriskd_wifi_identity baseline_identity;
+    uint64_t debounce_deadline_milliseconds;
+    bool baseline_connected;
+    bool debounce_armed;
+    bool integrity_lost;
+    bool opened;
+};
+
+int asteriskd_wifi_monitor_open(struct asteriskd_wifi_monitor *, char *, size_t);
+int asteriskd_wifi_monitor_fd(const struct asteriskd_wifi_monitor *);
+int asteriskd_wifi_monitor_baseline(
+    const struct asteriskd_wifi_monitor *, enum asteriskd_wifi_transition *,
+    struct asteriskd_wifi_identity *);
+int asteriskd_wifi_monitor_handle(
+    struct asteriskd_wifi_monitor *, enum asteriskd_wifi_transition *,
+    struct asteriskd_wifi_identity *, bool *, char *, size_t);
+bool asteriskd_wifi_monitor_next_deadline(
+    const struct asteriskd_wifi_monitor *, uint64_t *);
+int asteriskd_wifi_monitor_take_reconcile(
+    struct asteriskd_wifi_monitor *, uint64_t, enum asteriskd_wifi_transition *,
+    struct asteriskd_wifi_identity *, bool *, char *, size_t);
+void asteriskd_wifi_monitor_close(struct asteriskd_wifi_monitor *);
 
 struct asteriskd_json_token {
     enum asteriskd_json_type type;
@@ -277,6 +406,7 @@ struct asteriskd_config {
     char tunnel_name[ASTERISKD_MAX_TUNNEL_NAME];
     struct asteriskd_matcher_config matcher;
     struct asteriskd_helper_config helper;
+    struct asteriskd_service_control_config service_control;
 
 };
 
@@ -1386,6 +1516,8 @@ enum asteriskd_poll_source_kind {
     ASTERISKD_POLL_PROCESS_PIDFD,
     ASTERISKD_POLL_NETWORK,
     ASTERISKD_POLL_TC_NETLINK,
+    ASTERISKD_POLL_SERVICE_TIMER,
+    ASTERISKD_POLL_WIFI,
     ASTERISKD_POLL_SOURCE_KIND_COUNT,
 };
 
@@ -1445,6 +1577,7 @@ int asteriskd_test_start_failure_detail(
 int asteriskd_test_capability_path_search_result(bool, bool);
 int asteriskd_test_capability_inspect_error(int);
 int asteriskd_test_periodic_deadline(int64_t, int64_t, uint32_t, int64_t *);
+unsigned asteriskd_test_runtime_dispatch_priority(enum asteriskd_poll_source_kind);
 bool asteriskd_test_startup_components_verified(
     bool, bool, bool, bool, bool, bool, bool, bool, bool);
 #endif
@@ -1688,6 +1821,7 @@ int asteriskd_wal_recover_record_id(
 enum asteriskd_control_method {
     ASTERISKD_CONTROL_METHOD_STATUS,
     ASTERISKD_CONTROL_METHOD_STOP,
+    ASTERISKD_CONTROL_METHOD_SHUTDOWN,
     ASTERISKD_CONTROL_METHOD_WATCH,
     ASTERISKD_CONTROL_METHOD_COUNT,
 };
@@ -1870,6 +2004,8 @@ int asteriskd_runtime_supervise(
 struct asteriskd_recovery_result;
 int asteriskd_runtime_start_system(
     const char *, bool *, struct asteriskd_control_result *);
+int asteriskd_runtime_monitor_system(
+    const char *, bool *, struct asteriskd_control_result *);
 int asteriskd_runtime_recover_system(
     const char *, struct asteriskd_recovery_result *);
 
@@ -1934,8 +2070,10 @@ enum asteriskd_sync_result asteriskd_sync_path(
 
 enum asteriskd_cli_command {
     ASTERISKD_CLI_START,
+    ASTERISKD_CLI_MONITOR,
     ASTERISKD_CLI_STATUS,
     ASTERISKD_CLI_STOP,
+    ASTERISKD_CLI_SHUTDOWN,
     ASTERISKD_CLI_WATCH,
     ASTERISKD_CLI_SYNC,
     ASTERISKD_CLI_RECOVER,
@@ -2047,6 +2185,8 @@ struct asteriskd_cli_backend {
         asteriskd_control_line_sink, void *, struct asteriskd_control_response *);
     int (*run_start)(
         void *, const char *, bool *, struct asteriskd_control_result *);
+    int (*run_monitor)(
+        void *, const char *, bool *, struct asteriskd_control_result *);
     int (*recovery_gate)(
         void *, const char *, struct asteriskd_recovery_result *);
     int (*write_stdout)(void *, const char *, size_t);
@@ -2067,6 +2207,7 @@ struct asteriskd_control_transport_backend {
 struct asteriskd_control_callbacks {
     int (*snapshot)(void *, struct asteriskd_control_snapshot *);
     int (*request_stop)(void *);
+    int (*request_shutdown)(void *);
     void *context;
 };
 

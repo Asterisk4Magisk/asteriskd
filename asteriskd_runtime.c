@@ -22,6 +22,7 @@
 #include <sys/socket.h>
 #include <sys/signalfd.h>
 #include <sys/stat.h>
+#include <sys/timerfd.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -106,7 +107,14 @@ static bool runtime_startup_components_verified(
         (!matcher_required || matcher_verified) && rules_initialized && rules_verified;
 }
 
+static unsigned runtime_dispatch_priority(enum asteriskd_poll_source_kind);
+
 #if defined(ASTERISKD_TESTING)
+unsigned asteriskd_test_runtime_dispatch_priority(
+    enum asteriskd_poll_source_kind kind) {
+    return runtime_dispatch_priority(kind);
+}
+
 int asteriskd_test_periodic_deadline(
     int64_t now, int64_t caller_deadline, uint32_t interval,
     int64_t *iteration_deadline) {
@@ -168,7 +176,9 @@ static unsigned runtime_dispatch_priority(enum asteriskd_poll_source_kind kind) 
         case ASTERISKD_POLL_CONTROL_LISTENER:
         case ASTERISKD_POLL_CONTROL_CLIENT: return 3U;
         case ASTERISKD_POLL_NETWORK:
-        case ASTERISKD_POLL_TC_NETLINK: return 4U;
+        case ASTERISKD_POLL_TC_NETLINK:
+        case ASTERISKD_POLL_SERVICE_TIMER:
+        case ASTERISKD_POLL_WIFI: return 4U;
         default: return UINT_MAX;
     }
 }
@@ -1071,6 +1081,14 @@ struct asteriskd_system_supervisor {
     struct asteriskd_runtime *runtime;
     int signal_fd;
     bool signal_fd_owned;
+    int service_timer_fd;
+    bool service_timer_fd_owned;
+    struct asteriskd_wifi_monitor wifi_monitor;
+    bool wifi_monitor_opened;
+    struct asteriskd_service_control_runtime service_control;
+    bool service_running;
+    bool shutdown_requested;
+    bool service_start_requested;
     bool stop_requested;
     bool stopping_children;
     struct asteriskd_process_spec core_spec;
@@ -1237,11 +1255,106 @@ static void system_runtime_min_deadline(
     asteriskd_deadline_min(deadline, &next);
 }
 
+static void system_service_apply_action(
+    struct asteriskd_system_supervisor *system, enum asteriskd_service_action action) {
+    if (action == ASTERISKD_SERVICE_ACTION_START && !system->service_running) {
+        system->service_start_requested = true;
+    } else if (action == ASTERISKD_SERVICE_ACTION_STOP && system->service_running) {
+        system->stop_requested = true;
+    } else if (action == ASTERISKD_SERVICE_ACTION_SHUTDOWN) {
+        system->shutdown_requested = true;
+        if (system->service_running) system->stop_requested = true;
+    }
+}
+
+static int system_service_timer_arm(struct asteriskd_system_supervisor *system) {
+    if (!system->service_timer_fd_owned || system->service_timer_fd < 0) return 0;
+    struct itimerspec timer;
+    memset(&timer, 0, sizeof(timer));
+    const struct asteriskd_service_control_config *control =
+        &system->loaded_config.config.service_control;
+    if (control->enabled && control->schedule.enabled) {
+        time_t now = time(NULL);
+        time_t next_start = 0;
+        time_t next_stop = 0;
+        bool has_start = now != (time_t)-1 &&
+            asteriskd_cron_next(&control->schedule.start, now, &next_start) == 0;
+        bool has_stop = now != (time_t)-1 &&
+            asteriskd_cron_next(&control->schedule.stop, now, &next_stop) == 0;
+        time_t next = has_start && has_stop
+            ? (next_start < next_stop ? next_start : next_stop)
+            : has_start ? next_start : has_stop ? next_stop : 0;
+        if (next > 0) timer.it_value.tv_sec = next;
+    }
+    return timerfd_settime(system->service_timer_fd,
+        TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET, &timer, NULL);
+}
+
+static int system_service_reconcile_time(struct asteriskd_system_supervisor *system) {
+    time_t now = time(NULL);
+    if (now == (time_t)-1) return -1;
+    system_service_apply_action(system,
+        asteriskd_service_control_reconcile_time(&system->service_control, now));
+    return system_service_timer_arm(system);
+}
+
+static int system_service_timer_dispatch(struct asteriskd_system_supervisor *system) {
+    uint64_t expirations = 0U;
+    ssize_t count;
+    do {
+        count = read(system->service_timer_fd, &expirations, sizeof(expirations));
+    } while (count < 0 && errno == EINTR);
+    if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != ECANCELED) return -1;
+    return system_service_reconcile_time(system);
+}
+
+static int system_service_wifi_dispatch(struct asteriskd_system_supervisor *system) {
+    enum asteriskd_wifi_transition transition = ASTERISKD_WIFI_TRANSITION_BASELINE_DISCONNECTED;
+    struct asteriskd_wifi_identity identity;
+    bool has_transition = false;
+    char error[128U];
+    if (asteriskd_wifi_monitor_handle(&system->wifi_monitor, &transition,
+            &identity, &has_transition, error, sizeof(error)) != 0) return -1;
+    if (has_transition) {
+        system_service_apply_action(system,
+            asteriskd_service_control_on_wifi(
+                &system->service_control, transition, &identity));
+    }
+    return 0;
+}
+
+static int system_service_wifi_reconcile(
+    struct asteriskd_system_supervisor *system, uint64_t now) {
+    enum asteriskd_wifi_transition transition = ASTERISKD_WIFI_TRANSITION_BASELINE_DISCONNECTED;
+    struct asteriskd_wifi_identity identity;
+    bool has_transition = false;
+    char error[128U];
+    if (asteriskd_wifi_monitor_take_reconcile(&system->wifi_monitor, now,
+            &transition, &identity, &has_transition, error, sizeof(error)) != 0) return -1;
+    if (has_transition) {
+        system_service_apply_action(system,
+            asteriskd_service_control_on_wifi(
+                &system->service_control, transition, &identity));
+    }
+    return 0;
+}
+
 static int system_runtime_prepare(
     void *opaque, struct asteriskd_poll_builder *builder, struct asteriskd_deadline *deadline) {
     struct asteriskd_system_supervisor *system = opaque;
     if (system_runtime_add_source(builder, system->signal_fd, POLLIN,
             ASTERISKD_POLL_SIGNAL, 0U, 1U) != 0) return -1;
+    if (system->service_timer_fd_owned &&
+        system_runtime_add_source(builder, system->service_timer_fd, POLLIN,
+            ASTERISKD_POLL_SERVICE_TIMER, 0U, 1U) != 0) return -1;
+    if (system->wifi_monitor_opened &&
+        system_runtime_add_source(builder, asteriskd_wifi_monitor_fd(&system->wifi_monitor), POLLIN,
+            ASTERISKD_POLL_WIFI, 0U, 1U) != 0) return -1;
+    uint64_t wifi_deadline = 0U;
+    if (system->wifi_monitor_opened &&
+        asteriskd_wifi_monitor_next_deadline(&system->wifi_monitor, &wifi_deadline)) {
+        system_runtime_min_deadline(deadline, wifi_deadline);
+    }
     if (system->core_spawned && !system->core_reaped) {
         uint64_t generation = (uint64_t)system->core_process.pid;
         if (system->core_process.owns_setup_status_fd &&
@@ -1418,7 +1531,9 @@ static int system_runtime_dispatch_signal(
         if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
         if (count != (ssize_t)sizeof(info)) return -1;
         if (info.ssi_signo == SIGTERM || info.ssi_signo == SIGINT) {
-            if ((delta->flags & ASTERISKD_DELTA_STOP_REQUESTED) == 0U) {
+            system->shutdown_requested = true;
+            if (system->service_running &&
+                (delta->flags & ASTERISKD_DELTA_STOP_REQUESTED) == 0U) {
                 delta->flags |= ASTERISKD_DELTA_STOP_REQUESTED;
                 delta->stop_reason = info.ssi_signo == SIGTERM
                     ? ASTERISKD_LIFECYCLE_REASON_SIGTERM : ASTERISKD_LIFECYCLE_REASON_SIGINT;
@@ -1554,6 +1669,16 @@ static int system_runtime_dispatch(void *opaque, const struct asteriskd_poll_sou
             system->foreign_tc_netlink_failed = true;
             system->foreign_tc_netlink_done = true;
         }
+    } else if (source->kind == ASTERISKD_POLL_SERVICE_TIMER) {
+        if (system_service_timer_dispatch(system) != 0) {
+            system_runtime_fatal(delta, ASTERISKD_COMPONENT_RUNTIME,
+                "service schedule dispatch failed");
+        }
+    } else if (source->kind == ASTERISKD_POLL_WIFI) {
+        if (system_service_wifi_dispatch(system) != 0) {
+            system_runtime_fatal(delta, ASTERISKD_COMPONENT_NETWORK,
+                "WiFi event dispatch failed");
+        }
     }
     if (system->stop_requested &&
         (delta->flags & ASTERISKD_DELTA_STOP_REQUESTED) == 0U) {
@@ -1590,6 +1715,14 @@ static int system_runtime_expire(
             (void)integrity_loss;
         }
     }
+    uint64_t wifi_deadline = 0U;
+    if (system->wifi_monitor_opened &&
+        asteriskd_wifi_monitor_next_deadline(&system->wifi_monitor, &wifi_deadline) &&
+        (uint64_t)now >= wifi_deadline &&
+        system_service_wifi_reconcile(system, (uint64_t)now) != 0) {
+        system_runtime_fatal(delta, ASTERISKD_COMPONENT_NETWORK,
+            "WiFi association reconcile failed");
+    }
     return 0;
 }
 
@@ -1612,8 +1745,19 @@ static int system_runtime_snapshot(
 
 static int system_runtime_request_stop(void *opaque) {
     struct asteriskd_system_supervisor *system = opaque;
+    if (!system->service_running && !system->recovery_only) return 1;
     system->stop_requested = true;
     if (system->recovery_only) system->recovery_cancelled = true;
+    return 0;
+}
+
+static int system_runtime_request_shutdown(void *opaque) {
+    struct asteriskd_system_supervisor *system = opaque;
+    system->shutdown_requested = true;
+    if (system->service_running || system->recovery_only) {
+        system->stop_requested = true;
+        if (system->recovery_only) system->recovery_cancelled = true;
+    }
     return 0;
 }
 
@@ -6999,19 +7143,20 @@ static bool system_control_drained(void *opaque) {
     return asteriskd_control_server_drained(system->control);
 }
 
-static void system_runtime_cleanup(struct asteriskd_system_supervisor *system) {
+static void system_child_process_defaults(struct asteriskd_child_process *process) {
+    memset(process, 0, sizeof(*process));
+    process->pid = -1;
+    process->process_group_id = -1;
+    process->pidfd = -1;
+    process->stdout_fd = -1;
+    process->stderr_fd = -1;
+    process->setup_status_fd = -1;
+}
+
+static void system_runtime_cleanup_cycle(struct asteriskd_system_supervisor *system) {
     system_rule_batch_destroy(&system->rule_commands);
     system_rule_snapshot_destroy(&system->rule_snapshot);
     system_foreign_tc_netlink_close(system);
-    if (system->control != NULL) {
-        asteriskd_control_server_destroy(system->control);
-        system->control = NULL;
-    }
-    if (system->signal_fd_owned && system->signal_fd >= 0) (void)close(system->signal_fd);
-    system->signal_fd = -1;
-    system->signal_fd_owned = false;
-    if (system->runtime != NULL) asteriskd_runtime_destroy(system->runtime);
-    system->runtime = NULL;
     if (system->network_opened) (void)asteriskd_network_close(&system->network);
     system->network_opened = false;
     asteriskd_child_process_close(&system->core_process);
@@ -7029,13 +7174,67 @@ static void system_runtime_cleanup(struct asteriskd_system_supervisor *system) {
             asteriskd_system_anonymous_file_backend(), &system->matcher_launch);
     }
     system->matcher_launch_ready = false;
+}
+
+static void system_runtime_reset_cycle(struct asteriskd_system_supervisor *system) {
+    system_runtime_cleanup_cycle(system);
+    size_t offset = offsetof(struct asteriskd_system_supervisor, stop_requested);
+    memset((unsigned char *)system + offset, 0, sizeof(*system) - offset);
+    system->foreign_tc_netlink_fd = -1;
+    system_child_process_defaults(&system->core_process);
+    system_child_process_defaults(&system->helper_process);
+    system_child_process_defaults(&system->action_process);
+}
+
+static void system_runtime_cleanup(struct asteriskd_system_supervisor *system) {
+    system_runtime_cleanup_cycle(system);
+    if (system->control != NULL) {
+        asteriskd_control_server_destroy(system->control);
+        system->control = NULL;
+    }
+    if (system->signal_fd_owned && system->signal_fd >= 0) (void)close(system->signal_fd);
+    system->signal_fd = -1;
+    system->signal_fd_owned = false;
+    if (system->service_timer_fd_owned && system->service_timer_fd >= 0) {
+        (void)close(system->service_timer_fd);
+    }
+    system->service_timer_fd = -1;
+    system->service_timer_fd_owned = false;
+    if (system->wifi_monitor_opened) asteriskd_wifi_monitor_close(&system->wifi_monitor);
+    system->wifi_monitor_opened = false;
+    if (system->runtime != NULL) asteriskd_runtime_destroy(system->runtime);
+    system->runtime = NULL;
     asteriskd_state_document_destroy(&system->state);
     asteriskd_state_store_close(&system->store);
     if (system->logger.opened) (void)asteriskd_log_close(&system->logger);
     asteriskd_loaded_config_release(&system->loaded_config);
 }
 
-int asteriskd_runtime_start_system(const char *config_path,
+static void system_runtime_finish_control_stop(
+    struct asteriskd_system_supervisor *system) {
+    struct asteriskd_control_snapshot snapshot;
+    memset(&snapshot, 0, sizeof(snapshot));
+    struct asteriskd_control_result result;
+    memset(&result, 0, sizeof(result));
+    if (asteriskd_control_snapshot_from_state(&system->state, &system->live, &snapshot) == 0) {
+        result.code = asteriskd_state_is_canonical_stopped(&system->state)
+            ? ASTERISKD_CONTROL_RESULT_OK : ASTERISKD_CONTROL_RESULT_STOP_FAILED;
+        result.has_snapshot = true;
+        (void)asteriskd_control_snapshot_copy(&result.snapshot, &snapshot);
+        if (result.code == ASTERISKD_CONTROL_RESULT_STOP_FAILED) {
+            (void)asteriskd_control_result_set_message(&result, "cleanup incomplete", 18U);
+        }
+        int64_t now = 0;
+        if (system_runtime_clock(system, &now) == 0) {
+            (void)asteriskd_control_server_finish_stop(
+                system->control, &result, (uint64_t)now);
+        }
+    }
+    asteriskd_control_result_destroy(&result);
+    asteriskd_control_snapshot_destroy(&snapshot);
+}
+
+static int system_runtime_run(const char *config_path, bool initial_start,
     bool *has_early_result, struct asteriskd_control_result *early_result) {
     if (has_early_result == NULL || early_result == NULL) return -1;
     *has_early_result = false;
@@ -7063,25 +7262,12 @@ int asteriskd_runtime_start_system(const char *config_path,
     struct asteriskd_system_supervisor system;
     memset(&system, 0, sizeof(system));
     system.signal_fd = -1;
+    system.service_timer_fd = -1;
+    system.wifi_monitor.fd = -1;
     system.foreign_tc_netlink_fd = -1;
-    system.core_process.pid = -1;
-    system.core_process.process_group_id = -1;
-    system.core_process.pidfd = -1;
-    system.core_process.stdout_fd = -1;
-    system.core_process.stderr_fd = -1;
-    system.core_process.setup_status_fd = -1;
-    system.helper_process.pid = -1;
-    system.helper_process.process_group_id = -1;
-    system.helper_process.pidfd = -1;
-    system.helper_process.stdout_fd = -1;
-    system.helper_process.stderr_fd = -1;
-    system.helper_process.setup_status_fd = -1;
-    system.action_process.pid = -1;
-    system.action_process.process_group_id = -1;
-    system.action_process.pidfd = -1;
-    system.action_process.stdout_fd = -1;
-    system.action_process.stderr_fd = -1;
-    system.action_process.setup_status_fd = -1;
+    system_child_process_defaults(&system.core_process);
+    system_child_process_defaults(&system.helper_process);
+    system_child_process_defaults(&system.action_process);
     char error[256U];
     int loaded_config = asteriskd_config_load(
         config_path, &system.loaded_config, error, sizeof(error));
@@ -7150,6 +7336,10 @@ int asteriskd_runtime_start_system(const char *config_path,
             &system.store, &system.state, &system.loaded_config.config,
             error, sizeof(error));
     }
+    if (state_result == ASTERISKD_STATE_OK && !initial_start &&
+        !asteriskd_state_is_canonical_stopped(&system.state)) {
+        state_result = ASTERISKD_STATE_INCOMPATIBLE;
+    }
     if (state_result != ASTERISKD_STATE_OK) {
         (void)close(listener);
         *has_early_result = true;
@@ -7164,9 +7354,56 @@ int asteriskd_runtime_start_system(const char *config_path,
 
     system.live.supervisor_pid = (int)getpid();
     system.live.ipv6_enabled = system.loaded_config.config.enable_ipv6;
+    time_t service_now = time(NULL);
+    if (service_now == (time_t)-1) {
+        (void)close(listener);
+        *has_early_result = true;
+        (void)system_start_result(early_result, ASTERISKD_CONTROL_RESULT_START_FAILED,
+            "service control clock initialization failed", NULL);
+        system_runtime_cleanup(&system);
+        (void)sigprocmask(SIG_SETMASK, &previous, NULL);
+        return 1;
+    }
+    system.service_running = initial_start;
+    asteriskd_service_control_init(&system.service_control,
+        &system.loaded_config.config.service_control, initial_start, service_now);
+    const struct asteriskd_service_control_config *service =
+        &system.loaded_config.config.service_control;
+    if (service->enabled && service->schedule.enabled) {
+        system.service_timer_fd = timerfd_create(
+            CLOCK_REALTIME, TFD_NONBLOCK | TFD_CLOEXEC);
+        system.service_timer_fd_owned = system.service_timer_fd >= 0;
+    }
+    if (service->enabled && service->wifi.enabled) {
+        system.wifi_monitor_opened = asteriskd_wifi_monitor_open(
+            &system.wifi_monitor, error, sizeof(error)) == 0;
+    }
+    if (system.wifi_monitor_opened) {
+        enum asteriskd_wifi_transition transition;
+        struct asteriskd_wifi_identity identity;
+        if (asteriskd_wifi_monitor_baseline(
+                &system.wifi_monitor, &transition, &identity) != 0) {
+            system.wifi_monitor_opened = false;
+        } else {
+            (void)asteriskd_service_control_on_wifi(
+                &system.service_control, transition, &identity);
+        }
+    }
+    if ((service->enabled && service->schedule.enabled && !system.service_timer_fd_owned) ||
+        (service->enabled && service->wifi.enabled && !system.wifi_monitor_opened) ||
+        system_service_timer_arm(&system) != 0) {
+        (void)close(listener);
+        *has_early_result = true;
+        (void)system_start_result(early_result, ASTERISKD_CONTROL_RESULT_START_FAILED,
+            "service control event source initialization failed", NULL);
+        system_runtime_cleanup(&system);
+        (void)sigprocmask(SIG_SETMASK, &previous, NULL);
+        return 1;
+    }
     struct asteriskd_control_callbacks callbacks = {
         .snapshot = system_runtime_snapshot,
         .request_stop = system_runtime_request_stop,
+        .request_shutdown = system_runtime_request_shutdown,
         .context = &system,
     };
     if (asteriskd_control_server_create(&system.control, listener, &callbacks) != 0) {
@@ -7189,44 +7426,86 @@ int asteriskd_runtime_start_system(const char *config_path,
     }
     asteriskd_control_server_enable_accepting(system.control, true);
     struct asteriskd_runtime_effect_backend effects = system_runtime_effects(&system);
-    int status = asteriskd_runtime_supervise(system.runtime, &system.loaded_config.config,
-        &system.state, &system.live, &effects);
-
-    struct asteriskd_control_snapshot final_snapshot;
-    memset(&final_snapshot, 0, sizeof(final_snapshot));
-    struct asteriskd_control_result final_result;
-    memset(&final_result, 0, sizeof(final_result));
-    if (asteriskd_control_snapshot_from_state(
-            &system.state, &system.live, &final_snapshot) == 0) {
-        final_result.code = asteriskd_state_is_canonical_stopped(&system.state)
-            ? ASTERISKD_CONTROL_RESULT_OK : ASTERISKD_CONTROL_RESULT_STOP_FAILED;
-        final_result.has_snapshot = true;
-        (void)asteriskd_control_snapshot_copy(&final_result.snapshot, &final_snapshot);
-        if (final_result.code == ASTERISKD_CONTROL_RESULT_STOP_FAILED) {
-            (void)asteriskd_control_result_set_message(
-                &final_result, "cleanup incomplete", 18U);
-        }
-        int64_t now = 0;
-        if (system_runtime_clock(&system, &now) == 0) {
-            (void)asteriskd_control_server_finish_stop(
-                system.control, &final_result, (uint64_t)now);
-            asteriskd_control_server_enable_accepting(system.control, false);
-            if (!asteriskd_control_server_drained(system.control)) {
-                struct asteriskd_deadline deadline = {
-                    .armed = true,
-                    .monotonic_milliseconds = now + ASTERISKD_CONTROL_WATCH_STALL_MILLIS,
-                };
-                struct asteriskd_runtime_delta ignored;
-                (void)asteriskd_runtime_pump_until(system.runtime, &deadline,
-                    system_control_drained, &system, &ignored);
+    int status = 0;
+    bool should_start = initial_start;
+    while (!system.shutdown_requested) {
+        if (should_start || system.service_start_requested) {
+            bool automatic_start = !should_start;
+            if (!should_start) {
+                system_runtime_reset_cycle(&system);
+                if (asteriskd_runtime_prepare_start_state(
+                        &system.store, &system.state, &system.loaded_config.config,
+                        error, sizeof(error)) != ASTERISKD_STATE_OK) {
+                    status = 1;
+                    system.shutdown_requested = true;
+                    break;
+                }
             }
+            should_start = false;
+            system.service_start_requested = false;
+            system.service_running = true;
+            asteriskd_service_control_set_service_running(&system.service_control, true);
+            int cycle_status = asteriskd_runtime_supervise(
+                system.runtime, &system.loaded_config.config,
+                &system.state, &system.live, &effects);
+            system.service_running = false;
+            asteriskd_service_control_set_service_running(&system.service_control, false);
+            system_runtime_finish_control_stop(&system);
+            if (cycle_status != 0) {
+                status = cycle_status;
+                if (!automatic_start || !asteriskd_state_is_canonical_stopped(&system.state)) {
+                    system.shutdown_requested = true;
+                }
+            }
+            if (!service->enabled) break;
+            if (system.shutdown_requested) break;
+            if (system_service_reconcile_time(&system) != 0) {
+                status = 1;
+                system.shutdown_requested = true;
+            }
+            continue;
+        }
+        if (!service->enabled) break;
+        if (system_service_reconcile_time(&system) != 0) {
+            status = 1;
+            system.shutdown_requested = true;
+            break;
+        }
+        if (system.service_start_requested) continue;
+        struct asteriskd_runtime_delta delta;
+        if (asteriskd_runtime_pump_once(system.runtime, NULL, &delta) != 0 ||
+            (delta.flags & ASTERISKD_DELTA_FATAL) != 0U) {
+            status = 1;
+            system.shutdown_requested = true;
         }
     }
-    asteriskd_control_result_destroy(&final_result);
-    asteriskd_control_snapshot_destroy(&final_snapshot);
+    system_runtime_finish_control_stop(&system);
+    asteriskd_control_server_enable_accepting(system.control, false);
+    if (!asteriskd_control_server_drained(system.control)) {
+        int64_t now = 0;
+        if (system_runtime_clock(&system, &now) == 0) {
+            struct asteriskd_deadline deadline = {
+                .armed = true,
+                .monotonic_milliseconds = now + ASTERISKD_CONTROL_WATCH_STALL_MILLIS,
+            };
+            struct asteriskd_runtime_delta ignored;
+            (void)asteriskd_runtime_pump_until(system.runtime, &deadline,
+                system_control_drained, &system, &ignored);
+        }
+    }
     system_runtime_cleanup(&system);
     (void)sigprocmask(SIG_SETMASK, &previous, NULL);
     return status;
+}
+
+int asteriskd_runtime_start_system(const char *config_path,
+    bool *has_early_result, struct asteriskd_control_result *early_result) {
+    return system_runtime_run(config_path, true, has_early_result, early_result);
+}
+
+int asteriskd_runtime_monitor_system(const char *config_path,
+    bool *has_early_result, struct asteriskd_control_result *early_result) {
+    return system_runtime_run(config_path, false, has_early_result, early_result);
 }
 
 static int system_recovery_result_fill(
@@ -7412,6 +7691,7 @@ int asteriskd_runtime_recover_system(
     struct asteriskd_control_callbacks callbacks = {
         .snapshot = system_runtime_snapshot,
         .request_stop = system_runtime_request_stop,
+        .request_shutdown = system_runtime_request_shutdown,
         .context = &system,
     };
     struct asteriskd_runtime_reactor_backend reactor_backend = system_runtime_reactor_backend();

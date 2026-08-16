@@ -50,6 +50,16 @@ static int system_run_start(
         config_path, has_early_result, early_result);
 }
 
+static int system_run_monitor(
+    void *context,
+    const char *config_path,
+    bool *has_early_result,
+    struct asteriskd_control_result *early_result) {
+    (void)context;
+    return asteriskd_runtime_monitor_system(
+        config_path, has_early_result, early_result);
+}
+
 static int recovery_result_message(
     struct asteriskd_recovery_result *result,
     const char *message) {
@@ -181,6 +191,7 @@ static const struct asteriskd_cli_backend system_cli_backend = {
     .sync_path = system_sync_path,
     .control_client = system_control_client,
     .run_start = system_run_start,
+    .run_monitor = system_run_monitor,
     .recovery_gate = system_recovery_gate,
     .write_stdout = system_write_stdout,
     .write_stderr = system_write_stderr,

@@ -631,6 +631,181 @@ static int parse_network(
     return parse_policy(document, values[10], config);
 }
 
+static int parse_wifi_ssids(
+    const struct asteriskd_json_document *document,
+    size_t array,
+    struct asteriskd_wifi_rule_config *rule) {
+    size_t cursor;
+
+    if (document->tokens[array].type != ASTERISKD_JSON_ARRAY ||
+        document->tokens[array].child_count > ASTERISKD_MAX_WIFI_IDENTIFIERS) {
+        return -1;
+    }
+    rule->ssid_count = 0U;
+    cursor = array + 1U;
+    while (rule->ssid_count < document->tokens[array].child_count) {
+        char decoded[ASTERISKD_MAX_WIFI_SSID_BYTES + 1U];
+        size_t token = next_direct(document, array, cursor);
+        size_t length;
+        size_t previous;
+        if (token == TOKEN_NONE ||
+            copy_string(document, token, decoded, sizeof(decoded)) != 0) {
+            return -1;
+        }
+        length = strlen(decoded);
+        if (length == 0U || length > ASTERISKD_MAX_WIFI_SSID_BYTES) return -1;
+        for (previous = 0U; previous < rule->ssid_count; ++previous) {
+            if (rule->ssids[previous].length == length &&
+                memcmp(rule->ssids[previous].bytes, decoded, length) == 0) {
+                return -1;
+            }
+        }
+        memcpy(rule->ssids[rule->ssid_count].bytes, decoded, length);
+        rule->ssids[rule->ssid_count].length = (uint8_t)length;
+        ++rule->ssid_count;
+        cursor = token + 1U;
+    }
+    return 0;
+}
+
+static int parse_bssid_octet(char high, char low, uint8_t *result) {
+    unsigned int high_value;
+    unsigned int low_value;
+    high_value = high >= '0' && high <= '9'
+        ? (unsigned int)(high - '0')
+        : high >= 'a' && high <= 'f' ? (unsigned int)(high - 'a' + 10) : UINT_MAX;
+    low_value = low >= '0' && low <= '9'
+        ? (unsigned int)(low - '0')
+        : low >= 'a' && low <= 'f' ? (unsigned int)(low - 'a' + 10) : UINT_MAX;
+    if (high_value == UINT_MAX || low_value == UINT_MAX) return -1;
+    *result = (uint8_t)((high_value << 4U) | low_value);
+    return 0;
+}
+
+static int parse_bssid(const char *value, uint8_t result[6U]) {
+    size_t index;
+    if (strlen(value) != 17U) return -1;
+    for (index = 0U; index < 6U; ++index) {
+        size_t offset = index * 3U;
+        if (parse_bssid_octet(value[offset], value[offset + 1U], &result[index]) != 0 ||
+            (index < 5U && value[offset + 2U] != ':')) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int parse_wifi_bssids(
+    const struct asteriskd_json_document *document,
+    size_t array,
+    struct asteriskd_wifi_rule_config *rule) {
+    size_t cursor;
+
+    if (document->tokens[array].type != ASTERISKD_JSON_ARRAY ||
+        document->tokens[array].child_count > ASTERISKD_MAX_WIFI_IDENTIFIERS) {
+        return -1;
+    }
+    rule->bssid_count = 0U;
+    cursor = array + 1U;
+    while (rule->bssid_count < document->tokens[array].child_count) {
+        char decoded[18U];
+        size_t token = next_direct(document, array, cursor);
+        size_t previous;
+        if (token == TOKEN_NONE ||
+            copy_string(document, token, decoded, sizeof(decoded)) != 0 ||
+            parse_bssid(decoded, rule->bssids[rule->bssid_count]) != 0) {
+            return -1;
+        }
+        for (previous = 0U; previous < rule->bssid_count; ++previous) {
+            if (memcmp(
+                    rule->bssids[previous],
+                    rule->bssids[rule->bssid_count],
+                    6U) == 0) {
+                return -1;
+            }
+        }
+        ++rule->bssid_count;
+        cursor = token + 1U;
+    }
+    return 0;
+}
+
+static int parse_wifi_rule(
+    const struct asteriskd_json_document *document,
+    size_t object,
+    struct asteriskd_wifi_rule_config *rule) {
+    static const char *const names[] = {"enabled", "ssids", "bssids"};
+    size_t values[3];
+    if (object_fields(document, object, names, 3U, values) != 0 ||
+        parse_bool(document, values[0], &rule->enabled) != 0 ||
+        parse_wifi_ssids(document, values[1], rule) != 0 ||
+        parse_wifi_bssids(document, values[2], rule) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int parse_schedule_control(
+    const struct asteriskd_json_document *document,
+    size_t object,
+    bool master_enabled,
+    struct asteriskd_schedule_control_config *schedule) {
+    static const char *const names[] = {"enabled", "startCron", "stopCron"};
+    char start[ASTERISKD_MAX_CRON_EXPRESSION + 1U];
+    char stop[ASTERISKD_MAX_CRON_EXPRESSION + 1U];
+    size_t values[3];
+    if (object_fields(document, object, names, 3U, values) != 0 ||
+        parse_bool(document, values[0], &schedule->enabled) != 0 ||
+        copy_string(document, values[1], start, sizeof(start)) != 0 ||
+        copy_string(document, values[2], stop, sizeof(stop)) != 0) {
+        return -1;
+    }
+    if (master_enabled && schedule->enabled &&
+        (asteriskd_cron_parse(start, &schedule->start) != 0 ||
+            asteriskd_cron_parse(stop, &schedule->stop) != 0)) {
+        return -1;
+    }
+    return 0;
+}
+
+static int parse_wifi_control(
+    const struct asteriskd_json_document *document,
+    size_t object,
+    struct asteriskd_wifi_control_config *wifi) {
+    static const char *const names[] = {
+        "enabled", "connectStart", "connectStop", "disconnectStart", "disconnectStop",
+    };
+    size_t values[5];
+    if (object_fields(document, object, names, 5U, values) != 0 ||
+        parse_bool(document, values[0], &wifi->enabled) != 0 ||
+        parse_wifi_rule(document, values[1], &wifi->connect_start) != 0 ||
+        parse_wifi_rule(document, values[2], &wifi->connect_stop) != 0 ||
+        parse_wifi_rule(document, values[3], &wifi->disconnect_start) != 0 ||
+        parse_wifi_rule(document, values[4], &wifi->disconnect_stop) != 0 ||
+        (wifi->connect_start.enabled && wifi->connect_stop.enabled) ||
+        (wifi->disconnect_start.enabled && wifi->disconnect_stop.enabled)) {
+        return -1;
+    }
+    return 0;
+}
+
+static int parse_service_control(
+    const struct asteriskd_json_document *document,
+    size_t object,
+    struct asteriskd_service_control_config *service_control) {
+    static const char *const names[] = {"enabled", "schedule", "wifi"};
+    size_t values[3];
+    if (object_fields(document, object, names, 3U, values) != 0 ||
+        parse_bool(document, values[0], &service_control->enabled) != 0 ||
+        parse_schedule_control(
+            document, values[1], service_control->enabled,
+            &service_control->schedule) != 0 ||
+        parse_wifi_control(document, values[2], &service_control->wifi) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
 static int parse_mode_options(
     const struct asteriskd_json_document *document,
     size_t object,
@@ -829,18 +1004,28 @@ int asteriskd_config_parse(
     struct asteriskd_json_document document;
     int result = asteriskd_json_parse(json, length, &document, message, message_size);
     if (result != 0) return result;
-    static const char *const root_names[] = {
+    static const char *const root_names_v2[] = {
         "schemaVersion", "owner", "coreType", "coreExecutablePath", "coreConfigPath", "statePath",
         "logPath", "mode", "core", "network", "modeOptions", "matcher", "helper",
+    };
+    static const char *const root_names_v3[] = {
+        "schemaVersion", "owner", "coreType", "coreExecutablePath", "coreConfigPath", "statePath",
+        "logPath", "mode", "core", "network", "modeOptions", "matcher", "helper", "serviceControl",
     };
     static const char *const owners[] = {"asteriskng", "asteriskbox", "asteriskmeta"};
     static const char *const cores[] = {"xray", "sing-box", "mihomo"};
     static const char *const modes[] = {"tproxy", "tun", "tun2socks", "bpf2socks", "ebpf"};
-    size_t values[13];
+    size_t values[14];
+    size_t schema_token = TOKEN_NONE;
     uint32_t schema = 0U;
     int owner = 0, core = 0, mode = 0;
-    if (document.tokens[0].type != ASTERISKD_JSON_OBJECT || object_fields(&document, 0U, root_names, 13U, values) != 0 ||
-        parse_u32(&document, values[0], &schema) != 0 || schema != 2U ||
+    if (document.tokens[0].type != ASTERISKD_JSON_OBJECT ||
+        find_field(&document, 0U, "schemaVersion", &schema_token) != 0 ||
+        parse_u32(&document, schema_token, &schema) != 0 ||
+        (schema != 2U && schema != ASTERISKD_CONFIG_VERSION) ||
+        (schema == 2U
+            ? object_fields(&document, 0U, root_names_v2, 13U, values)
+            : object_fields(&document, 0U, root_names_v3, 14U, values)) != 0 ||
         copy_string(&document, values[3], config->core_executable_path, sizeof(config->core_executable_path)) != 0 || !path_is_normal(config->core_executable_path) ||
         copy_string(&document, values[4], config->core_config_path, sizeof(config->core_config_path)) != 0 || !path_is_normal(config->core_config_path) ||
         copy_string(&document, values[5], config->state_path, sizeof(config->state_path)) != 0 || !path_is_normal(config->state_path) ||
@@ -858,6 +1043,9 @@ int asteriskd_config_parse(
     if (result == 0) result = parse_mode_options(&document, values[10], config);
     if (result == 0) result = parse_matcher(&document, values[11], config);
     if (result == 0) result = parse_helper(&document, values[12], config);
+    if (result == 0 && schema == 3U) {
+        result = parse_service_control(&document, values[13], &config->service_control);
+    }
     if (result == ASTERISKD_CONFIG_NO_MEMORY) goto no_memory;
     if (result != 0 || validate_cross_fields(config) != 0) goto invalid;
     if (!supported(config)) {

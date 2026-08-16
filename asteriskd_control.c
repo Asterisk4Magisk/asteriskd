@@ -28,7 +28,7 @@
 
 #define CONTROL_TOKEN_NONE SIZE_MAX
 
-static const char *const control_method_names[] = {"status", "stop", "watch"};
+static const char *const control_method_names[] = {"status", "stop", "shutdown", "watch"};
 static const char *const control_result_names[] = {
     "ok", "already_running", "not_running", "permission_denied", "invalid_request",
     "config_invalid", "unsupported_combination", "start_failed", "stop_failed", "internal_error",
@@ -266,6 +266,7 @@ int asteriskd_cli_parse(
     if (argc == 2) {
         if (strcmp(argv[1], "status") == 0) invocation->command = ASTERISKD_CLI_STATUS;
         else if (strcmp(argv[1], "stop") == 0) invocation->command = ASTERISKD_CLI_STOP;
+        else if (strcmp(argv[1], "shutdown") == 0) invocation->command = ASTERISKD_CLI_SHUTDOWN;
         else if (strcmp(argv[1], "watch") == 0) invocation->command = ASTERISKD_CLI_WATCH;
         else goto invalid;
         return 0;
@@ -281,6 +282,10 @@ int asteriskd_cli_parse(
     bool config_path = false;
     if (strcmp(argv[1], "start") == 0 && strcmp(argv[2], "--config") == 0) {
         invocation->command = ASTERISKD_CLI_START;
+        path_target = ASTERISKD_SYNC_FILE;
+        config_path = true;
+    } else if (strcmp(argv[1], "monitor") == 0 && strcmp(argv[2], "--config") == 0) {
+        invocation->command = ASTERISKD_CLI_MONITOR;
         path_target = ASTERISKD_SYNC_FILE;
         config_path = true;
     } else if (strcmp(argv[1], "recover") == 0 && strcmp(argv[2], "--config") == 0) {
@@ -1775,7 +1780,8 @@ enum asteriskd_control_client_result asteriskd_control_client_run_with_backend(
     bool final_event_received = false;
     uint64_t last_sequence = 0U;
     for (;;) {
-        uint64_t read_deadline = initial_received || method == ASTERISKD_CONTROL_METHOD_STOP
+        uint64_t read_deadline = initial_received || method == ASTERISKD_CONTROL_METHOD_STOP ||
+            method == ASTERISKD_CONTROL_METHOD_SHUTDOWN
             ? UINT64_MAX : initial_deadline;
         enum asteriskd_control_client_result waited = control_client_wait(
             backend, context, fd, true, false, read_deadline);
@@ -2023,7 +2029,8 @@ enum asteriskd_control_client_result asteriskd_control_client_run(
 static bool control_cli_backend_complete(const struct asteriskd_cli_backend *backend) {
     return backend != NULL && backend->effective_uid != NULL &&
         backend->sync_path != NULL && backend->control_client != NULL &&
-        backend->run_start != NULL && backend->recovery_gate != NULL &&
+        backend->run_start != NULL && backend->run_monitor != NULL &&
+        backend->recovery_gate != NULL &&
         backend->write_stdout != NULL && backend->write_stderr != NULL;
 }
 
@@ -2125,7 +2132,7 @@ static int control_cli_usage(
     const struct asteriskd_cli_backend *backend,
     void *context) {
     static const char usage[] =
-        "usage: asteriskd start --config ABSOLUTE_PATH | status | stop | "
+        "usage: asteriskd start|monitor --config ABSOLUTE_PATH | status | stop | shutdown | "
         "watch [--until-running] | "
         "sync --file|--directory ABSOLUTE_PATH | recover --config ABSOLUTE_CONFIG_PATH\n";
     (void)backend->write_stderr(context, usage, sizeof(usage) - 1U);
@@ -2201,8 +2208,10 @@ int asteriskd_cli_main_with_backend(
             return status;
         }
         const char *request_id = invocation.command == ASTERISKD_CLI_START ? "start" :
+            invocation.command == ASTERISKD_CLI_MONITOR ? "monitor" :
             invocation.command == ASTERISKD_CLI_STATUS ? "status" :
-            invocation.command == ASTERISKD_CLI_STOP ? "stop" : "watch";
+            invocation.command == ASTERISKD_CLI_STOP ? "stop" :
+            invocation.command == ASTERISKD_CLI_SHUTDOWN ? "shutdown" : "watch";
         return control_cli_write_response(
             backend, context, request_id, ASTERISKD_CONTROL_RESULT_PERMISSION_DENIED,
             NULL, "root permission required");
@@ -2215,26 +2224,33 @@ int asteriskd_cli_main_with_backend(
         return control_cli_run_control(
             backend, context, ASTERISKD_CONTROL_METHOD_STOP, "stop", false);
     }
+    if (invocation.command == ASTERISKD_CLI_SHUTDOWN) {
+        return control_cli_run_control(
+            backend, context, ASTERISKD_CONTROL_METHOD_SHUTDOWN, "shutdown", false);
+    }
     if (invocation.command == ASTERISKD_CLI_WATCH) {
         return control_cli_run_control(
             backend, context, ASTERISKD_CONTROL_METHOD_WATCH, "watch",
             invocation.watch_until_running);
     }
 
-    if (invocation.command == ASTERISKD_CLI_START) {
+    if (invocation.command == ASTERISKD_CLI_START ||
+        invocation.command == ASTERISKD_CLI_MONITOR) {
         bool has_early_result = false;
         struct asteriskd_control_result early_result;
         memset(&early_result, 0, sizeof(early_result));
-        int status = backend->run_start(
-            context, invocation.path, &has_early_result, &early_result);
+        int status = (invocation.command == ASTERISKD_CLI_START
+            ? backend->run_start : backend->run_monitor)(
+                context, invocation.path, &has_early_result, &early_result);
+        const char *request_id = invocation.command == ASTERISKD_CLI_START ? "start" : "monitor";
         if (has_early_result && asteriskd_control_result_valid(&early_result)) {
             status = control_cli_write_response(
-                backend, context, "start", early_result.code,
+                backend, context, request_id, early_result.code,
                 early_result.has_snapshot ? &early_result.snapshot : NULL,
                 early_result.has_message ? early_result.message : NULL);
         } else if (has_early_result || status < 0) {
             status = control_cli_write_response(
-                backend, context, "start", ASTERISKD_CONTROL_RESULT_INTERNAL_ERROR,
+                backend, context, request_id, ASTERISKD_CONTROL_RESULT_INTERNAL_ERROR,
                 NULL, "runtime start failed before initialization");
         }
         asteriskd_control_result_destroy(&early_result);
@@ -2460,7 +2476,32 @@ static int control_server_process_request(
         return 0;
     }
     if (request.method == ASTERISKD_CONTROL_METHOD_STOP) {
-        if (server->callbacks.request_stop(server->callbacks.context) == 0) {
+        int requested = server->callbacks.request_stop(server->callbacks.context);
+        if (requested == 0) {
+            client->pending_stop = true;
+            return 0;
+        }
+        struct asteriskd_control_snapshot snapshot;
+        bool has_snapshot = control_server_snapshot(server, &snapshot) == 0;
+        if (requested > 0) {
+            if (control_server_queue_response(
+                    server, client, ASTERISKD_CONTROL_RESULT_OK,
+                    has_snapshot ? &snapshot : NULL, NULL, now, true) != 0) {
+                control_server_client_close(server, client);
+            }
+            if (has_snapshot) asteriskd_control_snapshot_destroy(&snapshot);
+            return 0;
+        }
+        if (control_server_queue_response(
+                server, client, ASTERISKD_CONTROL_RESULT_INTERNAL_ERROR,
+                has_snapshot ? &snapshot : NULL, "stop request failed", now, true) != 0) {
+            control_server_client_close(server, client);
+        }
+        if (has_snapshot) asteriskd_control_snapshot_destroy(&snapshot);
+        return 0;
+    }
+    if (request.method == ASTERISKD_CONTROL_METHOD_SHUTDOWN) {
+        if (server->callbacks.request_shutdown(server->callbacks.context) == 0) {
             client->pending_stop = true;
             return 0;
         }
@@ -2468,7 +2509,7 @@ static int control_server_process_request(
         bool has_snapshot = control_server_snapshot(server, &snapshot) == 0;
         if (control_server_queue_response(
                 server, client, ASTERISKD_CONTROL_RESULT_INTERNAL_ERROR,
-                has_snapshot ? &snapshot : NULL, "stop request failed", now, true) != 0) {
+                has_snapshot ? &snapshot : NULL, "shutdown request failed", now, true) != 0) {
             control_server_client_close(server, client);
         }
         if (has_snapshot) asteriskd_control_snapshot_destroy(&snapshot);
@@ -2607,7 +2648,7 @@ int asteriskd_control_server_create_with_backend(
     if (out != NULL) *out = NULL;
     if (out == NULL || listener_fd < 0 || !control_transport_complete(transport) ||
         callbacks == NULL || callbacks->snapshot == NULL ||
-        callbacks->request_stop == NULL) return -1;
+        callbacks->request_stop == NULL || callbacks->request_shutdown == NULL) return -1;
     struct asteriskd_control_server *server = calloc(1U, sizeof(*server));
     if (server == NULL) return -1;
     server->listener_fd = listener_fd;
