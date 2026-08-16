@@ -128,6 +128,7 @@ enum asteriskd_service_action asteriskd_service_control_on_wifi(
     struct asteriskd_service_control_runtime *runtime,
     enum asteriskd_wifi_transition transition,
     const struct asteriskd_wifi_identity *identity) {
+    struct asteriskd_wifi_identity disconnected_identity;
     const struct asteriskd_wifi_identity *match_identity = identity;
     bool connected_transition;
     bool duplicate;
@@ -148,7 +149,10 @@ enum asteriskd_service_action asteriskd_service_control_on_wifi(
         return ASTERISKD_SERVICE_ACTION_NONE;
     }
     if (transition == ASTERISKD_WIFI_TRANSITION_DISCONNECTED) {
-        if (runtime->wifi_connected) match_identity = &runtime->previous_wifi;
+        if (runtime->wifi_connected) {
+            disconnected_identity = runtime->previous_wifi;
+            match_identity = &disconnected_identity;
+        }
         duplicate = !runtime->wifi_connected;
         runtime->wifi_connected = false;
         memset(&runtime->previous_wifi, 0, sizeof(runtime->previous_wifi));
