@@ -1487,6 +1487,7 @@ struct asteriskd_rules_runtime {
 void asteriskd_rules_runtime_init(struct asteriskd_rules_runtime *);
 bool asteriskd_xtables_private_chain_shape_valid(
     const char *, size_t, const char *, size_t);
+size_t asteriskd_xtables_fake_dns_arguments(const char *, const char **);
 int asteriskd_xtables_private_chain_counts(
     const char *, size_t, const char *, size_t *, size_t *);
 size_t asteriskd_xtables_hook_arguments(

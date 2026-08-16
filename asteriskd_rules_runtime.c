@@ -220,6 +220,24 @@ int asteriskd_ip_route_output_classify(
     return 0;
 }
 
+size_t asteriskd_xtables_fake_dns_arguments(
+    const char *pool, const char **arguments) {
+    size_t pool_length = pool == NULL ? 0U : strnlen(pool, ASTERISKD_MAX_CIDR);
+    if (arguments == NULL || pool_length == 0U || pool_length >= ASTERISKD_MAX_CIDR ||
+        strpbrk(pool, " \t\r\n") != NULL) return 0U;
+    arguments[0] = "-d";
+    arguments[1] = pool;
+    arguments[2] = "-p";
+    arguments[3] = "icmp";
+    arguments[4] = "-m";
+    arguments[5] = "icmp";
+    arguments[6] = "--icmp-type";
+    arguments[7] = "8";
+    arguments[8] = "-j";
+    arguments[9] = "REDIRECT";
+    return 10U;
+}
+
 int asteriskd_xtables_private_chain_counts(
     const char *bytes, size_t length, const char *chain,
     size_t *declaration_count, size_t *rule_count) {

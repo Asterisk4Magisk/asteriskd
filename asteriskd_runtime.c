@@ -3143,11 +3143,12 @@ static int system_populate_private_chain(
     }
     if (group->chain_id == ASTERISKD_CHAIN_FAKE_DNS) {
         const char *pool = system->loaded_config.config.fake_dns_ipv4_pool;
-        const char *arguments[] = {"-d", pool, "-p", "icmp", "--icmp-type",
-            "echo-request", "-j", "REDIRECT"};
+        const char *arguments[10U];
+        size_t argument_count = asteriskd_xtables_fake_dns_arguments(pool, arguments);
+        if (argument_count == 0U) return -1;
         return system_xtables_zero(system, ASTERISKD_IP_FAMILY_IPV4,
             ASTERISKD_IP_TABLE_NAT, "-A", chain, arguments,
-            sizeof(arguments) / sizeof(arguments[0]));
+            argument_count);
     }
     return -1;
 }
