@@ -4157,18 +4157,33 @@ static int system_tc_remove_filter(struct asteriskd_system_supervisor *system,
     return 0;
 }
 
-static int system_tc_remove_qdisc(struct asteriskd_system_supervisor *system,
-    const struct asteriskd_tc_qdisc_resource *resource) {
-    bool present = false;
-    if (system_tc_probe_qdisc(system, resource, &present) != 0) return -1;
-    if (!present) return 0;
+static int system_tc_inspect_qdisc_cleanup(struct asteriskd_system_supervisor *system,
+    const struct asteriskd_tc_qdisc_resource *resource, bool *present,
+    enum asteriskd_tc_qdisc_cleanup_decision *decision) {
+    if (present == NULL || decision == NULL ||
+        system_tc_probe_qdisc(system, resource, present) != 0) return -1;
+    *decision = ASTERISKD_TC_QDISC_CLEANUP_DELETE;
+    if (!*present) return 0;
     const char *ingress[] = {"filter", "show", "dev", resource->interface_name, "ingress"};
     const char *egress[] = {"filter", "show", "dev", resource->interface_name, "egress"};
     int exit_status = -1;
     if (system_tc_command(system, ingress, 5U, true, &exit_status) != 0 ||
-        exit_status != 0 || system->action_stdout_length != 0U ||
-        system_tc_command(system, egress, 5U, true, &exit_status) != 0 ||
-        exit_status != 0 || system->action_stdout_length != 0U) return -1;
+        exit_status != 0) return -1;
+    bool ingress_occupied = system->action_stdout_length != 0U;
+    if (system_tc_command(system, egress, 5U, true, &exit_status) != 0 ||
+        exit_status != 0) return -1;
+    bool egress_occupied = system->action_stdout_length != 0U;
+    *decision = asteriskd_tc_qdisc_cleanup_decide(ingress_occupied, egress_occupied);
+    return 0;
+}
+
+static int system_tc_remove_qdisc(struct asteriskd_system_supervisor *system,
+    const struct asteriskd_tc_qdisc_resource *resource) {
+    bool present = false;
+    enum asteriskd_tc_qdisc_cleanup_decision decision;
+    if (system_tc_inspect_qdisc_cleanup(
+            system, resource, &present, &decision) != 0) return -1;
+    if (asteriskd_tc_qdisc_cleanup_restored(present, decision)) return 0;
     const char *arguments[] = {"qdisc", "del", "dev", resource->interface_name, "clsact"};
     return system_tc_zero(system, arguments, 5U);
 }
@@ -5239,9 +5254,11 @@ static int system_wal_verify_restored(void *opaque,
     if (record->kind == ASTERISKD_RECOVERY_TC_QDISC) {
         if (if_nametoindex(record->resource.tc_qdisc.interface_name) !=
                 record->resource.tc_qdisc.interface_index) return 0;
-        bool present = true;
-        return system_tc_probe_qdisc(system, &record->resource.tc_qdisc, &present) == 0 &&
-            !present ? 0 : -1;
+        bool present = false;
+        enum asteriskd_tc_qdisc_cleanup_decision decision;
+        return system_tc_inspect_qdisc_cleanup(system,
+                &record->resource.tc_qdisc, &present, &decision) == 0 &&
+            asteriskd_tc_qdisc_cleanup_restored(present, decision) ? 0 : -1;
     }
     if (record->kind == ASTERISKD_RECOVERY_IPTABLES_CHAIN) {
         const struct asteriskd_private_chain_group *group =

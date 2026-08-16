@@ -2677,6 +2677,11 @@ enum asteriskd_tc_slot_state {
     ASTERISKD_TC_SLOT_FOREIGN,
 };
 
+enum asteriskd_tc_qdisc_cleanup_decision {
+    ASTERISKD_TC_QDISC_CLEANUP_DELETE,
+    ASTERISKD_TC_QDISC_CLEANUP_RETAIN_SHARED,
+};
+
 enum asteriskd_tc_plan_operation_kind {
     ASTERISKD_TC_PLAN_SET_ROUTE_LOCALNET,
     ASTERISKD_TC_PLAN_CREATE_CLSACT,
@@ -2715,6 +2720,10 @@ int asteriskd_tc_install_plan_build(
     struct asteriskd_tc_plan *, char *, size_t);
 int asteriskd_tc_cleanup_plan_build(
     const struct asteriskd_tc_plan *, struct asteriskd_tc_plan *);
+enum asteriskd_tc_qdisc_cleanup_decision asteriskd_tc_qdisc_cleanup_decide(
+    bool ingress_occupied, bool egress_occupied);
+bool asteriskd_tc_qdisc_cleanup_restored(bool qdisc_present,
+    enum asteriskd_tc_qdisc_cleanup_decision decision);
 
 struct asteriskd_foreign_tc_probe {
     char interface_name[ASTERISKD_MAX_INTERFACE_NAME];

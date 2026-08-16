@@ -33,6 +33,18 @@ static bool slot_valid(enum asteriskd_tc_slot_state slot) {
     return slot >= ASTERISKD_TC_SLOT_ABSENT && slot <= ASTERISKD_TC_SLOT_FOREIGN;
 }
 
+enum asteriskd_tc_qdisc_cleanup_decision asteriskd_tc_qdisc_cleanup_decide(
+    bool ingress_occupied, bool egress_occupied) {
+    return ingress_occupied || egress_occupied
+        ? ASTERISKD_TC_QDISC_CLEANUP_RETAIN_SHARED
+        : ASTERISKD_TC_QDISC_CLEANUP_DELETE;
+}
+
+bool asteriskd_tc_qdisc_cleanup_restored(bool qdisc_present,
+    enum asteriskd_tc_qdisc_cleanup_decision decision) {
+    return !qdisc_present || decision == ASTERISKD_TC_QDISC_CLEANUP_RETAIN_SHARED;
+}
+
 static struct asteriskd_tc_plan_operation *append_operation(
     struct asteriskd_tc_plan *plan, enum asteriskd_tc_plan_operation_kind kind,
     enum asteriskd_recovery_kind recovery_kind) {
