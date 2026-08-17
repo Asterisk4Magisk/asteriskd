@@ -1007,7 +1007,6 @@ bool asteriskd_test_action_should_cancel(
 #if defined(__linux__) || defined(__ANDROID__)
 enum system_tc_netlink_query_kind {
     SYSTEM_TC_NETLINK_QUERY_NONE,
-    SYSTEM_TC_NETLINK_QUERY_FOREIGN_FILTER,
     SYSTEM_TC_NETLINK_QUERY_EXPECTED_FILTER,
     SYSTEM_TC_NETLINK_QUERY_SLOT_FILTER,
     SYSTEM_TC_NETLINK_QUERY_QDISC,
@@ -1095,21 +1094,15 @@ struct asteriskd_system_supervisor {
     struct asteriskd_bpf2_verification bpf2_verification;
     bool bpf2_plan_ready;
     bool bpf2_verified;
-    struct asteriskd_foreign_tc_probe foreign_tc_probe;
-    char foreign_tc_source_path[ASTERISKD_MAX_PATH];
-    uint64_t foreign_tc_pinned_object_id;
-    bool foreign_tc_pin_active;
-    int foreign_tc_netlink_fd;
-    uint32_t foreign_tc_netlink_port_id;
-    bool foreign_tc_netlink_fd_owned;
-    bool foreign_tc_netlink_active;
-    bool foreign_tc_netlink_done;
-    bool foreign_tc_netlink_failed;
-    bool foreign_tc_netlink_present;
-    uint32_t foreign_tc_netlink_sequence;
-    uint32_t foreign_tc_netlink_interface_index;
-    enum system_tc_netlink_query_kind foreign_tc_netlink_query;
-    struct asteriskd_foreign_tc_probe foreign_tc_netlink_probe;
+    int tc_netlink_fd;
+    uint32_t tc_netlink_port_id;
+    bool tc_netlink_fd_owned;
+    bool tc_netlink_active;
+    bool tc_netlink_done;
+    bool tc_netlink_failed;
+    uint32_t tc_netlink_sequence;
+    uint32_t tc_netlink_interface_index;
+    enum system_tc_netlink_query_kind tc_netlink_query;
     struct asteriskd_tc_filter_expectation tc_filter_netlink_expectation;
     enum asteriskd_rules_slot_state tc_filter_netlink_state;
     enum asteriskd_rules_slot_state tc_qdisc_netlink_state;
@@ -1156,14 +1149,11 @@ static int system_collect_local_address_set(
 
 static const char *system_pin_path(
     struct asteriskd_system_supervisor *, enum asteriskd_pin_id);
-static const char *system_recovery_pin_path(
-    struct asteriskd_system_supervisor *, const struct asteriskd_recovery_record *,
-    char *, size_t);
 static uint64_t system_verified_pin_id(
     const struct asteriskd_system_supervisor *, enum asteriskd_pin_id);
 static const struct asteriskd_bpf2_verified_pin *system_bpf2_verified_pin(
     const struct asteriskd_system_supervisor *, enum asteriskd_pin_id);
-static int system_foreign_tc_netlink_dispatch(struct asteriskd_system_supervisor *, short);
+static int system_tc_netlink_dispatch(struct asteriskd_system_supervisor *, short);
 
 static int system_runtime_clock(void *opaque, int64_t *milliseconds) {
     (void)opaque;
@@ -1393,10 +1383,10 @@ static int system_runtime_prepare(
     if (system->network_opened && system->network.fd_owned &&
         system_runtime_add_source(builder, system->network.fd, POLLIN,
             ASTERISKD_POLL_NETWORK, 0U, 1U) != 0) return -1;
-    if (system->foreign_tc_netlink_active && system->foreign_tc_netlink_fd_owned &&
-        system_runtime_add_source(builder, system->foreign_tc_netlink_fd, POLLIN,
+    if (system->tc_netlink_active && system->tc_netlink_fd_owned &&
+        system_runtime_add_source(builder, system->tc_netlink_fd, POLLIN,
             ASTERISKD_POLL_TC_NETLINK, 0U,
-            system->foreign_tc_netlink_sequence) != 0) return -1;
+            system->tc_netlink_sequence) != 0) return -1;
     uint64_t network_deadline = 0U;
     if (system->network_opened &&
         asteriskd_network_next_deadline(&system->network, &network_deadline)) {
@@ -1633,11 +1623,11 @@ static int system_runtime_dispatch(void *opaque, const struct asteriskd_poll_sou
             delta->flags |= ASTERISKD_DELTA_NETWORK_CHANGED;
         }
     } else if (source->kind == ASTERISKD_POLL_TC_NETLINK &&
-        system->foreign_tc_netlink_active) {
-        if (source->generation != system->foreign_tc_netlink_sequence ||
-            system_foreign_tc_netlink_dispatch(system, ready) != 0) {
-            system->foreign_tc_netlink_failed = true;
-            system->foreign_tc_netlink_done = true;
+        system->tc_netlink_active) {
+        if (source->generation != system->tc_netlink_sequence ||
+            system_tc_netlink_dispatch(system, ready) != 0) {
+            system->tc_netlink_failed = true;
+            system->tc_netlink_done = true;
         }
     } else if (source->kind == ASTERISKD_POLL_SERVICE_TIMER) {
         if (system_service_timer_dispatch(system) != 0) {
@@ -3539,22 +3529,22 @@ static int system_tc_zero(struct asteriskd_system_supervisor *system,
         false, &exit_status) == 0 && exit_status == 0 ? 0 : -1;
 }
 
-static void system_foreign_tc_netlink_close(struct asteriskd_system_supervisor *system) {
-    if (system->foreign_tc_netlink_fd_owned && system->foreign_tc_netlink_fd >= 0) {
-        (void)close(system->foreign_tc_netlink_fd);
+static void system_tc_netlink_close(struct asteriskd_system_supervisor *system) {
+    if (system->tc_netlink_fd_owned && system->tc_netlink_fd >= 0) {
+        (void)close(system->tc_netlink_fd);
     }
-    system->foreign_tc_netlink_fd = -1;
-    system->foreign_tc_netlink_port_id = 0U;
-    system->foreign_tc_netlink_fd_owned = false;
-    system->foreign_tc_netlink_active = false;
-    system->foreign_tc_netlink_query = SYSTEM_TC_NETLINK_QUERY_NONE;
+    system->tc_netlink_fd = -1;
+    system->tc_netlink_port_id = 0U;
+    system->tc_netlink_fd_owned = false;
+    system->tc_netlink_active = false;
+    system->tc_netlink_query = SYSTEM_TC_NETLINK_QUERY_NONE;
 }
 
 static int system_tc_netlink_begin(
     struct asteriskd_system_supervisor *system, uint32_t interface_index,
     enum system_tc_netlink_query_kind query, void *request, size_t request_size,
     struct nlmsghdr *header) {
-    if (system->foreign_tc_netlink_active || interface_index == 0U ||
+    if (system->tc_netlink_active || interface_index == 0U ||
         query == SYSTEM_TC_NETLINK_QUERY_NONE || request == NULL ||
         request_size < sizeof(*header) || header == NULL) return -1;
     int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC, NETLINK_ROUTE);
@@ -3579,9 +3569,9 @@ static int system_tc_netlink_begin(
         errno = saved == 0 ? EINVAL : saved;
         return -1;
     }
-    ++system->foreign_tc_netlink_sequence;
-    if (system->foreign_tc_netlink_sequence == 0U) ++system->foreign_tc_netlink_sequence;
-    header->nlmsg_seq = system->foreign_tc_netlink_sequence;
+    ++system->tc_netlink_sequence;
+    if (system->tc_netlink_sequence == 0U) ++system->tc_netlink_sequence;
+    header->nlmsg_seq = system->tc_netlink_sequence;
     struct sockaddr_nl kernel;
     memset(&kernel, 0, sizeof(kernel));
     kernel.nl_family = AF_NETLINK;
@@ -3596,29 +3586,26 @@ static int system_tc_netlink_begin(
         errno = saved;
         return -1;
     }
-    system->foreign_tc_netlink_fd = fd;
-    system->foreign_tc_netlink_port_id = assigned.nl_pid;
-    system->foreign_tc_netlink_fd_owned = true;
-    system->foreign_tc_netlink_active = true;
-    system->foreign_tc_netlink_done = false;
-    system->foreign_tc_netlink_failed = false;
-    system->foreign_tc_netlink_present = false;
-    system->foreign_tc_netlink_interface_index = interface_index;
-    system->foreign_tc_netlink_query = query;
-    memset(&system->foreign_tc_netlink_probe, 0, sizeof(system->foreign_tc_netlink_probe));
+    system->tc_netlink_fd = fd;
+    system->tc_netlink_port_id = assigned.nl_pid;
+    system->tc_netlink_fd_owned = true;
+    system->tc_netlink_active = true;
+    system->tc_netlink_done = false;
+    system->tc_netlink_failed = false;
+    system->tc_netlink_interface_index = interface_index;
+    system->tc_netlink_query = query;
     system->tc_filter_netlink_state = ASTERISKD_RULES_SLOT_ABSENT;
     system->tc_qdisc_netlink_state = ASTERISKD_RULES_SLOT_ABSENT;
     return 0;
 }
 
-static int system_foreign_tc_netlink_start(
+static int system_tc_filter_netlink_start(
     struct asteriskd_system_supervisor *system, uint32_t interface_index,
     uint32_t parent, uint32_t priority, uint32_t protocol,
     enum system_tc_netlink_query_kind query) {
     if (interface_index == 0U || parent == 0U ||
         priority == 0U || protocol == 0U ||
-        (query != SYSTEM_TC_NETLINK_QUERY_FOREIGN_FILTER &&
-         query != SYSTEM_TC_NETLINK_QUERY_EXPECTED_FILTER &&
+        (query != SYSTEM_TC_NETLINK_QUERY_EXPECTED_FILTER &&
          query != SYSTEM_TC_NETLINK_QUERY_SLOT_FILTER)) return -1;
     struct {
         struct nlmsghdr header;
@@ -3652,12 +3639,12 @@ static int system_tc_qdisc_netlink_start(
         SYSTEM_TC_NETLINK_QUERY_QDISC, &request, sizeof(request), &request.header);
 }
 
-static int system_foreign_tc_netlink_dispatch(
+static int system_tc_netlink_dispatch(
     struct asteriskd_system_supervisor *system, short ready) {
     if ((ready & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
         char message[96U];
         int written = snprintf(message, sizeof(message),
-            "hotspot netlink poll failed: revents=0x%x", (unsigned short)ready);
+            "TC netlink poll failed: revents=0x%x", (unsigned short)ready);
         if (written > 0 && (size_t)written < sizeof(message)) {
             (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
                 ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
@@ -3675,41 +3662,33 @@ static int system_foreign_tc_netlink_dispatch(
         message.msg_namelen = sizeof(sender);
         message.msg_iov = &vector;
         message.msg_iovlen = 1U;
-        ssize_t received = recvmsg(system->foreign_tc_netlink_fd, &message, MSG_TRUNC);
+        ssize_t received = recvmsg(system->tc_netlink_fd, &message, MSG_TRUNC);
         if (received < 0 && errno == EINTR) continue;
         if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
         if (received <= 0 || (size_t)received > sizeof(buffer) ||
             (message.msg_flags & MSG_TRUNC) != 0 || sender.nl_pid != 0U) return -1;
         char error[128U] = {0};
-        int decoded = system->foreign_tc_netlink_query == SYSTEM_TC_NETLINK_QUERY_FOREIGN_FILTER
-            ? asteriskd_foreign_tc_netlink_decode(
-                buffer, (size_t)received, system->foreign_tc_netlink_sequence,
-                system->foreign_tc_netlink_port_id,
-                system->foreign_tc_netlink_interface_index,
-                &system->foreign_tc_netlink_probe,
-                &system->foreign_tc_netlink_present,
-                &system->foreign_tc_netlink_done, error, sizeof(error))
-            : system->foreign_tc_netlink_query == SYSTEM_TC_NETLINK_QUERY_EXPECTED_FILTER
+        int decoded = system->tc_netlink_query == SYSTEM_TC_NETLINK_QUERY_EXPECTED_FILTER
                 ? asteriskd_tc_filter_netlink_decode(
-                    buffer, (size_t)received, system->foreign_tc_netlink_sequence,
-                    system->foreign_tc_netlink_port_id,
+                    buffer, (size_t)received, system->tc_netlink_sequence,
+                    system->tc_netlink_port_id,
                     &system->tc_filter_netlink_expectation,
                     &system->tc_filter_netlink_state,
-                    &system->foreign_tc_netlink_done, error, sizeof(error))
-                : system->foreign_tc_netlink_query == SYSTEM_TC_NETLINK_QUERY_SLOT_FILTER
+                    &system->tc_netlink_done, error, sizeof(error))
+                : system->tc_netlink_query == SYSTEM_TC_NETLINK_QUERY_SLOT_FILTER
                     ? asteriskd_tc_filter_slot_netlink_decode(
-                        buffer, (size_t)received, system->foreign_tc_netlink_sequence,
-                        system->foreign_tc_netlink_port_id,
+                        buffer, (size_t)received, system->tc_netlink_sequence,
+                        system->tc_netlink_port_id,
                         &system->tc_filter_netlink_expectation,
                         &system->tc_filter_netlink_state,
-                        &system->foreign_tc_netlink_done, error, sizeof(error))
-                : system->foreign_tc_netlink_query == SYSTEM_TC_NETLINK_QUERY_QDISC
+                        &system->tc_netlink_done, error, sizeof(error))
+                : system->tc_netlink_query == SYSTEM_TC_NETLINK_QUERY_QDISC
                     ? asteriskd_tc_qdisc_netlink_decode(
-                        buffer, (size_t)received, system->foreign_tc_netlink_sequence,
-                        system->foreign_tc_netlink_port_id,
-                        system->foreign_tc_netlink_interface_index,
+                        buffer, (size_t)received, system->tc_netlink_sequence,
+                        system->tc_netlink_port_id,
+                        system->tc_netlink_interface_index,
                         &system->tc_qdisc_netlink_state,
-                        &system->foreign_tc_netlink_done, error, sizeof(error))
+                        &system->tc_netlink_done, error, sizeof(error))
                     : -1;
         if (decoded != 0) {
             struct nlmsghdr first;
@@ -3723,9 +3702,9 @@ static int system_foreign_tc_netlink_dispatch(
             }
             char message[256U];
             int written = snprintf(message, sizeof(message),
-                "hotspot netlink decode failed: query=%u bytes=%zd type=%u flags=0x%x"
+                "TC netlink decode failed: query=%u bytes=%zd type=%u flags=0x%x"
                 " sequence=%" PRIu32 " pid=%" PRIu32 " kernelError=%" PRId32
-                " detail=%s", (unsigned)system->foreign_tc_netlink_query, received,
+                " detail=%s", (unsigned)system->tc_netlink_query, received,
                 (unsigned)first.nlmsg_type, (unsigned)first.nlmsg_flags,
                 first.nlmsg_seq, first.nlmsg_pid, kernel_error,
                 error[0] == '\0' ? "unavailable" : error);
@@ -3735,58 +3714,26 @@ static int system_foreign_tc_netlink_dispatch(
             }
             return -1;
         }
-        if (system->foreign_tc_netlink_done) return 0;
+        if (system->tc_netlink_done) return 0;
     }
 }
 
-static bool system_foreign_tc_netlink_done(void *opaque) {
+static bool system_tc_netlink_done(void *opaque) {
     struct asteriskd_system_supervisor *system = opaque;
     if (action_should_cancel(atomic_load_explicit(
             &system->runtime->lifecycle.stop_was_requested, memory_order_acquire),
             system->cleanup_in_progress)) {
-        system->foreign_tc_netlink_failed = true;
-        system->foreign_tc_netlink_done = true;
+        system->tc_netlink_failed = true;
+        system->tc_netlink_done = true;
     }
-    return system->foreign_tc_netlink_done;
-}
-
-static int system_foreign_tc_netlink_probe(
-    struct asteriskd_system_supervisor *system, uint32_t interface_index,
-    struct asteriskd_foreign_tc_probe *probe, bool *present) {
-    if (probe == NULL || present == NULL ||
-        system_foreign_tc_netlink_start(system, interface_index,
-            ASTERISKD_TC_PARENT_CLSACT_INGRESS,
-            ASTERISKD_ANDROID_TETHER_TC_PRIORITY, ASTERISKD_ETH_PROTOCOL_IPV6,
-            SYSTEM_TC_NETLINK_QUERY_FOREIGN_FILTER) != 0) return -1;
-    int64_t now = 0;
-    int result = -1;
-    if (system_runtime_clock(system, &now) == 0 &&
-        now <= INT64_MAX -
-            (int64_t)system->loaded_config.config.readiness_timeout_milliseconds) {
-        struct asteriskd_deadline deadline = {
-            .armed = true,
-            .monotonic_milliseconds = now +
-                (int64_t)system->loaded_config.config.readiness_timeout_milliseconds,
-        };
-        if (system_pump_condition(
-                system, &deadline, system_foreign_tc_netlink_done) == 0 &&
-            system->foreign_tc_netlink_done && !system->foreign_tc_netlink_failed) {
-            *probe = system->foreign_tc_netlink_probe;
-            *present = system->foreign_tc_netlink_present;
-            result = 0;
-        }
-    }
-    system_foreign_tc_netlink_close(system);
-    return result;
+    return system->tc_netlink_done;
 }
 
 static int system_expected_tc_netlink_probe(
     struct asteriskd_system_supervisor *system,
     const struct asteriskd_tc_filter_resource *resource,
     enum asteriskd_rules_slot_state *state) {
-    if (resource == NULL || state == NULL ||
-        resource->ownership != ASTERISKD_TC_OWNERSHIP_DAEMON ||
-        resource->interface_index == 0U) return -1;
+    if (resource == NULL || state == NULL || resource->interface_index == 0U) return -1;
     enum asteriskd_pin_id pin_id =
         resource->program_id == ASTERISKD_PROGRAM_BPF2SOCKS_INGRESS
             ? ASTERISKD_PIN_BPF2SOCKS_TC_INGRESS
@@ -3818,7 +3765,7 @@ static int system_expected_tc_netlink_probe(
         memcpy(system->tc_filter_netlink_expectation.program_tag, verified->tag,
             sizeof(system->tc_filter_netlink_expectation.program_tag));
     }
-    if (system_foreign_tc_netlink_start(system, resource->interface_index,
+    if (system_tc_filter_netlink_start(system, resource->interface_index,
             parent, ASTERISKD_HOTSPOT_TC_PRIORITY, ASTERISKD_ETH_PROTOCOL_ALL,
             query) != 0) return -1;
     int64_t now = 0;
@@ -3832,13 +3779,13 @@ static int system_expected_tc_netlink_probe(
                 (int64_t)system->loaded_config.config.readiness_timeout_milliseconds,
         };
         if (system_pump_condition(
-                system, &deadline, system_foreign_tc_netlink_done) == 0 &&
-            system->foreign_tc_netlink_done && !system->foreign_tc_netlink_failed) {
+                system, &deadline, system_tc_netlink_done) == 0 &&
+            system->tc_netlink_done && !system->tc_netlink_failed) {
             *state = system->tc_filter_netlink_state;
             result = 0;
         }
     }
-    system_foreign_tc_netlink_close(system);
+    system_tc_netlink_close(system);
     memset(&system->tc_filter_netlink_expectation, 0,
         sizeof(system->tc_filter_netlink_expectation));
     return result;
@@ -3860,13 +3807,13 @@ static int system_qdisc_netlink_probe(
                 (int64_t)system->loaded_config.config.readiness_timeout_milliseconds,
         };
         if (system_pump_condition(
-                system, &deadline, system_foreign_tc_netlink_done) == 0 &&
-            system->foreign_tc_netlink_done && !system->foreign_tc_netlink_failed) {
+                system, &deadline, system_tc_netlink_done) == 0 &&
+            system->tc_netlink_done && !system->tc_netlink_failed) {
             *state = system->tc_qdisc_netlink_state;
             result = 0;
         }
     }
-    system_foreign_tc_netlink_close(system);
+    system_tc_netlink_close(system);
     return result;
 }
 
@@ -3880,83 +3827,6 @@ static enum asteriskd_pin_id system_tc_pin_id(enum asteriskd_program_id program_
 static const char *system_tc_direction(enum asteriskd_tc_direction direction) {
     return direction == ASTERISKD_TC_DIRECTION_INGRESS ? "ingress" :
         direction == ASTERISKD_TC_DIRECTION_EGRESS ? "egress" : NULL;
-}
-
-static int system_read_sysfs_value(
-    const char *interface_name, const char *leaf, char *output, size_t capacity) {
-    if (interface_name == NULL || leaf == NULL || output == NULL || capacity < 2U ||
-        strchr(interface_name, '/') != NULL || strchr(leaf, '/') != NULL) return -1;
-    char path[ASTERISKD_MAX_PATH];
-    int length = snprintf(path, sizeof(path), "/sys/class/net/%s/%s", interface_name, leaf);
-    if (length <= 0 || (size_t)length >= sizeof(path)) return -1;
-    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
-    if (fd < 0) return -1;
-    ssize_t count;
-    do {
-        count = read(fd, output, capacity - 1U);
-    } while (count < 0 && errno == EINTR);
-    int saved = errno;
-    int closed = close(fd);
-    errno = saved;
-    if (count <= 0 || (size_t)count >= capacity || closed != 0) return -1;
-    output[count] = '\0';
-    if (output[count - 1] == '\n') output[count - 1] = '\0';
-    return output[0] == '\0' ? -1 : 0;
-}
-
-static int system_parse_decimal_u32(const char *value, uint32_t *output) {
-    if (value == NULL || output == NULL || value[0] == '\0') return -1;
-    uint32_t result = 0U;
-    for (size_t index = 0U; value[index] != '\0'; ++index) {
-        unsigned char byte = (unsigned char)value[index];
-        if (byte < '0' || byte > '9') return -1;
-        uint32_t digit = (uint32_t)(byte - '0');
-        if (result > (UINT32_MAX - digit) / 10U) return -1;
-        result = result * 10U + digit;
-    }
-    if (result == 0U) return -1;
-    *output = result;
-    return 0;
-}
-
-static int system_interface_identity(
-    const char *interface_name, uint32_t interface_index,
-    struct asteriskd_foreign_tc_probe *probe) {
-    if (probe == NULL || if_nametoindex(interface_name) != interface_index) return -1;
-    char value[128U];
-    uint32_t reported_index = 0U;
-    if (system_read_sysfs_value(interface_name, "ifindex", value, sizeof(value)) != 0 ||
-        system_parse_decimal_u32(value, &reported_index) != 0 ||
-        reported_index != interface_index ||
-        system_read_sysfs_value(interface_name, "iflink", value, sizeof(value)) != 0 ||
-        system_parse_decimal_u32(value, &probe->interface_link_index) != 0 ||
-        system_read_sysfs_value(interface_name, "type", value, sizeof(value)) != 0 ||
-        system_parse_decimal_u32(value, &probe->interface_hardware_type) != 0 ||
-        system_read_sysfs_value(interface_name, "address", value, sizeof(value)) != 0) return -1;
-    size_t output = 0U;
-    for (size_t index = 0U; value[index] != '\0'; ++index) {
-        unsigned char byte = (unsigned char)value[index];
-        if (byte == ':') continue;
-        if (!((byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f')) ||
-            output + 1U >= sizeof(probe->interface_address)) return -1;
-        probe->interface_address[output++] = (char)byte;
-    }
-    if (output == 0U || (output & 1U) != 0U) return -1;
-    probe->interface_address[output] = '\0';
-    probe->interface_index = interface_index;
-    (void)snprintf(probe->interface_name, sizeof(probe->interface_name), "%s", interface_name);
-    return if_nametoindex(interface_name) == interface_index ? 0 : -1;
-}
-
-static bool system_foreign_interface_matches(
-    const struct asteriskd_tc_filter_resource *resource) {
-    struct asteriskd_foreign_tc_probe probe;
-    memset(&probe, 0, sizeof(probe));
-    return system_interface_identity(
-        resource->interface_name, resource->interface_index, &probe) == 0 &&
-        probe.interface_link_index == resource->interface_link_index &&
-        probe.interface_hardware_type == resource->interface_hardware_type &&
-        strcmp(probe.interface_address, resource->interface_address) == 0;
 }
 
 static int system_tc_probe_qdisc(struct asteriskd_system_supervisor *system,
@@ -3976,112 +3846,6 @@ static int system_tc_probe_filter(struct asteriskd_system_supervisor *system,
     if (resource == NULL || state == NULL ||
         if_nametoindex(resource->interface_name) != resource->interface_index) return -1;
     return system_expected_tc_netlink_probe(system, resource, state);
-}
-
-static const struct asteriskd_recovery_record *system_find_recovery_record(
-    const struct asteriskd_system_supervisor *system, uint64_t record_id) {
-    for (size_t index = 0U; index < system->state.recovery.record_count; ++index) {
-        if (system->state.recovery.records[index].record_id == record_id) {
-            return &system->state.recovery.records[index];
-        }
-    }
-    return NULL;
-}
-
-static bool system_foreign_tc_probe_matches(
-    const struct asteriskd_foreign_tc_probe *probe,
-    const struct asteriskd_tc_filter_resource *resource, uint64_t expected_object_id) {
-    return probe->chain == resource->chain && probe->protocol == resource->protocol &&
-        probe->priority == resource->priority && probe->handle == resource->handle &&
-        strcmp(probe->bpf_name, resource->bpf_name) == 0 &&
-        probe->bpf_flags == resource->bpf_flags &&
-        probe->bpf_flags_gen == resource->bpf_flags_gen &&
-        probe->program_object_id == expected_object_id &&
-        probe->program_type == ASTERISKD_BPF_PROGRAM_TYPE_SCHED_CLS &&
-        strcmp(probe->program_tag, resource->program_tag) == 0 &&
-        probe->direct_action && !probe->unknown_attributes;
-}
-
-static int system_tc_probe_foreign_filter(
-    struct asteriskd_system_supervisor *system,
-    const struct asteriskd_tc_filter_resource *resource, uint64_t expected_object_id,
-    enum asteriskd_rules_slot_state *state) {
-    if (resource == NULL || state == NULL ||
-        resource->ownership != ASTERISKD_TC_OWNERSHIP_FOREIGN_SNAPSHOT ||
-        resource->direction != ASTERISKD_TC_DIRECTION_INGRESS ||
-        !system_foreign_interface_matches(resource)) return -1;
-    struct asteriskd_foreign_tc_probe probe;
-    bool present = false;
-    if (system_foreign_tc_netlink_probe(
-            system, resource->interface_index, &probe, &present) != 0) return -1;
-    if (!present) {
-        *state = ASTERISKD_RULES_SLOT_ABSENT;
-        return 0;
-    }
-    *state = expected_object_id != 0U &&
-        system_foreign_tc_probe_matches(&probe, resource, expected_object_id)
-            ? ASTERISKD_RULES_SLOT_OWNED : ASTERISKD_RULES_SLOT_FOREIGN;
-    return 0;
-}
-
-static int system_tc_delete_foreign_filter(
-    struct asteriskd_system_supervisor *system,
-    const struct asteriskd_tc_filter_resource *resource) {
-    const struct asteriskd_recovery_record *pin =
-        system_find_recovery_record(system, resource->recovery_pin_record_id);
-    uint64_t object_id = pin == NULL ? 0U : pin->resource.bpf_pin.object_id;
-    enum asteriskd_rules_slot_state state = ASTERISKD_RULES_SLOT_FOREIGN;
-    if (pin == NULL || pin->kind != ASTERISKD_RECOVERY_BPF_PIN ||
-        pin->resource.bpf_pin.pin_id != ASTERISKD_PIN_HOTSPOT_RECOVERY ||
-        !pin->resource.bpf_pin.has_object_id ||
-        system_tc_probe_foreign_filter(system, resource, object_id, &state) != 0) return -1;
-    if (state == ASTERISKD_RULES_SLOT_ABSENT) return 0;
-    if (state != ASTERISKD_RULES_SLOT_OWNED) return -1;
-    char handle[16U];
-    if (snprintf(handle, sizeof(handle), "0x%" PRIx32, resource->handle) <= 0) return -1;
-    const char *arguments[] = {"filter", "del", "dev", resource->interface_name,
-        "ingress", "protocol", "ipv6", "pref", "2", "handle", handle, "bpf"};
-    return system_tc_zero(system, arguments, 12U);
-}
-
-static int system_tc_restore_foreign_filter(
-    struct asteriskd_system_supervisor *system,
-    const struct asteriskd_tc_filter_resource *resource) {
-    const struct asteriskd_recovery_record *pin =
-        system_find_recovery_record(system, resource->recovery_pin_record_id);
-    char path_storage[ASTERISKD_MAX_PATH];
-    const char *path = pin == NULL ? NULL : system_recovery_pin_path(
-        system, pin, path_storage, sizeof(path_storage));
-    if (pin == NULL || path == NULL || pin->kind != ASTERISKD_RECOVERY_BPF_PIN ||
-        !pin->resource.bpf_pin.has_object_id ||
-        if_nametoindex(resource->interface_name) != resource->interface_index) return -1;
-    enum asteriskd_rules_slot_state state = ASTERISKD_RULES_SLOT_FOREIGN;
-    if (system_tc_probe_foreign_filter(
-            system, resource, pin->resource.bpf_pin.object_id, &state) != 0) return -1;
-    if (state == ASTERISKD_RULES_SLOT_OWNED) return 0;
-    if (state != ASTERISKD_RULES_SLOT_ABSENT) return -1;
-    char handle[16U];
-    if (snprintf(handle, sizeof(handle), "0x%" PRIx32, resource->handle) <= 0) return -1;
-    const char *arguments[18U];
-    size_t count = 0U;
-    arguments[count++] = "filter";
-    arguments[count++] = "add";
-    arguments[count++] = "dev";
-    arguments[count++] = resource->interface_name;
-    arguments[count++] = "ingress";
-    arguments[count++] = "protocol";
-    arguments[count++] = "ipv6";
-    arguments[count++] = "pref";
-    arguments[count++] = "2";
-    arguments[count++] = "handle";
-    arguments[count++] = handle;
-    arguments[count++] = "bpf";
-    arguments[count++] = "da";
-    arguments[count++] = "pinned";
-    arguments[count++] = path;
-    if ((resource->bpf_flags_gen & 1U) != 0U) arguments[count++] = "skip_hw";
-    if ((resource->bpf_flags_gen & 2U) != 0U) arguments[count++] = "skip_sw";
-    return system_tc_zero(system, arguments, count);
 }
 
 static int system_tc_apply_qdisc(struct asteriskd_system_supervisor *system,
@@ -4451,46 +4215,6 @@ static const char *system_pin_path(
     return NULL;
 }
 
-static const char *system_recovery_pin_path(
-    struct asteriskd_system_supervisor *system,
-    const struct asteriskd_recovery_record *record,
-    char *storage, size_t storage_size) {
-    if (record == NULL || record->kind != ASTERISKD_RECOVERY_BPF_PIN) return NULL;
-    if (record->resource.bpf_pin.pin_id != ASTERISKD_PIN_HOTSPOT_RECOVERY) {
-        return system_pin_path(system, record->resource.bpf_pin.pin_id);
-    }
-    const char *owner = system->loaded_config.config.owner == ASTERISKD_OWNER_NG
-        ? "asteriskng" : system->loaded_config.config.owner == ASTERISKD_OWNER_BOX
-            ? "asteriskbox" : system->loaded_config.config.owner == ASTERISKD_OWNER_META
-                ? "asteriskmeta" : NULL;
-    if (owner == NULL || storage == NULL || storage_size == 0U || record->record_id == 0U ||
-        snprintf(storage, storage_size, "/sys/fs/bpf/%s_hotspot_recovery_%" PRIu64,
-            owner, record->record_id) <= 0 || strnlen(storage, storage_size) >= storage_size) {
-        return NULL;
-    }
-    return storage;
-}
-
-static uint64_t system_recovery_pin_object_id(
-    struct asteriskd_system_supervisor *system,
-    const struct asteriskd_recovery_record *record) {
-    char path_storage[ASTERISKD_MAX_PATH];
-    const char *path = system_recovery_pin_path(
-        system, record, path_storage, sizeof(path_storage));
-    const struct asteriskd_bpf_program_backend *backend =
-        asteriskd_system_bpf_program_backend();
-    if (path == NULL || backend == NULL || backend->open_program == NULL ||
-        backend->program_info == NULL || backend->close == NULL) return 0U;
-    int fd = -1;
-    struct asteriskd_bpf_program_info info;
-    memset(&info, 0, sizeof(info));
-    if (backend->open_program(backend->context, path, &fd) != 0 || fd < 0) return 0U;
-    int inspected = backend->program_info(backend->context, fd, &info);
-    int closed = backend->close(backend->context, fd);
-    if (inspected != 0 || closed != 0 || info.object_id == 0U) return 0U;
-    return info.object_id;
-}
-
 static uint64_t system_verified_pin_id(
     const struct asteriskd_system_supervisor *system, enum asteriskd_pin_id pin_id) {
     if (system->matcher_verified) {
@@ -4645,9 +4369,7 @@ static int system_wal_probe_original(void *opaque,
         return 0;
     }
     if (record->kind == ASTERISKD_RECOVERY_BPF_PIN) {
-        char path_storage[ASTERISKD_MAX_PATH];
-        const char *path = system_recovery_pin_path(
-            system, record, path_storage, sizeof(path_storage));
+        const char *path = system_pin_path(system, record->resource.bpf_pin.pin_id);
         const struct asteriskd_bpf_pin_ownership_backend *backend =
             asteriskd_system_bpf_pin_ownership_backend();
         bool exists = true;
@@ -4674,22 +4396,10 @@ static int system_wal_probe_original(void *opaque,
     }
     if (record->kind == ASTERISKD_RECOVERY_TC_FILTER) {
         enum asteriskd_rules_slot_state state = ASTERISKD_RULES_SLOT_FOREIGN;
-        if (record->resource.tc_filter.ownership == ASTERISKD_TC_OWNERSHIP_DAEMON) {
-            if (system_tc_probe_filter(system, &record->resource.tc_filter, &state) != 0 ||
-                state != ASTERISKD_RULES_SLOT_ABSENT) return -1;
-            delta->kind = ASTERISKD_WAL_ORIGINAL_DELTA_PRESENCE;
-            delta->original_presence = false;
-            return 0;
-        }
-        const struct asteriskd_recovery_record *pin = system_find_recovery_record(
-            system, record->resource.tc_filter.recovery_pin_record_id);
-        if (pin == NULL || pin->kind != ASTERISKD_RECOVERY_BPF_PIN ||
-            !pin->resource.bpf_pin.has_object_id ||
-            system_tc_probe_foreign_filter(system, &record->resource.tc_filter,
-                pin->resource.bpf_pin.object_id, &state) != 0 ||
-            state != ASTERISKD_RULES_SLOT_OWNED) return -1;
+        if (system_tc_probe_filter(system, &record->resource.tc_filter, &state) != 0 ||
+            state != ASTERISKD_RULES_SLOT_ABSENT) return -1;
         delta->kind = ASTERISKD_WAL_ORIGINAL_DELTA_PRESENCE;
-        delta->original_presence = true;
+        delta->original_presence = false;
         return 0;
     }
     if (record->kind == ASTERISKD_RECOVERY_IPTABLES_CHAIN) {
@@ -4750,13 +4460,8 @@ static int system_wal_apply(void *opaque, const struct asteriskd_recovery_record
     if (count == 1U && records[0].kind == ASTERISKD_RECOVERY_TC_QDISC) {
         return system_tc_apply_qdisc(system, &records[0].resource.tc_qdisc);
     }
-    if (count == 1U && records[0].kind == ASTERISKD_RECOVERY_TC_FILTER &&
-        records[0].resource.tc_filter.ownership == ASTERISKD_TC_OWNERSHIP_DAEMON) {
+    if (count == 1U && records[0].kind == ASTERISKD_RECOVERY_TC_FILTER) {
         return system_tc_apply_filter(system, &records[0].resource.tc_filter);
-    }
-    if (count == 1U && records[0].kind == ASTERISKD_RECOVERY_TC_FILTER &&
-        records[0].resource.tc_filter.ownership == ASTERISKD_TC_OWNERSHIP_FOREIGN_SNAPSHOT) {
-        return system_tc_delete_foreign_filter(system, &records[0].resource.tc_filter);
     }
     bool rule_batch = system_rule_recovery_kind(records[0].kind);
     for (size_t index = 0U; rule_batch && index < count; ++index) {
@@ -4853,20 +4558,6 @@ rule_batch_failed:
         const struct asteriskd_route_effect *effect = system_find_route_effect(system, &records[0]);
         return effect == NULL ? -1 : system_apply_route_effect(system, effect);
     }
-    if (count == 1U && records[0].kind == ASTERISKD_RECOVERY_BPF_PIN &&
-        records[0].resource.bpf_pin.pin_id == ASTERISKD_PIN_HOTSPOT_RECOVERY) {
-        char path_storage[ASTERISKD_MAX_PATH];
-        const char *path = system_recovery_pin_path(
-            system, &records[0], path_storage, sizeof(path_storage));
-        uint64_t object_id = 0U;
-        if (!system->foreign_tc_pin_active || path == NULL ||
-            asteriskd_foreign_tc_pin_clone(
-                &system->foreign_tc_probe, system->foreign_tc_source_path, path,
-                asteriskd_system_bpf_program_backend(), &object_id,
-                error, error_size) != 0) return -1;
-        system->foreign_tc_pinned_object_id = object_id;
-        return 0;
-    }
     for (size_t index = 0U; index < count; ++index) {
         if (records[index].kind != ASTERISKD_RECOVERY_BPF_PIN) return -1;
     }
@@ -4904,9 +4595,8 @@ static int system_wal_verify_applied(void *opaque,
             value == record->resource.sysctl.desired_value ? 0 : -1;
     }
     if (record->kind == ASTERISKD_RECOVERY_BPF_PIN) {
-        uint64_t object_id = record->resource.bpf_pin.pin_id == ASTERISKD_PIN_HOTSPOT_RECOVERY
-            ? system_recovery_pin_object_id(system, record)
-            : system_verified_pin_id(system, record->resource.bpf_pin.pin_id);
+        uint64_t object_id = system_verified_pin_id(
+            system, record->resource.bpf_pin.pin_id);
         if (object_id == 0U) {
             if (error != NULL && error_size != 0U) {
                 (void)snprintf(error, error_size, "%s", "verified BPF identity is missing");
@@ -4924,17 +4614,8 @@ static int system_wal_verify_applied(void *opaque,
     }
     if (record->kind == ASTERISKD_RECOVERY_TC_FILTER) {
         enum asteriskd_rules_slot_state state = ASTERISKD_RULES_SLOT_FOREIGN;
-        if (record->resource.tc_filter.ownership == ASTERISKD_TC_OWNERSHIP_DAEMON) {
-            return system_tc_probe_filter(system, &record->resource.tc_filter, &state) == 0 &&
-                state == ASTERISKD_RULES_SLOT_OWNED ? 0 : -1;
-        }
-        const struct asteriskd_recovery_record *pin = system_find_recovery_record(
-            system, record->resource.tc_filter.recovery_pin_record_id);
-        return pin != NULL && pin->kind == ASTERISKD_RECOVERY_BPF_PIN &&
-            pin->resource.bpf_pin.has_object_id &&
-            system_tc_probe_foreign_filter(system, &record->resource.tc_filter,
-                pin->resource.bpf_pin.object_id, &state) == 0 &&
-            state == ASTERISKD_RULES_SLOT_ABSENT ? 0 : -1;
+        return system_tc_probe_filter(system, &record->resource.tc_filter, &state) == 0 &&
+            state == ASTERISKD_RULES_SLOT_OWNED ? 0 : -1;
     }
     if (record->kind == ASTERISKD_RECOVERY_IPTABLES_CHAIN) {
         const struct asteriskd_private_chain_group *group =
@@ -5014,9 +4695,7 @@ static int system_wal_probe_recovery(void *opaque,
         return 0;
     }
     if (record->kind == ASTERISKD_RECOVERY_BPF_PIN) {
-        char path_storage[ASTERISKD_MAX_PATH];
-        const char *path = system_recovery_pin_path(
-            system, record, path_storage, sizeof(path_storage));
+        const char *path = system_pin_path(system, record->resource.bpf_pin.pin_id);
         const struct asteriskd_bpf_pin_ownership_backend *backend =
             asteriskd_system_bpf_pin_ownership_backend();
         bool exists = true;
@@ -5051,25 +4730,12 @@ static int system_wal_probe_recovery(void *opaque,
     if (record->kind == ASTERISKD_RECOVERY_TC_FILTER) {
         if (if_nametoindex(record->resource.tc_filter.interface_name) !=
                 record->resource.tc_filter.interface_index) {
-            *state = record->resource.tc_filter.ownership ==
-                ASTERISKD_TC_OWNERSHIP_FOREIGN_SNAPSHOT
-                    ? ASTERISKD_WAL_RESOURCE_ORIGINAL : ASTERISKD_WAL_RESOURCE_ABSENT;
+            *state = ASTERISKD_WAL_RESOURCE_ABSENT;
             return 0;
         }
         enum asteriskd_rules_slot_state slot = ASTERISKD_RULES_SLOT_FOREIGN;
-        int probed;
-        if (record->resource.tc_filter.ownership == ASTERISKD_TC_OWNERSHIP_FOREIGN_SNAPSHOT) {
-            const struct asteriskd_recovery_record *pin = system_find_recovery_record(
-                system, record->resource.tc_filter.recovery_pin_record_id);
-            probed = pin == NULL || pin->kind != ASTERISKD_RECOVERY_BPF_PIN ||
-                !pin->resource.bpf_pin.has_object_id ? -1 :
-                system_tc_probe_foreign_filter(system, &record->resource.tc_filter,
-                    pin->resource.bpf_pin.object_id, &slot);
-        } else {
-            probed = system_tc_probe_filter(system, &record->resource.tc_filter, &slot);
-        }
-        if (record->resource.tc_filter.ownership == ASTERISKD_TC_OWNERSHIP_DAEMON &&
-            (probed != 0 || slot == ASTERISKD_RULES_SLOT_FOREIGN)) {
+        int probed = system_tc_probe_filter(system, &record->resource.tc_filter, &slot);
+        if (probed != 0 || slot == ASTERISKD_RULES_SLOT_FOREIGN) {
             enum asteriskd_pin_id pin_id = system_tc_pin_id(
                 record->resource.tc_filter.program_id);
             char message[224U];
@@ -5087,13 +4753,9 @@ static int system_wal_probe_recovery(void *opaque,
         if (probed != 0) {
             *state = ASTERISKD_WAL_RESOURCE_AMBIGUOUS;
         } else if (slot == ASTERISKD_RULES_SLOT_ABSENT) {
-            *state = record->resource.tc_filter.ownership ==
-                ASTERISKD_TC_OWNERSHIP_FOREIGN_SNAPSHOT
-                    ? ASTERISKD_WAL_RESOURCE_EXPECTED_EFFECT : ASTERISKD_WAL_RESOURCE_ABSENT;
+            *state = ASTERISKD_WAL_RESOURCE_ABSENT;
         } else if (slot == ASTERISKD_RULES_SLOT_OWNED) {
-            *state = record->resource.tc_filter.ownership ==
-                ASTERISKD_TC_OWNERSHIP_FOREIGN_SNAPSHOT
-                    ? ASTERISKD_WAL_RESOURCE_ORIGINAL : ASTERISKD_WAL_RESOURCE_EXPECTED_EFFECT;
+            *state = ASTERISKD_WAL_RESOURCE_EXPECTED_EFFECT;
         } else {
             *state = ASTERISKD_WAL_RESOURCE_FOREIGN;
         }
@@ -5157,20 +4819,13 @@ static int system_wal_undo(void *opaque,
             record->resource.sysctl.original_value);
     }
     if (record->kind == ASTERISKD_RECOVERY_BPF_PIN) {
-        char path_storage[ASTERISKD_MAX_PATH];
-        const char *path = system_recovery_pin_path(
-            system, record, path_storage, sizeof(path_storage));
+        const char *path = system_pin_path(system, record->resource.bpf_pin.pin_id);
         return path == NULL ? -1 : asteriskd_bpf_pin_cleanup_owned(
             path, record->resource.bpf_pin.object_id,
             asteriskd_system_bpf_pin_ownership_backend(), error, error_size);
     }
-    if (record->kind == ASTERISKD_RECOVERY_TC_FILTER &&
-        record->resource.tc_filter.ownership == ASTERISKD_TC_OWNERSHIP_DAEMON) {
+    if (record->kind == ASTERISKD_RECOVERY_TC_FILTER) {
         return system_tc_remove_filter(system, &record->resource.tc_filter);
-    }
-    if (record->kind == ASTERISKD_RECOVERY_TC_FILTER &&
-        record->resource.tc_filter.ownership == ASTERISKD_TC_OWNERSHIP_FOREIGN_SNAPSHOT) {
-        return system_tc_restore_foreign_filter(system, &record->resource.tc_filter);
     }
     if (record->kind == ASTERISKD_RECOVERY_TC_QDISC) {
         return system_tc_remove_qdisc(system, &record->resource.tc_qdisc);
@@ -5204,9 +4859,7 @@ static int system_wal_verify_restored(void *opaque,
         return result == 0 && value == record->resource.sysctl.original_value ? 0 : -1;
     }
     if (record->kind == ASTERISKD_RECOVERY_BPF_PIN) {
-        char path_storage[ASTERISKD_MAX_PATH];
-        const char *path = system_recovery_pin_path(
-            system, record, path_storage, sizeof(path_storage));
+        const char *path = system_pin_path(system, record->resource.bpf_pin.pin_id);
         const struct asteriskd_bpf_pin_ownership_backend *backend =
             asteriskd_system_bpf_pin_ownership_backend();
         bool exists = true;
@@ -5219,15 +4872,6 @@ static int system_wal_verify_restored(void *opaque,
         if (if_nametoindex(record->resource.tc_filter.interface_name) !=
                 record->resource.tc_filter.interface_index) return 0;
         enum asteriskd_rules_slot_state state = ASTERISKD_RULES_SLOT_FOREIGN;
-        if (record->resource.tc_filter.ownership == ASTERISKD_TC_OWNERSHIP_FOREIGN_SNAPSHOT) {
-            const struct asteriskd_recovery_record *pin = system_find_recovery_record(
-                system, record->resource.tc_filter.recovery_pin_record_id);
-            return pin != NULL && pin->kind == ASTERISKD_RECOVERY_BPF_PIN &&
-                pin->resource.bpf_pin.has_object_id &&
-                system_tc_probe_foreign_filter(system, &record->resource.tc_filter,
-                    pin->resource.bpf_pin.object_id, &state) == 0 &&
-                state == ASTERISKD_RULES_SLOT_OWNED ? 0 : -1;
-        }
         return system_tc_probe_filter(system, &record->resource.tc_filter, &state) == 0 &&
             state == ASTERISKD_RULES_SLOT_ABSENT ? 0 : -1;
     }
@@ -5310,9 +4954,7 @@ static bool system_rule_record_matches(
                 strcmp(left->resource.tc_qdisc.interface_name,
                     right->resource.tc_qdisc.interface_name) == 0;
         case ASTERISKD_RECOVERY_TC_FILTER:
-            return left->resource.tc_filter.ownership == right->resource.tc_filter.ownership &&
-                left->resource.tc_filter.inverse == right->resource.tc_filter.inverse &&
-                left->resource.tc_filter.filter_id == right->resource.tc_filter.filter_id &&
+            return left->resource.tc_filter.filter_id == right->resource.tc_filter.filter_id &&
                 left->resource.tc_filter.direction == right->resource.tc_filter.direction &&
                 left->resource.tc_filter.interface_index ==
                     right->resource.tc_filter.interface_index &&
@@ -5909,160 +5551,45 @@ static int system_reconcile_bpf2_local_maps(
 static bool system_hotspot_interface_selected(
     const struct asteriskd_config *config, const char *name) {
     for (size_t index = 0U; index < config->hotspot_interface_prefix_count; ++index) {
-        const char *selector = config->hotspot_interface_prefixes[index];
-        size_t length = strlen(selector);
-        if (length != 0U && selector[length - 1U] == '+') {
-            if (strncmp(name, selector, length - 1U) == 0) return true;
-        } else if (strcmp(name, selector) == 0) {
-            return true;
-        }
+        if (asteriskd_interface_matches_selector(
+                name, config->hotspot_interface_prefixes[index])) return true;
     }
     return false;
 }
 
-static const struct asteriskd_recovery_record *system_foreign_filter_record(
-    const struct asteriskd_system_supervisor *system, const char *name, uint32_t index) {
-    for (size_t position = 0U; position < system->state.recovery.record_count; ++position) {
-        const struct asteriskd_recovery_record *record =
-            &system->state.recovery.records[position];
-        if (record->kind == ASTERISKD_RECOVERY_TC_FILTER &&
-            record->resource.tc_filter.ownership == ASTERISKD_TC_OWNERSHIP_FOREIGN_SNAPSHOT &&
-            record->resource.tc_filter.interface_index == index &&
-            strcmp(record->resource.tc_filter.interface_name, name) == 0) return record;
-    }
-    return NULL;
-}
-
-static const struct asteriskd_recovery_record *system_hotspot_recovery_pin(
-    const struct asteriskd_system_supervisor *system, uint64_t object_id) {
-    for (size_t position = 0U; position < system->state.recovery.record_count; ++position) {
-        const struct asteriskd_recovery_record *record =
-            &system->state.recovery.records[position];
-        if (record->kind == ASTERISKD_RECOVERY_BPF_PIN &&
-            record->resource.bpf_pin.pin_id == ASTERISKD_PIN_HOTSPOT_RECOVERY &&
-            record->resource.bpf_pin.has_object_id &&
-            record->resource.bpf_pin.object_id == object_id) return record;
-    }
-    return NULL;
-}
-
-static int system_tc_probe_foreign_candidate(
-    struct asteriskd_system_supervisor *system, const char *name, uint32_t index,
-    struct asteriskd_foreign_tc_probe *probe, bool *present,
-    char *trusted_path, size_t trusted_path_size) {
-    static const char *const trusted_paths[] = {
-        "/sys/fs/bpf/tethering/prog_offload_schedcls_tether_upstream6_ether",
-        "/sys/fs/bpf/tethering/prog_offload_schedcls_tether_upstream6_rawip",
-        "/sys/fs/bpf/tethering/prog_offload_schedcls_tether_downstream6_ether",
-        "/sys/fs/bpf/tethering/prog_offload_schedcls_tether_downstream6_rawip",
-        "/sys/fs/bpf/prog_offload_schedcls_tether_upstream6_ether",
-        "/sys/fs/bpf/prog_offload_schedcls_tether_upstream6_rawip",
-        "/sys/fs/bpf/prog_offload_schedcls_tether_downstream6_ether",
-        "/sys/fs/bpf/prog_offload_schedcls_tether_downstream6_rawip",
+static int system_clear_android_hotspot_offload_interface(
+    struct asteriskd_system_supervisor *system, const char *name) {
+    const char *show[] = {
+        "filter", "show", "dev", name, "ingress", "protocol", "ipv6",
     };
-    if (probe == NULL || present == NULL || trusted_path == NULL || trusted_path_size == 0U) {
-        return -1;
-    }
-    memset(probe, 0, sizeof(*probe));
-    *present = false;
-    trusted_path[0] = '\0';
-    char error[128U] = {0};
-    if (system_foreign_tc_netlink_probe(system, index, probe, present) != 0) {
-        char message[224U];
-        int written = snprintf(message, sizeof(message),
-            "hotspot filter probe failed: interface=%s index=%" PRIu32
-            " stage=netlink done=%u failed=%u present=%u sequence=%" PRIu32,
-            name, index, system->foreign_tc_netlink_done ? 1U : 0U,
-            system->foreign_tc_netlink_failed ? 1U : 0U,
-            system->foreign_tc_netlink_present ? 1U : 0U,
-            system->foreign_tc_netlink_sequence);
-        if (written > 0 && (size_t)written < sizeof(message)) {
-            (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
-                ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
-        }
-        return -1;
-    }
-    if (!*present) return 0;
-    probe->parent = UINT32_C(0xfffffff2);
-    if (system_interface_identity(name, index, probe) != 0 ||
-        asteriskd_foreign_tc_trusted_pin_find(
-            probe, trusted_paths, sizeof(trusted_paths) / sizeof(trusted_paths[0]),
-            asteriskd_system_bpf_program_backend(), trusted_path, trusted_path_size,
-            error, sizeof(error)) != 0) {
-        char message[192U];
-        int written = snprintf(message, sizeof(message),
-            "hotspot filter probe failed: interface=%s index=%" PRIu32
-            " stage=identity detail=%s", name, index,
-            error[0] == '\0' ? "unavailable" : error);
-        if (written > 0 && (size_t)written < sizeof(message)) {
-            (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
-                ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
-        }
-        return -1;
-    }
-    return 0;
+    int exit_status = -1;
+    if (system_tc_command(system, show, 7U, true, &exit_status) != 0 ||
+        exit_status != 0 || system->action_stdout_overflow) return -1;
+    if (!asteriskd_hotspot_tc_output_has_android_offload(
+            system->action_stdout, system->action_stdout_length)) return 0;
+    const char *remove[] = {
+        "filter", "del", "dev", name, "ingress", "protocol", "ipv6", "pref", "2",
+    };
+    return system_tc_zero(system, remove, 9U);
 }
 
-static int system_reconcile_foreign_hotspot_filter(
-    struct asteriskd_system_supervisor *system, const char *name, uint32_t index) {
-    const struct asteriskd_recovery_record *existing =
-        system_foreign_filter_record(system, name, index);
-    if (existing != NULL) {
-        uint64_t filter_id = existing->record_id;
-        uint64_t pin_id = existing->resource.tc_filter.recovery_pin_record_id;
-        enum asteriskd_wal_resource_state state = ASTERISKD_WAL_RESOURCE_AMBIGUOUS;
-        char error[128U];
-        if (system_wal_probe_recovery(
-                system, existing, &state, error, sizeof(error)) != 0) return -1;
-        if (state == ASTERISKD_WAL_RESOURCE_EXPECTED_EFFECT) return 0;
-        if (state != ASTERISKD_WAL_RESOURCE_ORIGINAL ||
-            asteriskd_wal_recover_record_id(
-                &system->store, &system->state, filter_id,
-                &system_wal_backend, system, error, sizeof(error)) != ASTERISKD_STATE_OK) {
-            return -1;
+static int system_clear_android_hotspot_offload(
+    struct asteriskd_system_supervisor *system) {
+    DIR *directory = opendir("/sys/class/net");
+    if (directory == NULL) return -1;
+    int result = 0;
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL) {
+        if (!system_hotspot_interface_selected(
+                &system->loaded_config.config, entry->d_name)) continue;
+        if (system_clear_android_hotspot_offload_interface(
+                system, entry->d_name) != 0) {
+            result = -1;
+            break;
         }
-        (void)pin_id;
     }
-    struct asteriskd_foreign_tc_probe probe;
-    bool present = false;
-    char source_path[ASTERISKD_MAX_PATH];
-    if (system_tc_probe_foreign_candidate(
-            system, name, index, &probe, &present,
-            source_path, sizeof(source_path)) != 0) return -1;
-    if (!present) return 0;
-
-    const struct asteriskd_recovery_record *pin =
-        system_hotspot_recovery_pin(system, probe.program_object_id);
-    uint64_t pin_record_id = pin == NULL
-        ? system->state.recovery.next_record_id : pin->record_id;
-    struct asteriskd_foreign_tc_plan plan;
-    char error[256U];
-    if (asteriskd_foreign_tc_plan_build(
-            &probe, pin_record_id, &plan, error, sizeof(error)) != 0) return -1;
-    if (pin == NULL) {
-        struct asteriskd_recovery_record pin_record = plan.operations[0].recovery;
-        pin_record.record_id = 0U;
-        system->foreign_tc_probe = probe;
-        (void)snprintf(system->foreign_tc_source_path,
-            sizeof(system->foreign_tc_source_path), "%s", source_path);
-        system->foreign_tc_pinned_object_id = 0U;
-        system->foreign_tc_pin_active = true;
-        int applied = asteriskd_wal_apply(
-            &system->store, &system->state, &pin_record,
-            &system_wal_backend, system, error, sizeof(error));
-        system->foreign_tc_pin_active = false;
-        memset(&system->foreign_tc_probe, 0, sizeof(system->foreign_tc_probe));
-        memset(system->foreign_tc_source_path, 0, sizeof(system->foreign_tc_source_path));
-        if (applied != ASTERISKD_STATE_OK ||
-            pin_record.record_id != pin_record_id ||
-            !pin_record.resource.bpf_pin.has_object_id ||
-            pin_record.resource.bpf_pin.object_id != probe.program_object_id) return -1;
-    }
-    struct asteriskd_recovery_record filter = plan.operations[1].recovery;
-    filter.record_id = 0U;
-    return asteriskd_wal_apply(
-        &system->store, &system->state, &filter,
-        &system_wal_backend, system, error, sizeof(error)) == ASTERISKD_STATE_OK ? 0 : -1;
+    (void)closedir(directory);
+    return result;
 }
 
 static int system_tc_slot_for_qdisc(struct asteriskd_system_supervisor *system,
@@ -6137,10 +5664,7 @@ static int system_reconcile_hotspot_tc_interface(
     memset(&filter, 0, sizeof(filter));
     filter.status = ASTERISKD_RECOVERY_INTENT;
     filter.kind = ASTERISKD_RECOVERY_TC_FILTER;
-    filter.resource.tc_filter.ownership = ASTERISKD_TC_OWNERSHIP_DAEMON;
-    filter.resource.tc_filter.inverse = ASTERISKD_TC_INVERSE_REMOVE;
     filter.resource.tc_filter.interface_index = index;
-    filter.resource.tc_filter.program_type = ASTERISKD_PROGRAM_TYPE_SCHED_CLS;
     (void)snprintf(filter.resource.tc_filter.interface_name,
         sizeof(filter.resource.tc_filter.interface_name), "%s", name);
     filter.resource.tc_filter.filter_id = ASTERISKD_FILTER_HOTSPOT_EGRESS;
@@ -6164,9 +5688,11 @@ static int system_reconcile_hotspot_tc_interface(
 
 static int system_reconcile_hotspot_tc(struct asteriskd_system_supervisor *system) {
     bool bpf2socks = system->loaded_config.config.mode == ASTERISKD_MODE_BPF2SOCKS;
-    bool foreign_ipv6 = system->loaded_config.config.enable_ipv6 &&
-        system->loaded_config.config.mode != ASTERISKD_MODE_EBPF;
-    if (!bpf2socks && !foreign_ipv6) return 0;
+    bool android_ipv6_offload = system->loaded_config.config.enable_ipv6 &&
+        system->loaded_config.config.mode != ASTERISKD_MODE_EBPF &&
+        system->loaded_config.config.hotspot_interface_prefix_count != 0U;
+    if (android_ipv6_offload && system_clear_android_hotspot_offload(system) != 0) return -1;
+    if (!bpf2socks) return 0;
     struct ifaddrs *addresses = NULL;
     if (getifaddrs(&addresses) != 0) return -1;
     char handled[ASTERISKD_MAX_ADDRESSES][ASTERISKD_MAX_INTERFACE_NAME];
@@ -6187,10 +5713,8 @@ static int system_reconcile_hotspot_tc(struct asteriskd_system_supervisor *syste
         uint32_t interface_index = if_nametoindex(entry->ifa_name);
         if (interface_index == 0U || snprintf(handled[handled_count],
                 sizeof(handled[handled_count]), "%s", entry->ifa_name) <= 0 ||
-            (bpf2socks && system_reconcile_hotspot_tc_interface(
-                system, entry->ifa_name, interface_index) != 0) ||
-            (foreign_ipv6 && system_reconcile_foreign_hotspot_filter(
-                system, entry->ifa_name, interface_index) != 0)) {
+            system_reconcile_hotspot_tc_interface(
+                system, entry->ifa_name, interface_index) != 0) {
             result = -1;
             break;
         }
@@ -6232,21 +5756,10 @@ static int system_recover_retired_interface_records(
             continue;
         }
         uint64_t record_id = record->record_id;
-        uint64_t recovery_pin_record_id =
-            record->kind == ASTERISKD_RECOVERY_TC_FILTER &&
-            record->resource.tc_filter.ownership == ASTERISKD_TC_OWNERSHIP_FOREIGN_SNAPSHOT
-                ? record->resource.tc_filter.recovery_pin_record_id : 0U;
         int recovered = asteriskd_wal_recover_record_id(
             &system->store, &system->state, record_id,
             &system_wal_backend, system, error, sizeof(error));
         if (recovered != ASTERISKD_STATE_OK) return -1;
-        if (recovery_pin_record_id != 0U) {
-            recovered = asteriskd_wal_recover_record_id(
-                &system->store, &system->state, recovery_pin_record_id,
-                &system_wal_backend, system, error, sizeof(error));
-            if (recovered != ASTERISKD_STATE_OK &&
-                recovered != ASTERISKD_WAL_INCOMPLETE) return -1;
-        }
     }
     return 0;
 }
@@ -6556,10 +6069,7 @@ static int system_cleanup_stopped_bpf2_tc_interface(
     const char *name, uint32_t index) {
     struct asteriskd_tc_filter_resource filter;
     memset(&filter, 0, sizeof(filter));
-    filter.ownership = ASTERISKD_TC_OWNERSHIP_DAEMON;
-    filter.inverse = ASTERISKD_TC_INVERSE_REMOVE;
     filter.interface_index = index;
-    filter.program_type = ASTERISKD_PROGRAM_TYPE_SCHED_CLS;
     if (snprintf(filter.interface_name,
             sizeof(filter.interface_name), "%s", name) <= 0) return -1;
     filter.filter_id = ASTERISKD_FILTER_HOTSPOT_EGRESS;
@@ -6659,7 +6169,56 @@ static int system_cleanup_stopped_bpf_residue(
     return 0;
 }
 
+static bool system_obsolete_hotspot_pin_name(const char *name, const char *prefix) {
+    size_t prefix_length = strlen(prefix);
+    if (strncmp(name, prefix, prefix_length) != 0 || name[prefix_length] == '\0') return false;
+    for (const char *cursor = name + prefix_length; *cursor != '\0'; ++cursor) {
+        if (*cursor < '0' || *cursor > '9') return false;
+    }
+    return true;
+}
+
+static void system_cleanup_obsolete_hotspot_pins(
+    struct asteriskd_system_supervisor *system) {
+    const char *owner = system->loaded_config.config.owner == ASTERISKD_OWNER_NG
+        ? "asteriskng" : system->loaded_config.config.owner == ASTERISKD_OWNER_BOX
+            ? "asteriskbox" : system->loaded_config.config.owner == ASTERISKD_OWNER_META
+                ? "asteriskmeta" : NULL;
+    char prefix[64U];
+    if (owner == NULL || snprintf(prefix, sizeof(prefix),
+            "%s_hotspot_recovery_", owner) <= 0) return;
+    DIR *directory = opendir("/sys/fs/bpf");
+    if (directory == NULL) return;
+    bool removed = false;
+    bool failed = false;
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL) {
+        if (!system_obsolete_hotspot_pin_name(entry->d_name, prefix)) continue;
+        char path[ASTERISKD_MAX_PATH];
+        int written = snprintf(path, sizeof(path), "/sys/fs/bpf/%s", entry->d_name);
+        if (written <= 0 || (size_t)written >= sizeof(path)) {
+            failed = true;
+        } else if (unlink(path) == 0 || errno == ENOENT) {
+            removed = true;
+        } else {
+            failed = true;
+        }
+    }
+    if (closedir(directory) != 0) failed = true;
+    if (removed) {
+        (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_INFO,
+            ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC,
+            "removed obsolete hotspot recovery BPF pin residue");
+    }
+    if (failed) {
+        (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_WARNING,
+            ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC,
+            "obsolete hotspot recovery BPF pin cleanup was incomplete");
+    }
+}
+
 static int system_cleanup_start_state(struct asteriskd_system_supervisor *system) {
+    system_cleanup_obsolete_hotspot_pins(system);
     if (asteriskd_state_is_canonical_stopped(&system->state)) {
         return system_cleanup_stopped_iptables_residue(system) == 0
             ? system_cleanup_stopped_bpf_residue(system) : -1;
@@ -7054,7 +6613,7 @@ static void system_child_process_defaults(struct asteriskd_child_process *proces
 static void system_runtime_cleanup_cycle(struct asteriskd_system_supervisor *system) {
     system_rule_batch_destroy(&system->rule_commands);
     system_rule_snapshot_destroy(&system->rule_snapshot);
-    system_foreign_tc_netlink_close(system);
+    system_tc_netlink_close(system);
     if (system->network_opened) (void)asteriskd_network_close(&system->network);
     system->network_opened = false;
     asteriskd_child_process_close(&system->core_process);
@@ -7078,7 +6637,7 @@ static void system_runtime_reset_cycle(struct asteriskd_system_supervisor *syste
     system_runtime_cleanup_cycle(system);
     size_t offset = offsetof(struct asteriskd_system_supervisor, stop_requested);
     memset((unsigned char *)system + offset, 0, sizeof(*system) - offset);
-    system->foreign_tc_netlink_fd = -1;
+    system->tc_netlink_fd = -1;
     system_child_process_defaults(&system->core_process);
     system_child_process_defaults(&system->helper_process);
     system_child_process_defaults(&system->action_process);
@@ -7162,7 +6721,7 @@ static int system_runtime_run(const char *config_path, bool initial_start,
     system.signal_fd = -1;
     system.service_timer_fd = -1;
     system.wifi_monitor.fd = -1;
-    system.foreign_tc_netlink_fd = -1;
+    system.tc_netlink_fd = -1;
     system_child_process_defaults(&system.core_process);
     system_child_process_defaults(&system.helper_process);
     system_child_process_defaults(&system.action_process);

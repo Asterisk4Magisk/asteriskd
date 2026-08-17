@@ -100,8 +100,6 @@ static int append_filter(
     operation->handle = ASTERISKD_HOTSPOT_TC_HANDLE;
     operation->direct_action = true;
     struct asteriskd_tc_filter_resource *resource = &operation->recovery.resource.tc_filter;
-    resource->ownership = ASTERISKD_TC_OWNERSHIP_DAEMON;
-    resource->inverse = ASTERISKD_TC_INVERSE_REMOVE;
     resource->filter_id = ingress ? ASTERISKD_FILTER_HOTSPOT_INGRESS :
         ASTERISKD_FILTER_HOTSPOT_EGRESS;
     resource->direction = direction;
@@ -109,7 +107,6 @@ static int append_filter(
     resource->interface_index = probe->interface_index;
     resource->program_id = ingress ? ASTERISKD_PROGRAM_BPF2SOCKS_INGRESS :
         ASTERISKD_PROGRAM_BPF2SOCKS_EGRESS;
-    resource->program_type = ASTERISKD_PROGRAM_TYPE_SCHED_CLS;
     resource->original_presence = false;
     return 0;
 }

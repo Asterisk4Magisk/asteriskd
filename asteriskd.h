@@ -1174,7 +1174,6 @@ enum asteriskd_pin_id {
     ASTERISKD_PIN_BPF2SOCKS_LOCAL_ADDRESS_V6,
     ASTERISKD_PIN_BPF2SOCKS_TC_INGRESS,
     ASTERISKD_PIN_BPF2SOCKS_TC_EGRESS,
-    ASTERISKD_PIN_HOTSPOT_RECOVERY,
     ASTERISKD_PIN_COUNT,
 };
 
@@ -1203,7 +1202,6 @@ enum asteriskd_qdisc_id {
 enum asteriskd_filter_id {
     ASTERISKD_FILTER_HOTSPOT_INGRESS,
     ASTERISKD_FILTER_HOTSPOT_EGRESS,
-    ASTERISKD_FILTER_HOTSPOT_IPV6_OFFLOAD,
     ASTERISKD_FILTER_COUNT,
 };
 
@@ -1216,23 +1214,7 @@ enum asteriskd_tc_direction {
 enum asteriskd_program_id {
     ASTERISKD_PROGRAM_BPF2SOCKS_INGRESS,
     ASTERISKD_PROGRAM_BPF2SOCKS_EGRESS,
-    ASTERISKD_PROGRAM_ANDROID_TETHER_OFFLOAD,
     ASTERISKD_PROGRAM_COUNT,
-};
-
-enum asteriskd_program_type {
-    ASTERISKD_PROGRAM_TYPE_SCHED_CLS,
-    ASTERISKD_PROGRAM_TYPE_COUNT,
-};
-
-enum asteriskd_tc_ownership {
-    ASTERISKD_TC_OWNERSHIP_DAEMON,
-    ASTERISKD_TC_OWNERSHIP_FOREIGN_SNAPSHOT,
-};
-
-enum asteriskd_tc_inverse {
-    ASTERISKD_TC_INVERSE_REMOVE,
-    ASTERISKD_TC_INVERSE_RESTORE,
 };
 
 enum asteriskd_sysctl_id {
@@ -1300,27 +1282,11 @@ struct asteriskd_tc_qdisc_resource {
 };
 
 struct asteriskd_tc_filter_resource {
-    enum asteriskd_tc_ownership ownership;
-    enum asteriskd_tc_inverse inverse;
     enum asteriskd_filter_id filter_id;
     enum asteriskd_tc_direction direction;
     char interface_name[ASTERISKD_MAX_INTERFACE_NAME];
     uint32_t interface_index;
-    uint32_t interface_link_index;
-    uint32_t interface_hardware_type;
-    char interface_address[ASTERISKD_MAX_HEX_ID];
-    uint32_t parent;
-    uint32_t chain;
-    uint32_t protocol;
-    uint32_t priority;
-    uint32_t handle;
-    char bpf_name[ASTERISKD_MAX_INTERFACE_NAME];
-    uint32_t bpf_flags;
-    uint32_t bpf_flags_gen;
     enum asteriskd_program_id program_id;
-    enum asteriskd_program_type program_type;
-    char program_tag[ASTERISKD_MAX_HEX_ID];
-    uint64_t recovery_pin_record_id;
     bool original_presence;
 };
 
@@ -2586,9 +2552,10 @@ const struct asteriskd_network_backend *asteriskd_system_network_backend(void);
 
 #define ASTERISKD_HOTSPOT_TC_PRIORITY 1U
 #define ASTERISKD_HOTSPOT_TC_HANDLE 1U
-#define ASTERISKD_ANDROID_TETHER_TC_PRIORITY 2U
 #define ASTERISKD_ETH_PROTOCOL_IPV6 UINT32_C(0x86dd)
 #define ASTERISKD_ETH_PROTOCOL_ALL UINT32_C(0x0003)
+
+bool asteriskd_hotspot_tc_output_has_android_offload(const void *, size_t);
 
 enum asteriskd_tc_slot_state {
     ASTERISKD_TC_SLOT_ABSENT,
@@ -2645,28 +2612,6 @@ enum asteriskd_tc_qdisc_cleanup_decision asteriskd_tc_qdisc_cleanup_decide(
 bool asteriskd_tc_qdisc_cleanup_restored(bool qdisc_present,
     enum asteriskd_tc_qdisc_cleanup_decision decision);
 
-struct asteriskd_foreign_tc_probe {
-    char interface_name[ASTERISKD_MAX_INTERFACE_NAME];
-    uint32_t interface_index;
-    uint32_t interface_link_index;
-    uint32_t interface_hardware_type;
-    char interface_address[ASTERISKD_MAX_HEX_ID];
-    uint32_t parent;
-    uint32_t chain;
-    uint32_t protocol;
-    uint32_t priority;
-    uint32_t handle;
-    char bpf_name[ASTERISKD_MAX_INTERFACE_NAME];
-    uint32_t bpf_flags;
-    uint32_t bpf_flags_gen;
-    uint64_t program_object_id;
-    uint32_t program_type;
-    char program_tag[ASTERISKD_MAX_HEX_ID];
-    bool direct_action;
-    bool trusted_system_pin_match;
-    bool unknown_attributes;
-};
-
 struct asteriskd_tc_filter_expectation {
     uint32_t interface_index;
     uint32_t parent;
@@ -2681,31 +2626,6 @@ struct asteriskd_tc_filter_expectation {
     unsigned char program_tag[ASTERISKD_BPF_PROGRAM_TAG_SIZE];
 };
 
-enum asteriskd_foreign_tc_operation_kind {
-    ASTERISKD_FOREIGN_TC_PIN_PROGRAM,
-    ASTERISKD_FOREIGN_TC_DELETE_FILTER,
-    ASTERISKD_FOREIGN_TC_RESTORE_FILTER,
-    ASTERISKD_FOREIGN_TC_UNPIN_PROGRAM,
-};
-
-struct asteriskd_foreign_tc_operation {
-    enum asteriskd_foreign_tc_operation_kind kind;
-    struct asteriskd_recovery_record recovery;
-};
-
-struct asteriskd_foreign_tc_plan {
-    struct asteriskd_foreign_tc_operation operations[2U];
-    size_t operation_count;
-};
-
-int asteriskd_foreign_tc_plan_build(
-    const struct asteriskd_foreign_tc_probe *, uint64_t,
-    struct asteriskd_foreign_tc_plan *, char *, size_t);
-int asteriskd_foreign_tc_json_parse(
-    const char *, size_t, struct asteriskd_foreign_tc_probe *, bool *, char *, size_t);
-int asteriskd_foreign_tc_netlink_decode(
-    const void *, size_t, uint32_t, uint32_t, uint32_t,
-    struct asteriskd_foreign_tc_probe *, bool *, bool *, char *, size_t);
 int asteriskd_tc_filter_netlink_decode(
     const void *, size_t, uint32_t, uint32_t,
     const struct asteriskd_tc_filter_expectation *,
@@ -2717,15 +2637,6 @@ int asteriskd_tc_filter_slot_netlink_decode(
 int asteriskd_tc_qdisc_netlink_decode(
     const void *, size_t, uint32_t, uint32_t, uint32_t,
     enum asteriskd_rules_slot_state *, bool *, char *, size_t);
-int asteriskd_foreign_tc_trusted_pin_find(
-    struct asteriskd_foreign_tc_probe *, const char *const *, size_t,
-    const struct asteriskd_bpf_program_backend *, char *, size_t, char *, size_t);
-int asteriskd_foreign_tc_pin_clone(
-    const struct asteriskd_foreign_tc_probe *, const char *, const char *,
-    const struct asteriskd_bpf_program_backend *, uint64_t *, char *, size_t);
-int asteriskd_foreign_tc_cleanup_plan_build(
-    const struct asteriskd_foreign_tc_plan *, struct asteriskd_foreign_tc_plan *);
-
 enum asteriskd_event_action {
     ASTERISKD_EVENT_ADDED,
     ASTERISKD_EVENT_REMOVED,

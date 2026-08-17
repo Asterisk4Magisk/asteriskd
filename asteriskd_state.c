@@ -69,19 +69,18 @@ static const char *const pin_names[] = {
     "matcher-output-v4", "matcher-output-v6", "matcher-prerouting-v4",
     "matcher-prerouting-v6", "bpf2socks-local-address-v4",
     "bpf2socks-local-address-v6", "bpf2socks-tc-ingress",
-    "bpf2socks-tc-egress", "hotspot-recovery",
+    "bpf2socks-tc-egress",
 };
 static const char *const qdisc_names[] = {"hotspot-clsact"};
 static const char *const filter_names[] = {
-    "hotspot-ingress", "hotspot-egress", "hotspot-ipv6-offload",
+    "hotspot-ingress", "hotspot-egress",
 };
 static const char *const direction_names[] = {"ingress", "egress"};
 static const char *const program_names[] = {
-    "bpf2socks-ingress", "bpf2socks-egress", "android-tether-offload",
+    "bpf2socks-ingress", "bpf2socks-egress",
 };
-static const char *const program_type_names[] = {"sched-cls"};
-static const char *const ownership_names[] = {"daemon", "foreign-snapshot"};
-static const char *const inverse_names[] = {"remove", "restore"};
+static const char *const tc_ownership_names[] = {"daemon"};
+static const char *const tc_inverse_names[] = {"remove"};
 static const char *const sysctl_names[] = {"disable-ipv6", "route-localnet"};
 static const char *const tether_names[] = {"dnsmasq"};
 
@@ -130,16 +129,6 @@ static bool interface_name_valid(const char *value, bool allow_default) {
     return true;
 }
 
-static bool lowercase_hex_valid(const char *value, bool allow_empty) {
-    size_t length = value == NULL ? 0U : strnlen(value, ASTERISKD_MAX_HEX_ID);
-    if ((!allow_empty && length == 0U) || length >= ASTERISKD_MAX_HEX_ID || (length & 1U) != 0U) return false;
-    for (size_t index = 0U; index < length; ++index) {
-        if (!((value[index] >= '0' && value[index] <= '9') ||
-              (value[index] >= 'a' && value[index] <= 'f'))) return false;
-    }
-    return true;
-}
-
 static bool child_type_matches_core(enum asteriskd_child_type type, enum asteriskd_core_type core) {
     return (type == ASTERISKD_CHILD_TYPE_XRAY && core == ASTERISKD_CORE_XRAY) ||
         (type == ASTERISKD_CHILD_TYPE_SING_BOX && core == ASTERISKD_CORE_SING_BOX) ||
@@ -166,65 +155,18 @@ static bool child_valid(
     return false;
 }
 
-static bool trusted_tether_bpf_name(const char *name) {
-    static const char *const names[] = {
-        "prog_offload_schedcls_tether_upstream6_ether",
-        "prog_offload_schedcls_tether_upstream6_rawip",
-        "prog_offload_schedcls_tether_downstream6_ether",
-        "prog_offload_schedcls_tether_downstream6_rawip",
-    };
-    for (size_t index = 0U; index < sizeof(names) / sizeof(names[0]); ++index) {
-        if (strcmp(name, names[index]) == 0) return true;
-    }
-    return false;
-}
-
 static bool tc_filter_valid(const struct asteriskd_tc_filter_resource *resource) {
-    if (resource->ownership < 0 || resource->ownership > ASTERISKD_TC_OWNERSHIP_FOREIGN_SNAPSHOT ||
-        resource->inverse < 0 || resource->inverse > ASTERISKD_TC_INVERSE_RESTORE ||
-        resource->filter_id < 0 || resource->filter_id >= ASTERISKD_FILTER_COUNT ||
+    if (resource->filter_id < 0 || resource->filter_id >= ASTERISKD_FILTER_COUNT ||
         resource->direction < 0 || resource->direction >= ASTERISKD_TC_DIRECTION_COUNT ||
         resource->program_id < 0 || resource->program_id >= ASTERISKD_PROGRAM_COUNT ||
         !interface_name_valid(resource->interface_name, false) || resource->interface_index == 0U) return false;
-    if (resource->ownership == ASTERISKD_TC_OWNERSHIP_DAEMON) {
-        return resource->inverse == ASTERISKD_TC_INVERSE_REMOVE &&
-            !resource->original_presence &&
-            resource->interface_link_index == 0U && resource->interface_hardware_type == 0U &&
-            bytes_are_zero(resource->interface_address, sizeof(resource->interface_address)) &&
-            resource->parent == 0U && resource->chain == 0U && resource->protocol == 0U &&
-            resource->priority == 0U && resource->handle == 0U &&
-            bytes_are_zero(resource->bpf_name, sizeof(resource->bpf_name)) &&
-            resource->bpf_flags == 0U && resource->bpf_flags_gen == 0U &&
-            resource->program_type == 0 &&
-            bytes_are_zero(resource->program_tag, sizeof(resource->program_tag)) &&
-            resource->recovery_pin_record_id == 0U &&
-            ((resource->direction == ASTERISKD_TC_DIRECTION_INGRESS &&
-              resource->filter_id == ASTERISKD_FILTER_HOTSPOT_INGRESS &&
-              resource->program_id == ASTERISKD_PROGRAM_BPF2SOCKS_INGRESS) ||
-             (resource->direction == ASTERISKD_TC_DIRECTION_EGRESS &&
-              resource->filter_id == ASTERISKD_FILTER_HOTSPOT_EGRESS &&
-              resource->program_id == ASTERISKD_PROGRAM_BPF2SOCKS_EGRESS));
-    }
-    return resource->inverse == ASTERISKD_TC_INVERSE_RESTORE &&
-        resource->filter_id == ASTERISKD_FILTER_HOTSPOT_IPV6_OFFLOAD &&
-        resource->direction == ASTERISKD_TC_DIRECTION_INGRESS &&
-        resource->program_id == ASTERISKD_PROGRAM_ANDROID_TETHER_OFFLOAD &&
-        resource->program_type == ASTERISKD_PROGRAM_TYPE_SCHED_CLS &&
-        resource->bpf_flags == ASTERISKD_TC_BPF_FLAG_ACT_DIRECT &&
-        resource->parent == ASTERISKD_TC_PARENT_CLSACT_INGRESS &&
-        resource->chain == 0U && resource->protocol == ASTERISKD_ETH_PROTOCOL_IPV6 &&
-        resource->priority == ASTERISKD_ANDROID_TETHER_TC_PRIORITY &&
-        resource->handle > 0U && (resource->bpf_flags_gen & ~UINT32_C(0xf)) == 0U &&
-        (resource->bpf_flags_gen & UINT32_C(0xc)) != UINT32_C(0xc) &&
-        resource->interface_link_index > 0U && resource->interface_hardware_type > 0U &&
-        resource->recovery_pin_record_id > 0U && resource->original_presence &&
-        lowercase_hex_valid(resource->interface_address, false) &&
-        lowercase_hex_valid(resource->program_tag, false) &&
-        strnlen(resource->program_tag, sizeof(resource->program_tag)) ==
-            ASTERISKD_BPF_PROGRAM_TAG_HEX_LENGTH &&
-        strnlen(resource->bpf_name, sizeof(resource->bpf_name)) > 0U &&
-        strnlen(resource->bpf_name, sizeof(resource->bpf_name)) < sizeof(resource->bpf_name) &&
-        trusted_tether_bpf_name(resource->bpf_name);
+    return !resource->original_presence &&
+        ((resource->direction == ASTERISKD_TC_DIRECTION_INGRESS &&
+          resource->filter_id == ASTERISKD_FILTER_HOTSPOT_INGRESS &&
+          resource->program_id == ASTERISKD_PROGRAM_BPF2SOCKS_INGRESS) ||
+         (resource->direction == ASTERISKD_TC_DIRECTION_EGRESS &&
+          resource->filter_id == ASTERISKD_FILTER_HOTSPOT_EGRESS &&
+          resource->program_id == ASTERISKD_PROGRAM_BPF2SOCKS_EGRESS));
 }
 
 static bool record_resource_valid(const struct asteriskd_recovery_record *record) {
@@ -385,22 +327,6 @@ static bool document_valid(const struct asteriskd_state_document *document) {
             record->record_id >= document->recovery.next_record_id) return false;
         if (record->status == ASTERISKD_RECOVERY_INTENT) saw_intent = true;
         else if (saw_intent) return false;
-        if (record->kind == ASTERISKD_RECOVERY_TC_FILTER &&
-            record->resource.tc_filter.ownership == ASTERISKD_TC_OWNERSHIP_FOREIGN_SNAPSHOT) {
-            bool pin_found = false;
-            for (size_t pin_index = 0U; pin_index < index; ++pin_index) {
-                const struct asteriskd_recovery_record *pin = &document->recovery.records[pin_index];
-                if (pin->record_id == record->resource.tc_filter.recovery_pin_record_id &&
-                    pin->kind == ASTERISKD_RECOVERY_BPF_PIN &&
-                    pin->status == ASTERISKD_RECOVERY_APPLIED &&
-                    pin->resource.bpf_pin.pin_id == ASTERISKD_PIN_HOTSPOT_RECOVERY &&
-                    pin->resource.bpf_pin.has_object_id) {
-                    pin_found = true;
-                    break;
-                }
-            }
-            if (!pin_found) return false;
-        }
         previous = record->record_id;
     }
     if (document->owner == ASTERISKD_OWNER_BOX &&
@@ -830,30 +756,12 @@ static void serialize_record_resource(
         }
         case ASTERISKD_RECOVERY_TC_FILTER: {
             const struct asteriskd_tc_filter_resource *resource = &record->resource.tc_filter;
-            builder_raw(builder, "\"ownership\":"); builder_json_string(builder, ownership_names[resource->ownership]);
-            builder_raw(builder, ",\"inverse\":"); builder_json_string(builder, inverse_names[resource->inverse]);
+            builder_raw(builder, "\"ownership\":\"daemon\",\"inverse\":\"remove\"");
             builder_raw(builder, ",\"filterId\":"); builder_json_string(builder, filter_names[resource->filter_id]);
             builder_raw(builder, ",\"direction\":"); builder_json_string(builder, direction_names[resource->direction]);
             builder_raw(builder, ",\"interfaceName\":"); builder_json_string(builder, resource->interface_name);
             builder_format(builder, ",\"interfaceIndex\":%" PRIu32, resource->interface_index);
-            if (resource->ownership == ASTERISKD_TC_OWNERSHIP_FOREIGN_SNAPSHOT) {
-                builder_format(builder, ",\"interfaceLinkIndex\":%" PRIu32
-                    ",\"interfaceHardwareType\":%" PRIu32 ",\"interfaceAddress\":",
-                    resource->interface_link_index, resource->interface_hardware_type);
-                builder_json_string(builder, resource->interface_address);
-                builder_format(builder, ",\"parent\":%" PRIu32 ",\"chain\":%" PRIu32
-                    ",\"protocol\":%" PRIu32 ",\"priority\":%" PRIu32 ",\"handle\":%" PRIu32,
-                    resource->parent, resource->chain, resource->protocol, resource->priority, resource->handle);
-                builder_raw(builder, ",\"bpfName\":"); builder_json_string(builder, resource->bpf_name);
-                builder_format(builder, ",\"bpfFlags\":%" PRIu32 ",\"bpfFlagsGen\":%" PRIu32,
-                    resource->bpf_flags, resource->bpf_flags_gen);
-            }
             builder_raw(builder, ",\"programId\":"); builder_json_string(builder, program_names[resource->program_id]);
-            if (resource->ownership == ASTERISKD_TC_OWNERSHIP_FOREIGN_SNAPSHOT) {
-                builder_raw(builder, ",\"programType\":"); builder_json_string(builder, program_type_names[resource->program_type]);
-                builder_raw(builder, ",\"programTag\":"); builder_json_string(builder, resource->program_tag);
-                builder_format(builder, ",\"recoveryPinRecordId\":%" PRIu64, resource->recovery_pin_record_id);
-            }
             builder_raw(builder, ",\"originalPresence\":"); builder_raw(builder, boolean_name(resource->original_presence));
             break;
         }
@@ -1108,26 +1016,6 @@ static int object_values(
     return pairs == name_count ? 0 : -1;
 }
 
-static int find_value(
-    const struct asteriskd_json_document *document,
-    size_t object,
-    const char *name,
-    size_t *out) {
-    if (object >= document->token_count || document->tokens[object].type != ASTERISKD_JSON_OBJECT) return -1;
-    size_t cursor = object + 1U;
-    while (true) {
-        size_t key = next_direct(document, object, cursor);
-        if (key == TOKEN_NONE) return -1;
-        size_t value = next_direct(document, object, key + 1U);
-        if (value == TOKEN_NONE) return -1;
-        if (token_string_equals(document, key, name)) {
-            *out = value;
-            return 0;
-        }
-        cursor = value + 1U;
-    }
-}
-
 static int find_unique_value(
     const struct asteriskd_json_document *document,
     size_t object,
@@ -1294,6 +1182,112 @@ static int parse_nullable_interface(
         parse_u32_token(json, index_token, index) == 0 ? 0 : -1;
 }
 
+/*
+ * Early 2.0 builds persisted Android tethering filters as restorable foreign
+ * resources.  That design was removed: current startup deliberately applies
+ * the pre-2.0 one-way TC cleanup instead.  Keep only this strict decoder so a
+ * version-2 state file written by those builds can be migrated by dropping the
+ * obsolete records; none of their restore data enters the runtime model.
+ */
+static bool legacy_lowercase_hex_valid(const char *value, size_t exact_length) {
+    size_t length = value == NULL ? 0U : strnlen(value, ASTERISKD_MAX_HEX_ID);
+    if (length == 0U || length >= ASTERISKD_MAX_HEX_ID ||
+        (length & 1U) != 0U || (exact_length != 0U && length != exact_length)) return false;
+    for (size_t index = 0U; index < length; ++index) {
+        if (!((value[index] >= '0' && value[index] <= '9') ||
+              (value[index] >= 'a' && value[index] <= 'f'))) return false;
+    }
+    return true;
+}
+
+static bool legacy_tether_bpf_name(const char *name) {
+    static const char *const names[] = {
+        "prog_offload_schedcls_tether_upstream6_ether",
+        "prog_offload_schedcls_tether_upstream6_rawip",
+        "prog_offload_schedcls_tether_downstream6_ether",
+        "prog_offload_schedcls_tether_downstream6_rawip",
+    };
+    for (size_t index = 0U; index < sizeof(names) / sizeof(names[0]); ++index) {
+        if (strcmp(name, names[index]) == 0) return true;
+    }
+    return false;
+}
+
+/* Returns one for an obsolete record, zero for a current record, and -1 for malformed legacy data. */
+static int parse_obsolete_hotspot_record(
+    const struct asteriskd_json_document *json,
+    size_t object,
+    const struct asteriskd_recovery_record *record) {
+    if (record->kind == ASTERISKD_RECOVERY_BPF_PIN) {
+        size_t pin_token;
+        if (find_unique_value(json, object, "pinId", &pin_token) != 0 ||
+            !token_string_equals(json, pin_token, "hotspot-recovery")) return 0;
+        static const char *const names[] = {"pinId", "objectId", "originalPresence"};
+        size_t values[3];
+        uint64_t object_id = 0U;
+        bool original_presence = false;
+        bool has_object_id;
+        if (object_values(json, object, names, 3U, values) != 0) return -1;
+        has_object_id = !is_null_token(json, values[1]);
+        if ((has_object_id &&
+             (parse_u64_token(json, values[1], &object_id) != 0 || object_id == 0U)) ||
+            parse_bool_token(json, values[2], &original_presence) != 0 || original_presence ||
+            (record->status == ASTERISKD_RECOVERY_APPLIED && !has_object_id)) return -1;
+        return 1;
+    }
+    if (record->kind != ASTERISKD_RECOVERY_TC_FILTER) return 0;
+    size_t ownership_token;
+    if (find_unique_value(json, object, "ownership", &ownership_token) != 0 ||
+        !token_string_equals(json, ownership_token, "foreign-snapshot")) return 0;
+    static const char *const names[] = {
+        "ownership", "inverse", "filterId", "direction", "interfaceName", "interfaceIndex",
+        "interfaceLinkIndex", "interfaceHardwareType", "interfaceAddress", "parent", "chain",
+        "protocol", "priority", "handle", "bpfName", "bpfFlags", "bpfFlagsGen", "programId",
+        "programType", "programTag", "recoveryPinRecordId", "originalPresence",
+    };
+    size_t values[22];
+    char interface_name[ASTERISKD_MAX_INTERFACE_NAME];
+    char interface_address[ASTERISKD_MAX_HEX_ID];
+    char bpf_name[ASTERISKD_MAX_INTERFACE_NAME];
+    char program_tag[ASTERISKD_MAX_HEX_ID];
+    uint32_t interface_index, interface_link_index, interface_hardware_type;
+    uint32_t parent, chain, protocol, priority, handle, bpf_flags, bpf_flags_gen;
+    uint64_t recovery_pin_record_id;
+    bool original_presence;
+    if (object_values(json, object, names, 22U, values) != 0 ||
+        !token_string_equals(json, values[1], "restore") ||
+        !token_string_equals(json, values[2], "hotspot-ipv6-offload") ||
+        !token_string_equals(json, values[3], "ingress") ||
+        decode_json_string(json, values[4], interface_name, sizeof(interface_name)) != 0 ||
+        parse_u32_token(json, values[5], &interface_index) != 0 ||
+        parse_u32_token(json, values[6], &interface_link_index) != 0 ||
+        parse_u32_token(json, values[7], &interface_hardware_type) != 0 ||
+        decode_json_string(json, values[8], interface_address, sizeof(interface_address)) != 0 ||
+        parse_u32_token(json, values[9], &parent) != 0 ||
+        parse_u32_token(json, values[10], &chain) != 0 ||
+        parse_u32_token(json, values[11], &protocol) != 0 ||
+        parse_u32_token(json, values[12], &priority) != 0 ||
+        parse_u32_token(json, values[13], &handle) != 0 ||
+        decode_json_string(json, values[14], bpf_name, sizeof(bpf_name)) != 0 ||
+        parse_u32_token(json, values[15], &bpf_flags) != 0 ||
+        parse_u32_token(json, values[16], &bpf_flags_gen) != 0 ||
+        !token_string_equals(json, values[17], "android-tether-offload") ||
+        !token_string_equals(json, values[18], "sched-cls") ||
+        decode_json_string(json, values[19], program_tag, sizeof(program_tag)) != 0 ||
+        parse_u64_token(json, values[20], &recovery_pin_record_id) != 0 ||
+        parse_bool_token(json, values[21], &original_presence) != 0) return -1;
+    return interface_name_valid(interface_name, false) && interface_index > 0U &&
+        interface_link_index > 0U && interface_hardware_type > 0U &&
+        legacy_lowercase_hex_valid(interface_address, 0U) &&
+        parent == ASTERISKD_TC_PARENT_CLSACT_INGRESS && chain == 0U &&
+        protocol == ASTERISKD_ETH_PROTOCOL_IPV6 && priority == 2U && handle > 0U &&
+        legacy_tether_bpf_name(bpf_name) && bpf_flags == ASTERISKD_TC_BPF_FLAG_ACT_DIRECT &&
+        (bpf_flags_gen & ~UINT32_C(0xf)) == 0U &&
+        (bpf_flags_gen & UINT32_C(0xc)) != UINT32_C(0xc) &&
+        legacy_lowercase_hex_valid(program_tag, ASTERISKD_BPF_PROGRAM_TAG_HEX_LENGTH) &&
+        recovery_pin_record_id > 0U && original_presence ? 1 : -1;
+}
+
 static int parse_record_resource(
     const struct asteriskd_json_document *json,
     size_t object,
@@ -1394,64 +1388,24 @@ static int parse_record_resource(
                 parse_bool_token(json, values[3], &resource->original_presence) == 0 ? 0 : -1;
         }
         case ASTERISKD_RECOVERY_TC_FILTER: {
-            size_t ownership_token;
-            if (find_value(json, object, "ownership", &ownership_token) != 0 ||
-                parse_enum_token(json, ownership_token, ownership_names, 2U, &value) != 0) return -1;
-            struct asteriskd_tc_filter_resource *resource = &record->resource.tc_filter;
-            resource->ownership = (enum asteriskd_tc_ownership)value;
-            if (resource->ownership == ASTERISKD_TC_OWNERSHIP_DAEMON) {
-                static const char *const names[] = {
-                    "ownership", "inverse", "filterId", "direction", "interfaceName", "interfaceIndex",
-                    "programId", "originalPresence",
-                };
-                size_t values[8];
-                if (object_values(json, object, names, 8U, values) != 0 ||
-                    parse_enum_token(json, values[1], inverse_names, 2U, &value) != 0) return -1;
-                resource->inverse = (enum asteriskd_tc_inverse)value;
-                if (parse_enum_token(json, values[2], filter_names, ASTERISKD_FILTER_COUNT, &value) != 0) return -1;
-                resource->filter_id = (enum asteriskd_filter_id)value;
-                if (parse_enum_token(json, values[3], direction_names, ASTERISKD_TC_DIRECTION_COUNT, &value) != 0) return -1;
-                resource->direction = (enum asteriskd_tc_direction)value;
-                if (decode_json_string(json, values[4], resource->interface_name, sizeof(resource->interface_name)) != 0 ||
-                    parse_u32_token(json, values[5], &resource->interface_index) != 0 ||
-                    parse_enum_token(json, values[6], program_names, ASTERISKD_PROGRAM_COUNT, &value) != 0) return -1;
-                resource->program_id = (enum asteriskd_program_id)value;
-                return parse_bool_token(json, values[7], &resource->original_presence);
-            }
             static const char *const names[] = {
                 "ownership", "inverse", "filterId", "direction", "interfaceName", "interfaceIndex",
-                "interfaceLinkIndex", "interfaceHardwareType", "interfaceAddress", "parent", "chain",
-                "protocol", "priority", "handle", "bpfName", "bpfFlags", "bpfFlagsGen", "programId",
-                "programType", "programTag", "recoveryPinRecordId", "originalPresence",
+                "programId", "originalPresence",
             };
-            size_t values[22];
-            if (object_values(json, object, names, 22U, values) != 0 ||
-                parse_enum_token(json, values[1], inverse_names, 2U, &value) != 0) return -1;
-            resource->inverse = (enum asteriskd_tc_inverse)value;
+            size_t values[8];
+            struct asteriskd_tc_filter_resource *resource = &record->resource.tc_filter;
+            if (object_values(json, object, names, 8U, values) != 0 ||
+                parse_enum_token(json, values[0], tc_ownership_names, 1U, &value) != 0 ||
+                parse_enum_token(json, values[1], tc_inverse_names, 1U, &value) != 0) return -1;
             if (parse_enum_token(json, values[2], filter_names, ASTERISKD_FILTER_COUNT, &value) != 0) return -1;
             resource->filter_id = (enum asteriskd_filter_id)value;
             if (parse_enum_token(json, values[3], direction_names, ASTERISKD_TC_DIRECTION_COUNT, &value) != 0) return -1;
             resource->direction = (enum asteriskd_tc_direction)value;
             if (decode_json_string(json, values[4], resource->interface_name, sizeof(resource->interface_name)) != 0 ||
                 parse_u32_token(json, values[5], &resource->interface_index) != 0 ||
-                parse_u32_token(json, values[6], &resource->interface_link_index) != 0 ||
-                parse_u32_token(json, values[7], &resource->interface_hardware_type) != 0 ||
-                decode_json_string(json, values[8], resource->interface_address, sizeof(resource->interface_address)) != 0 ||
-                parse_u32_token(json, values[9], &resource->parent) != 0 ||
-                parse_u32_token(json, values[10], &resource->chain) != 0 ||
-                parse_u32_token(json, values[11], &resource->protocol) != 0 ||
-                parse_u32_token(json, values[12], &resource->priority) != 0 ||
-                parse_u32_token(json, values[13], &resource->handle) != 0 ||
-                decode_json_string(json, values[14], resource->bpf_name, sizeof(resource->bpf_name)) != 0 ||
-                parse_u32_token(json, values[15], &resource->bpf_flags) != 0 ||
-                parse_u32_token(json, values[16], &resource->bpf_flags_gen) != 0 ||
-                parse_enum_token(json, values[17], program_names, ASTERISKD_PROGRAM_COUNT, &value) != 0) return -1;
+                parse_enum_token(json, values[6], program_names, ASTERISKD_PROGRAM_COUNT, &value) != 0) return -1;
             resource->program_id = (enum asteriskd_program_id)value;
-            if (parse_enum_token(json, values[18], program_type_names, ASTERISKD_PROGRAM_TYPE_COUNT, &value) != 0) return -1;
-            resource->program_type = (enum asteriskd_program_type)value;
-            return decode_json_string(json, values[19], resource->program_tag, sizeof(resource->program_tag)) == 0 &&
-                parse_u64_token(json, values[20], &resource->recovery_pin_record_id) == 0 &&
-                parse_bool_token(json, values[21], &resource->original_presence) == 0 ? 0 : -1;
+            return parse_bool_token(json, values[7], &resource->original_presence);
         }
         case ASTERISKD_RECOVERY_SYSCTL: {
             static const char *const names[] = {"sysctlId", "interfaceName", "interfaceIndex", "originalValue", "desiredValue"};
@@ -1501,6 +1455,8 @@ static int parse_recovery_record(
     record->status = (enum asteriskd_recovery_status)value;
     if (parse_enum_token(json, values[2], recovery_kind_names, ASTERISKD_RECOVERY_KIND_COUNT, &value) != 0) return -1;
     record->kind = (enum asteriskd_recovery_kind)value;
+    int obsolete = parse_obsolete_hotspot_record(json, values[3], record);
+    if (obsolete != 0) return obsolete;
     return parse_record_resource(json, values[3], record);
 }
 
@@ -1613,11 +1569,19 @@ int asteriskd_state_parse(
         json.tokens[recovery_values[2]].type != ASTERISKD_JSON_ARRAY) goto done;
     state->recovery.next_record_id = 1U;
     cursor = recovery_values[2] + 1U;
+    uint64_t previous_record_id = 0U;
+    bool saw_intent = false;
     for (size_t index = 0U; index < json.tokens[recovery_values[2]].child_count; ++index) {
         size_t token = next_direct(&json, recovery_values[2], cursor);
         struct asteriskd_recovery_record record;
-        if (token == TOKEN_NONE || parse_recovery_record(&json, token, &record) != 0 ||
-            asteriskd_state_append_recovery(state, &record, error, error_size) != ASTERISKD_STATE_OK) goto done;
+        int parsed = token == TOKEN_NONE ? -1 : parse_recovery_record(&json, token, &record);
+        if (parsed < 0 || record.record_id <= previous_record_id ||
+            record.record_id >= declared_next_record_id ||
+            (record.status == ASTERISKD_RECOVERY_APPLIED && saw_intent) ||
+            (parsed == 0 && asteriskd_state_append_recovery(
+                state, &record, error, error_size) != ASTERISKD_STATE_OK)) goto done;
+        if (record.status == ASTERISKD_RECOVERY_INTENT) saw_intent = true;
+        previous_record_id = record.record_id;
         cursor = token + 1U;
     }
     if (declared_next_record_id < state->recovery.next_record_id) goto done;
@@ -2148,7 +2112,6 @@ static bool verified_identities_are_unique(
         PIN_IDENTITY_MATCHER_PROGRAM,
         PIN_IDENTITY_BPF2SOCKS_MAP,
         PIN_IDENTITY_BPF2SOCKS_PROGRAM,
-        PIN_IDENTITY_HOTSPOT_PROGRAM,
     };
     for (size_t left = 0U; left < record_count; ++left) {
         for (size_t right = left + 1U; right < record_count; ++right) {
@@ -2165,13 +2128,13 @@ static bool verified_identities_are_unique(
                     (left_id <= ASTERISKD_PIN_BPF2SOCKS_LOCAL_ADDRESS_V6 ?
                         PIN_IDENTITY_BPF2SOCKS_MAP :
                         (left_id <= ASTERISKD_PIN_BPF2SOCKS_TC_EGRESS ?
-                            PIN_IDENTITY_BPF2SOCKS_PROGRAM : PIN_IDENTITY_HOTSPOT_PROGRAM));
+                            PIN_IDENTITY_BPF2SOCKS_PROGRAM : PIN_IDENTITY_NONE));
                 enum pin_identity_domain right_domain = right_id <= ASTERISKD_PIN_MATCHER_PREROUTING_V6 ?
                     PIN_IDENTITY_MATCHER_PROGRAM :
                     (right_id <= ASTERISKD_PIN_BPF2SOCKS_LOCAL_ADDRESS_V6 ?
                         PIN_IDENTITY_BPF2SOCKS_MAP :
                         (right_id <= ASTERISKD_PIN_BPF2SOCKS_TC_EGRESS ?
-                            PIN_IDENTITY_BPF2SOCKS_PROGRAM : PIN_IDENTITY_HOTSPOT_PROGRAM));
+                            PIN_IDENTITY_BPF2SOCKS_PROGRAM : PIN_IDENTITY_NONE));
                 if (left_domain != PIN_IDENTITY_NONE && left_domain == right_domain &&
                     records[left].resource.bpf_pin.object_id ==
                         records[right].resource.bpf_pin.object_id) return false;
@@ -2260,8 +2223,7 @@ static bool wal_creation_original_is_absent(
         case ASTERISKD_RECOVERY_TC_QDISC:
             return !record->resource.tc_qdisc.original_presence;
         case ASTERISKD_RECOVERY_TC_FILTER:
-            return record->resource.tc_filter.ownership == ASTERISKD_TC_OWNERSHIP_FOREIGN_SNAPSHOT ||
-                !record->resource.tc_filter.original_presence;
+            return !record->resource.tc_filter.original_presence;
         case ASTERISKD_RECOVERY_SYSCTL:
         case ASTERISKD_RECOVERY_TETHER_STATE:
         case ASTERISKD_RECOVERY_KIND_COUNT:
@@ -2433,8 +2395,7 @@ int asteriskd_wal_apply(
     void *context,
     char *error,
     size_t error_size) {
-    if (record != NULL && record->kind == ASTERISKD_RECOVERY_BPF_PIN &&
-        record->resource.bpf_pin.pin_id != ASTERISKD_PIN_HOTSPOT_RECOVERY) {
+    if (record != NULL && record->kind == ASTERISKD_RECOVERY_BPF_PIN) {
         set_error(error, error_size, "grouped pin requires fixed batch WAL");
         return ASTERISKD_STATE_INVALID;
     }
@@ -2596,21 +2557,6 @@ static bool recovery_original_is_absent(const struct asteriskd_recovery_record *
     return false;
 }
 
-static bool recovery_pin_is_still_referenced(
-    const struct asteriskd_state_document *state,
-    size_t pin_index) {
-    const struct asteriskd_recovery_record *pin = &state->recovery.records[pin_index];
-    if (pin->kind != ASTERISKD_RECOVERY_BPF_PIN ||
-        pin->resource.bpf_pin.pin_id != ASTERISKD_PIN_HOTSPOT_RECOVERY) return false;
-    for (size_t index = pin_index + 1U; index < state->recovery.record_count; ++index) {
-        const struct asteriskd_recovery_record *record = &state->recovery.records[index];
-        if (record->kind == ASTERISKD_RECOVERY_TC_FILTER &&
-            record->resource.tc_filter.ownership == ASTERISKD_TC_OWNERSHIP_FOREIGN_SNAPSHOT &&
-            record->resource.tc_filter.recovery_pin_record_id == pin->record_id) return true;
-    }
-    return false;
-}
-
 static int recover_record_at(
     struct asteriskd_state_store *store,
     struct asteriskd_state_document *state,
@@ -2619,7 +2565,6 @@ static int recover_record_at(
     void *context,
     char *error,
     size_t error_size) {
-    if (recovery_pin_is_still_referenced(state, index)) return ASTERISKD_WAL_INCOMPLETE;
     const struct asteriskd_recovery_record *record = &state->recovery.records[index];
     enum asteriskd_wal_resource_state resource_state = ASTERISKD_WAL_RESOURCE_AMBIGUOUS;
     if (backend->probe_recovery(context, record, &resource_state, error, error_size) != 0 ||

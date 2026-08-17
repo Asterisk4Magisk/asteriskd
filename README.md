@@ -120,6 +120,13 @@ parent-directory fsync. Cleanup signals a persisted PID only after the complete
 `/proc` identity (PID/PGID/start ticks/executable device+inode/full argv)
 matches. PID-only or substring matching is forbidden.
 
+The pre-2.0 Android hotspot compatibility cleanup is the deliberate exception:
+for configured hotspot interface selectors, startup removes the trusted
+`prog_offload_schedcls_tether_` IPv6 filter with the legacy `tc` command and
+does not journal or restore that Android-owned filter. Version-2 state records
+from the removed foreign-filter design are accepted only for one-way migration
+and are discarded; obsolete app-owned recovery pins are cleaned as residue.
+
 `start` uses the latest published configuration. Before launching the core it
 cleans daemon-owned residue from a previous interrupted run using the durable
 journal; it never restores an older application configuration. Foreign owner or
