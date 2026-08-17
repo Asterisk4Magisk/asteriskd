@@ -45,6 +45,45 @@ static void set_error(char *error, size_t error_size, const char *format, ...) {
     va_end(arguments);
 }
 
+static const char *core_start_failure_stage_name(
+    enum asteriskd_core_start_failure_stage stage) {
+    switch (stage) {
+        case ASTERISKD_CORE_START_FAILURE_PROCESS_SPEC: return "process-spec";
+        case ASTERISKD_CORE_START_FAILURE_BACKEND_INIT: return "backend-init";
+        case ASTERISKD_CORE_START_FAILURE_READINESS_PREFLIGHT: return "readiness-preflight";
+        case ASTERISKD_CORE_START_FAILURE_SPAWN: return "spawn";
+        case ASTERISKD_CORE_START_FAILURE_CLOCK: return "clock";
+        case ASTERISKD_CORE_START_FAILURE_SETUP_WAIT: return "setup-wait";
+        case ASTERISKD_CORE_START_FAILURE_SETUP_RESULT: return "setup-result";
+        case ASTERISKD_CORE_START_FAILURE_IDENTITY: return "identity";
+        default: return NULL;
+    }
+}
+
+int asteriskd_core_start_diagnostic_format(
+    const struct asteriskd_core_start_diagnostic *diagnostic,
+    char *output,
+    size_t output_size) {
+    if (diagnostic == NULL || output == NULL || output_size == 0U ||
+        diagnostic->setup_error_number < 0 || diagnostic->detail == NULL ||
+        strchr(diagnostic->detail, '\n') != NULL || strchr(diagnostic->detail, '\r') != NULL) {
+        return ASTERISKD_LOG_INVALID;
+    }
+    const char *stage = core_start_failure_stage_name(diagnostic->stage);
+    if (stage == NULL) return ASTERISKD_LOG_INVALID;
+    int count = snprintf(output, output_size,
+        "core start failed: stage=%s setupComplete=%d setupFatal=%d "
+        "setupErrno=%d reaped=%d detail=%s",
+        stage,
+        diagnostic->setup_complete ? 1 : 0,
+        diagnostic->setup_fatal ? 1 : 0,
+        diagnostic->setup_error_number,
+        diagnostic->reaped ? 1 : 0,
+        diagnostic->detail);
+    return count >= 0 && (size_t)count < output_size
+        ? ASTERISKD_LOG_OK : ASTERISKD_LOG_INVALID;
+}
+
 struct log_builder {
     char *bytes;
     size_t length;

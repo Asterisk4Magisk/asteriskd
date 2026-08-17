@@ -2212,6 +2212,29 @@ enum asteriskd_log_stream {
     ASTERISKD_LOG_STREAM_COUNT,
 };
 
+enum asteriskd_core_start_failure_stage {
+    ASTERISKD_CORE_START_FAILURE_PROCESS_SPEC = 0,
+    ASTERISKD_CORE_START_FAILURE_BACKEND_INIT = 1,
+    ASTERISKD_CORE_START_FAILURE_READINESS_PREFLIGHT = 2,
+    ASTERISKD_CORE_START_FAILURE_SPAWN = 3,
+    ASTERISKD_CORE_START_FAILURE_CLOCK = 4,
+    ASTERISKD_CORE_START_FAILURE_SETUP_WAIT = 5,
+    ASTERISKD_CORE_START_FAILURE_SETUP_RESULT = 6,
+    ASTERISKD_CORE_START_FAILURE_IDENTITY = 7,
+};
+
+struct asteriskd_core_start_diagnostic {
+    enum asteriskd_core_start_failure_stage stage;
+    bool setup_complete;
+    bool setup_fatal;
+    int setup_error_number;
+    bool reaped;
+    const char *detail;
+};
+
+int asteriskd_core_start_diagnostic_format(
+    const struct asteriskd_core_start_diagnostic *, char *, size_t);
+
 struct asteriskd_local_time {
     int year;
     int month;

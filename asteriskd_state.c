@@ -398,6 +398,9 @@ int asteriskd_state_set_child(
     if (child->role == ASTERISKD_CHILD_CORE) {
         document->children.core = *child;
         document->children.core_present = true;
+        if (document->mode == ASTERISKD_MODE_EBPF) {
+            document->recovery.core_owned_ebpf_boundary = true;
+        }
     } else {
         document->children.helper = *child;
         document->children.helper_present = true;
@@ -413,6 +416,9 @@ int asteriskd_state_clear_child(
     if (role == ASTERISKD_CHILD_CORE) {
         memset(&document->children.core, 0, sizeof(document->children.core));
         document->children.core_present = false;
+        if (document->mode == ASTERISKD_MODE_EBPF) {
+            document->recovery.core_owned_ebpf_boundary = false;
+        }
     } else {
         memset(&document->children.helper, 0, sizeof(document->children.helper));
         document->children.helper_present = false;

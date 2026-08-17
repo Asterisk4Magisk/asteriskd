@@ -1769,27 +1769,77 @@ static bool system_core_setup_done(void *opaque) {
     return system->core_setup.complete || system->core_setup.fatal || system->core_reaped;
 }
 
+static int system_core_start_failed(
+    struct asteriskd_system_supervisor *system,
+    enum asteriskd_core_start_failure_stage stage,
+    const char *detail) {
+    struct asteriskd_core_start_diagnostic diagnostic = {
+        .stage = stage,
+        .setup_complete = system->core_setup.complete,
+        .setup_fatal = system->core_setup.fatal,
+        .setup_error_number = system->core_setup.fatal_error_number,
+        .reaped = system->core_reaped,
+        .detail = detail,
+    };
+    char message[512U];
+    if (asteriskd_core_start_diagnostic_format(
+            &diagnostic, message, sizeof(message)) == ASTERISKD_LOG_OK) {
+        int log_result = asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
+            ASTERISKD_COMPONENT_RUNTIME, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+        if (log_result != ASTERISKD_LOG_OK) {
+            (void)fprintf(stderr, "%s structuredLogResult=%d\n", message, log_result);
+            (void)fflush(stderr);
+        }
+    } else {
+        (void)fprintf(stderr,
+            "core start failed: stage=diagnostic-format setupComplete=%d setupFatal=%d "
+            "setupErrno=%d reaped=%d detail=formatting-failed\n",
+            system->core_setup.complete ? 1 : 0,
+            system->core_setup.fatal ? 1 : 0,
+            system->core_setup.fatal_error_number,
+            system->core_reaped ? 1 : 0);
+        (void)fflush(stderr);
+    }
+    return -1;
+}
+
 static int system_effect_start_core(
     void *opaque, struct asteriskd_child_identity *identity) {
     struct asteriskd_system_supervisor *system = opaque;
-    char error[256U];
+    char error[256U] = {0};
     if (!system->core_spec_ready && asteriskd_core_process_spec(
             &system->loaded_config.config, (const char *const *)environ,
-            &system->core_spec, error, sizeof(error)) != 0) return -1;
+            &system->core_spec, error, sizeof(error)) != 0) {
+        return system_core_start_failed(system,
+            ASTERISKD_CORE_START_FAILURE_PROCESS_SPEC,
+            error[0] == '\0' ? "process specification failed" : error);
+    }
     system->core_spec_ready = true;
     if (asteriskd_system_process_backends_init(&system->process_context,
             &system->core_spec, NULL, &system->readiness_backend,
-            &system->stop_backend) != 0 ||
-        asteriskd_readiness_preflight(&system->loaded_config.config,
-            ASTERISKD_CHILD_CORE, &system->readiness_backend) != 0) return -1;
+            &system->stop_backend) != 0) {
+        return system_core_start_failed(system,
+            ASTERISKD_CORE_START_FAILURE_BACKEND_INIT,
+            "process backend initialization failed");
+    }
+    if (asteriskd_readiness_preflight(&system->loaded_config.config,
+            ASTERISKD_CHILD_CORE, &system->readiness_backend) != 0) {
+        return system_core_start_failed(system,
+            ASTERISKD_CORE_START_FAILURE_READINESS_PREFLIGHT,
+            "readiness preflight failed");
+    }
     if (asteriskd_process_spawn_system(
-            &system->core_spec, &system->core_process, error, sizeof(error)) != 0) return -1;
+            &system->core_spec, &system->core_process, error, sizeof(error)) != 0) {
+        return system_core_start_failed(system, ASTERISKD_CORE_START_FAILURE_SPAWN,
+            error[0] == '\0' ? "process spawn failed" : error);
+    }
     system->core_spawned = true;
     asteriskd_child_setup_stream_init(&system->core_setup);
     int64_t now = 0;
     if (system_runtime_clock(system, &now) != 0 ||
         (uint64_t)now > UINT64_MAX - system->loaded_config.config.readiness_timeout_milliseconds) {
-        return -1;
+        return system_core_start_failed(system, ASTERISKD_CORE_START_FAILURE_CLOCK,
+            "setup deadline clock failed");
     }
     struct asteriskd_deadline deadline = {
         .armed = true,
@@ -1798,15 +1848,24 @@ static int system_effect_start_core(
     };
     int pumped = system_pump_condition(
         system, &deadline, system_core_setup_done);
-    if (pumped != 0 || !system->core_setup.complete || system->core_setup.fatal ||
-        system->core_reaped) return -1;
+    if (pumped != 0) {
+        return system_core_start_failed(system, ASTERISKD_CORE_START_FAILURE_SETUP_WAIT,
+            "setup status wait failed");
+    }
+    if (!system->core_setup.complete || system->core_setup.fatal || system->core_reaped) {
+        return system_core_start_failed(system, ASTERISKD_CORE_START_FAILURE_SETUP_RESULT,
+            "child setup failed");
+    }
     enum asteriskd_child_type type = system->loaded_config.config.core_type == ASTERISKD_CORE_XRAY
         ? ASTERISKD_CHILD_TYPE_XRAY :
         system->loaded_config.config.core_type == ASTERISKD_CORE_SING_BOX
             ? ASTERISKD_CHILD_TYPE_SING_BOX : ASTERISKD_CHILD_TYPE_MIHOMO;
     if (asteriskd_process_identity_read(asteriskd_system_process_identity_backend(),
             system->core_process.pid, ASTERISKD_CHILD_CORE, type, &system->core_spec,
-            &system->core_identity, error, sizeof(error)) != 0) return -1;
+            &system->core_identity, error, sizeof(error)) != 0) {
+        return system_core_start_failed(system, ASTERISKD_CORE_START_FAILURE_IDENTITY,
+            error[0] == '\0' ? "process identity verification failed" : error);
+    }
     system->core_identity_ready = true;
     *identity = system->core_identity;
     return 0;
