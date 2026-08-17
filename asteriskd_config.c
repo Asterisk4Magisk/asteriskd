@@ -1414,7 +1414,6 @@ static int validate_loaded_paths(const struct asteriskd_config *config, int runt
         result = ASTERISKD_CONFIG_INVALID;
     }
     if (directory_fd >= 0) close(directory_fd);
-    if (result == 0) result = validate_regular_path(config->core_executable_path, true, false, true, false, false);
     if (result == 0) result = validate_regular_path(config->core_config_path, true, false, false, false, false);
     if (result == 0) result = validate_regular_path(config->state_path, true, true, false, true, true);
     if (result == 0) result = validate_regular_path(config->log_path, false, true, false, true, true);
