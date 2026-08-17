@@ -181,7 +181,7 @@ int asteriskd_platform_capability_ensure(
     if (found <= 0) {
         capability_error(error, error_size, found < 0 ?
             "platform capability discovery failed" : "platform capability tool not found");
-        return ASTERISKD_CONFIG_IO;
+        return 0;
     }
     result->tool_found = true;
     for (size_t index = 0U; index < sizeof(capability_rules) / sizeof(capability_rules[0]); ++index) {
@@ -202,7 +202,7 @@ int asteriskd_platform_capability_ensure(
             result->partial_application = result->applied_rule_count != 0U;
             capability_error(error, error_size, result->partial_application ?
                 "platform capability partially applied" : "platform capability application failed");
-            return ASTERISKD_CONFIG_IO;
+            return 0;
         }
         ++result->applied_rule_count;
     }

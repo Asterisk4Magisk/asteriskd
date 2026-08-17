@@ -17,10 +17,8 @@
 #include <string.h>
 
 #if defined(__linux__) || defined(__ANDROID__)
-#include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
@@ -55,11 +53,6 @@ static const char *const control_failure_names[] = {
 static const char *const control_category_names[] = {
     "tproxy", "routing", "dns", "fake-dns", "local-bypass", "hotspot", "tc", "bpf", "ipv6-guard",
 };
-static const char *const recovery_result_names[] = {
-    "clean", "recovered", "recovery_required", "already_running",
-    "permission_denied", "internal_error",
-};
-
 static const unsigned char control_abstract_name[] = "\0asteriskd.control";
 
 static size_t control_bounded_length(const char *, size_t);
@@ -220,26 +213,11 @@ enum asteriskd_control_listener_result asteriskd_control_listener_open(int *out)
 #endif
 }
 
-static bool control_sync_backend_complete(const struct asteriskd_sync_backend *backend) {
-    return backend != NULL && backend->open_root != NULL &&
-        backend->openat_fd != NULL && backend->fstat_fd != NULL &&
-        backend->fsync_fd != NULL && backend->close_fd != NULL;
-}
-
-static bool control_sync_path_valid(
-    const char *path,
-    enum asteriskd_sync_target target,
-    size_t *length) {
-    if (path == NULL || length == NULL ||
-        (target != ASTERISKD_SYNC_FILE && target != ASTERISKD_SYNC_DIRECTORY)) return false;
+static bool control_cli_config_path_valid(const char *path, size_t *length) {
+    if (path == NULL || length == NULL) return false;
     size_t size = control_bounded_length(path, ASTERISKD_MAX_PATH);
     if (size == 0U || size >= ASTERISKD_MAX_PATH || path[0] != '/' ||
-        (size > 1U && path[size - 1U] == '/')) return false;
-    if (size == 1U) {
-        if (target != ASTERISKD_SYNC_DIRECTORY) return false;
-        *length = size;
-        return true;
-    }
+        size == 1U || path[size - 1U] == '/') return false;
     size_t start = 1U;
     while (start < size) {
         size_t end = start;
@@ -278,191 +256,25 @@ int asteriskd_cli_parse(
         return 0;
     }
     if (argc != 4 || argv[2] == NULL || argv[3] == NULL) goto invalid;
-    enum asteriskd_sync_target path_target;
-    bool config_path = false;
     if (strcmp(argv[1], "start") == 0 && strcmp(argv[2], "--config") == 0) {
         invocation->command = ASTERISKD_CLI_START;
-        path_target = ASTERISKD_SYNC_FILE;
-        config_path = true;
     } else if (strcmp(argv[1], "monitor") == 0 && strcmp(argv[2], "--config") == 0) {
         invocation->command = ASTERISKD_CLI_MONITOR;
-        path_target = ASTERISKD_SYNC_FILE;
-        config_path = true;
-    } else if (strcmp(argv[1], "recover") == 0 && strcmp(argv[2], "--config") == 0) {
-        invocation->command = ASTERISKD_CLI_RECOVER;
-        path_target = ASTERISKD_SYNC_FILE;
-        config_path = true;
-    } else if (strcmp(argv[1], "sync") == 0 && strcmp(argv[2], "--file") == 0) {
-        invocation->command = ASTERISKD_CLI_SYNC;
-        path_target = ASTERISKD_SYNC_FILE;
-    } else if (strcmp(argv[1], "sync") == 0 && strcmp(argv[2], "--directory") == 0) {
-        invocation->command = ASTERISKD_CLI_SYNC;
-        path_target = ASTERISKD_SYNC_DIRECTORY;
     } else {
         goto invalid;
     }
     size_t path_length = 0U;
-    if (!control_sync_path_valid(argv[3], path_target, &path_length)) goto invalid;
-    if (config_path) {
-        static const char leaf[] = "asteriskd.json";
-        if (path_length <= sizeof(leaf) ||
-            memcmp(argv[3] + path_length - (sizeof(leaf) - 1U), leaf, sizeof(leaf)) != 0 ||
-            argv[3][path_length - sizeof(leaf)] != '/') goto invalid;
-    }
+    if (!control_cli_config_path_valid(argv[3], &path_length)) goto invalid;
+    static const char leaf[] = "asteriskd.json";
+    if (path_length <= sizeof(leaf) ||
+        memcmp(argv[3] + path_length - (sizeof(leaf) - 1U), leaf, sizeof(leaf)) != 0 ||
+        argv[3][path_length - sizeof(leaf)] != '/') goto invalid;
     memcpy(invocation->path, argv[3], path_length + 1U);
-    invocation->sync_target = path_target;
     return 0;
 invalid:
     memset(invocation, 0, sizeof(*invocation));
     return -1;
 }
-
-static int control_sync_close(
-    const struct asteriskd_sync_backend *backend,
-    void *context,
-    int *fd) {
-    if (fd == NULL || *fd < 0) return 0;
-    int closing = *fd;
-    *fd = -1;
-    return backend->close_fd(context, closing);
-}
-
-enum asteriskd_sync_result asteriskd_sync_path_with_backend(
-    const char *path,
-    enum asteriskd_sync_target target,
-    const struct asteriskd_sync_backend *backend,
-    void *context) {
-    size_t path_length = 0U;
-    if (!control_sync_backend_complete(backend) ||
-        !control_sync_path_valid(path, target, &path_length)) return ASTERISKD_SYNC_INVALID;
-    const uint32_t directory_flags = ASTERISKD_SYNC_OPEN_READ |
-        ASTERISKD_SYNC_OPEN_DIRECTORY | ASTERISKD_SYNC_OPEN_NOFOLLOW |
-        ASTERISKD_SYNC_OPEN_CLOEXEC | ASTERISKD_SYNC_OPEN_NONBLOCK;
-    const uint32_t file_flags = ASTERISKD_SYNC_OPEN_WRITE |
-        ASTERISKD_SYNC_OPEN_NOFOLLOW | ASTERISKD_SYNC_OPEN_CLOEXEC |
-        ASTERISKD_SYNC_OPEN_NONBLOCK;
-    int current = -1;
-    if (backend->open_root(context, directory_flags, &current) != 0 || current < 0) {
-        (void)control_sync_close(backend, context, &current);
-        return ASTERISKD_SYNC_IO;
-    }
-    enum asteriskd_file_kind kind = ASTERISKD_FILE_OTHER;
-    if (backend->fstat_fd(context, current, &kind) != 0 ||
-        kind != ASTERISKD_FILE_DIRECTORY) {
-        (void)control_sync_close(backend, context, &current);
-        return ASTERISKD_SYNC_IO;
-    }
-    if (path_length > 1U) {
-        size_t start = 1U;
-        while (start < path_length) {
-            size_t end = start;
-            while (end < path_length && path[end] != '/') ++end;
-            bool final = end == path_length;
-            char component[256];
-            size_t component_length = end - start;
-            memcpy(component, path + start, component_length);
-            component[component_length] = '\0';
-            uint32_t flags = final && target == ASTERISKD_SYNC_FILE
-                ? file_flags : directory_flags;
-            int next = -1;
-            if (backend->openat_fd(context, current, component, flags, &next) != 0 || next < 0) {
-                (void)control_sync_close(backend, context, &next);
-                (void)control_sync_close(backend, context, &current);
-                return ASTERISKD_SYNC_IO;
-            }
-            kind = ASTERISKD_FILE_OTHER;
-            enum asteriskd_file_kind expected = final && target == ASTERISKD_SYNC_FILE
-                ? ASTERISKD_FILE_REGULAR : ASTERISKD_FILE_DIRECTORY;
-            if (backend->fstat_fd(context, next, &kind) != 0 || kind != expected) {
-                (void)control_sync_close(backend, context, &next);
-                (void)control_sync_close(backend, context, &current);
-                return ASTERISKD_SYNC_IO;
-            }
-            if (control_sync_close(backend, context, &current) != 0) {
-                (void)control_sync_close(backend, context, &next);
-                return ASTERISKD_SYNC_IO;
-            }
-            current = next;
-            start = end + 1U;
-        }
-    }
-    bool failed = backend->fsync_fd(context, current) != 0;
-    if (control_sync_close(backend, context, &current) != 0) failed = true;
-    return failed ? ASTERISKD_SYNC_IO : ASTERISKD_SYNC_OK;
-}
-
-#if defined(__linux__) || defined(__ANDROID__)
-static int control_system_sync_flags(uint32_t flags) {
-    int native = (flags & ASTERISKD_SYNC_OPEN_WRITE) != 0U ? O_WRONLY : O_RDONLY;
-    if ((flags & ASTERISKD_SYNC_OPEN_DIRECTORY) != 0U) native |= O_DIRECTORY;
-    if ((flags & ASTERISKD_SYNC_OPEN_NOFOLLOW) != 0U) native |= O_NOFOLLOW;
-    if ((flags & ASTERISKD_SYNC_OPEN_CLOEXEC) != 0U) native |= O_CLOEXEC;
-    if ((flags & ASTERISKD_SYNC_OPEN_NONBLOCK) != 0U) native |= O_NONBLOCK;
-    return native;
-}
-
-static int control_system_sync_open_root(void *context, uint32_t flags, int *fd) {
-    (void)context;
-    int opened = open("/", control_system_sync_flags(flags));
-    if (fd != NULL) *fd = opened;
-    return opened < 0 ? -1 : 0;
-}
-
-static int control_system_sync_openat(
-    void *context,
-    int parent,
-    const char *name,
-    uint32_t flags,
-    int *fd) {
-    (void)context;
-    int opened = openat(parent, name, control_system_sync_flags(flags));
-    if (fd != NULL) *fd = opened;
-    return opened < 0 ? -1 : 0;
-}
-
-static int control_system_sync_fstat(
-    void *context,
-    int fd,
-    enum asteriskd_file_kind *kind) {
-    (void)context;
-    struct stat metadata;
-    if (fstat(fd, &metadata) != 0 || kind == NULL) return -1;
-    if (S_ISREG(metadata.st_mode)) *kind = ASTERISKD_FILE_REGULAR;
-    else if (S_ISDIR(metadata.st_mode)) *kind = ASTERISKD_FILE_DIRECTORY;
-    else if (S_ISFIFO(metadata.st_mode)) *kind = ASTERISKD_FILE_FIFO;
-    else if (S_ISCHR(metadata.st_mode) || S_ISBLK(metadata.st_mode)) *kind = ASTERISKD_FILE_DEVICE;
-    else if (S_ISLNK(metadata.st_mode)) *kind = ASTERISKD_FILE_SYMLINK;
-    else *kind = ASTERISKD_FILE_OTHER;
-    return 0;
-}
-
-static int control_system_sync_fsync(void *context, int fd) {
-    (void)context;
-    return fsync(fd);
-}
-
-static const struct asteriskd_sync_backend control_system_sync_backend = {
-    .open_root = control_system_sync_open_root,
-    .openat_fd = control_system_sync_openat,
-    .fstat_fd = control_system_sync_fstat,
-    .fsync_fd = control_system_sync_fsync,
-    .close_fd = control_system_close,
-};
-#endif
-
-enum asteriskd_sync_result asteriskd_sync_path(
-    const char *path,
-    enum asteriskd_sync_target target) {
-#if defined(__linux__) || defined(__ANDROID__)
-    return asteriskd_sync_path_with_backend(
-        path, target, &control_system_sync_backend, NULL);
-#else
-    (void)path;
-    (void)target;
-    return ASTERISKD_SYNC_IO;
-#endif
-}
-
 
 static size_t control_bounded_length(const char *value, size_t capacity) {
     if (value == NULL) return capacity;
@@ -696,110 +508,6 @@ int asteriskd_control_result_set_message(
         &result->message, &result->message_length, message, message_length) != 0) return -1;
     result->has_message = true;
     return 0;
-}
-
-void asteriskd_recovery_result_destroy(struct asteriskd_recovery_result *result) {
-    if (result == NULL) return;
-    free(result->message);
-    memset(result, 0, sizeof(*result));
-}
-
-int asteriskd_recovery_result_set_message(
-    struct asteriskd_recovery_result *result,
-    const char *message,
-    size_t message_length) {
-    if (result == NULL || control_copy_message(
-            &result->message, &result->message_length,
-            message, message_length) != 0) return -1;
-    result->has_message = true;
-    return 0;
-}
-
-bool asteriskd_recovery_result_valid(const struct asteriskd_recovery_result *result) {
-    if (result == NULL || result->code < 0 ||
-        result->code >= ASTERISKD_RECOVERY_RESULT_CODE_COUNT) return false;
-    if (result->has_identity) {
-        if (!control_combination_valid(result->owner, result->core_type, result->mode)) return false;
-    } else if (result->owner != 0 || result->core_type != 0 || result->mode != 0) {
-        return false;
-    }
-    if (!result->has_core_owned_ebpf_boundary && result->core_owned_ebpf_boundary) return false;
-    if (result->has_message) {
-        if (!control_message_valid(result->message, result->message_length)) return false;
-    } else if (result->message != NULL || result->message_length != 0U) {
-        return false;
-    }
-    switch (result->code) {
-        case ASTERISKD_RECOVERY_CLEAN:
-            return result->has_core_owned_ebpf_boundary &&
-                !result->core_owned_ebpf_boundary && !result->has_message;
-        case ASTERISKD_RECOVERY_RECOVERED:
-            return result->has_identity && result->has_core_owned_ebpf_boundary &&
-                !result->core_owned_ebpf_boundary && !result->has_message;
-        case ASTERISKD_RECOVERY_REQUIRED:
-            return result->has_message &&
-                (result->has_identity == result->has_core_owned_ebpf_boundary);
-        case ASTERISKD_RECOVERY_ALREADY_RUNNING:
-            return result->has_identity && !result->has_core_owned_ebpf_boundary &&
-                result->has_message;
-        case ASTERISKD_RECOVERY_PERMISSION_DENIED:
-        case ASTERISKD_RECOVERY_INTERNAL_ERROR:
-            return !result->has_identity && !result->has_core_owned_ebpf_boundary &&
-                result->has_message;
-        default:
-            return false;
-    }
-}
-
-int asteriskd_recovery_result_encode_line(
-    const struct asteriskd_recovery_result *result,
-    char *out,
-    size_t out_size,
-    size_t *out_length) {
-    if (out == NULL || out_size == 0U || !asteriskd_recovery_result_valid(result)) return -1;
-    struct control_builder builder = {.bytes = out, .capacity = out_size};
-    control_builder_raw(&builder,
-        "{\"protocolVersion\":1,\"requestId\":\"recover\",\"recoveryResult\":{\"code\":");
-    control_builder_json_string(&builder, recovery_result_names[result->code]);
-    control_builder_raw(&builder, ",\"owner\":");
-    if (result->has_identity) control_builder_json_string(&builder, control_owner_names[result->owner]);
-    else control_builder_raw(&builder, "null");
-    control_builder_raw(&builder, ",\"coreType\":");
-    if (result->has_identity) control_builder_json_string(&builder, control_core_names[result->core_type]);
-    else control_builder_raw(&builder, "null");
-    control_builder_raw(&builder, ",\"mode\":");
-    if (result->has_identity) control_builder_json_string(&builder, control_mode_names[result->mode]);
-    else control_builder_raw(&builder, "null");
-    control_builder_raw(&builder, ",\"coreOwnedEbpfBoundary\":");
-    if (result->has_core_owned_ebpf_boundary) {
-        control_builder_raw(&builder, result->core_owned_ebpf_boundary ? "true" : "false");
-    } else {
-        control_builder_raw(&builder, "null");
-    }
-    control_builder_raw(&builder, ",\"message\":");
-    if (result->has_message) {
-        control_builder_json_bytes(&builder, result->message, result->message_length);
-    } else {
-        control_builder_raw(&builder, "null");
-    }
-    control_builder_raw(&builder, "}}");
-    return control_builder_finish(&builder, out_length);
-}
-
-int asteriskd_recovery_result_exit_code(enum asteriskd_recovery_result_code code) {
-    switch (code) {
-        case ASTERISKD_RECOVERY_CLEAN:
-        case ASTERISKD_RECOVERY_RECOVERED:
-            return 0;
-        case ASTERISKD_RECOVERY_ALREADY_RUNNING:
-            return 4;
-        case ASTERISKD_RECOVERY_PERMISSION_DENIED:
-            return 77;
-        case ASTERISKD_RECOVERY_REQUIRED:
-        case ASTERISKD_RECOVERY_INTERNAL_ERROR:
-        default:
-            return 1;
-    }
 }
 
 int asteriskd_control_snapshot_copy(
@@ -2028,9 +1736,8 @@ enum asteriskd_control_client_result asteriskd_control_client_run(
 
 static bool control_cli_backend_complete(const struct asteriskd_cli_backend *backend) {
     return backend != NULL && backend->effective_uid != NULL &&
-        backend->sync_path != NULL && backend->control_client != NULL &&
+        backend->control_client != NULL &&
         backend->run_start != NULL && backend->run_monitor != NULL &&
-        backend->recovery_gate != NULL &&
         backend->write_stdout != NULL && backend->write_stderr != NULL;
 }
 
@@ -2113,28 +1820,12 @@ failed:
     return 1;
 }
 
-static int control_cli_write_recovery(
-    const struct asteriskd_cli_backend *backend,
-    void *context,
-    const struct asteriskd_recovery_result *result) {
-    char *line = malloc(ASTERISKD_CONTROL_MAX_PAYLOAD + 2U);
-    if (line == NULL) return 1;
-    size_t length = 0U;
-    int status = asteriskd_recovery_result_encode_line(
-        result, line, ASTERISKD_CONTROL_MAX_PAYLOAD + 2U, &length) == 0 &&
-        backend->write_stdout(context, line, length) == 0
-            ? asteriskd_recovery_result_exit_code(result->code) : 1;
-    free(line);
-    return status;
-}
-
 static int control_cli_usage(
     const struct asteriskd_cli_backend *backend,
     void *context) {
     static const char usage[] =
         "usage: asteriskd start|monitor --config ABSOLUTE_PATH | status | stop | shutdown | "
-        "watch [--until-running] | "
-        "sync --file|--directory ABSOLUTE_PATH | recover --config ABSOLUTE_CONFIG_PATH\n";
+        "watch [--until-running]\n";
     (void)backend->write_stderr(context, usage, sizeof(usage) - 1U);
     return 64;
 }
@@ -2172,17 +1863,6 @@ static int control_cli_run_control(
             ? "control request timed out" : "control request failed");
 }
 
-static void control_cli_make_recovery_message(
-    struct asteriskd_recovery_result *result,
-    enum asteriskd_recovery_result_code code,
-    const char *message) {
-    memset(result, 0, sizeof(*result));
-    result->code = code;
-    if (message != NULL) {
-        (void)asteriskd_recovery_result_set_message(result, message, strlen(message));
-    }
-}
-
 int asteriskd_cli_main_with_backend(
     int argc,
     const char *const *argv,
@@ -2193,20 +1873,7 @@ int asteriskd_cli_main_with_backend(
     if (asteriskd_cli_parse(argc, argv, &invocation) != 0) {
         return control_cli_usage(backend, context);
     }
-    if (invocation.command == ASTERISKD_CLI_SYNC) {
-        enum asteriskd_sync_result synced = backend->sync_path(
-            context, invocation.path, invocation.sync_target);
-        return synced == ASTERISKD_SYNC_OK ? 0 : 1;
-    }
     if (backend->effective_uid(context) != 0U) {
-        if (invocation.command == ASTERISKD_CLI_RECOVER) {
-            struct asteriskd_recovery_result denied;
-            control_cli_make_recovery_message(
-                &denied, ASTERISKD_RECOVERY_PERMISSION_DENIED, "root permission required");
-            int status = control_cli_write_recovery(backend, context, &denied);
-            asteriskd_recovery_result_destroy(&denied);
-            return status;
-        }
         const char *request_id = invocation.command == ASTERISKD_CLI_START ? "start" :
             invocation.command == ASTERISKD_CLI_MONITOR ? "monitor" :
             invocation.command == ASTERISKD_CLI_STATUS ? "status" :
@@ -2257,17 +1924,7 @@ int asteriskd_cli_main_with_backend(
         return status;
     }
 
-    struct asteriskd_recovery_result recovery;
-    memset(&recovery, 0, sizeof(recovery));
-    if (backend->recovery_gate(context, invocation.path, &recovery) != 0 ||
-        !asteriskd_recovery_result_valid(&recovery)) {
-        asteriskd_recovery_result_destroy(&recovery);
-        control_cli_make_recovery_message(
-            &recovery, ASTERISKD_RECOVERY_INTERNAL_ERROR, "recovery gate failed");
-    }
-    int status = control_cli_write_recovery(backend, context, &recovery);
-    asteriskd_recovery_result_destroy(&recovery);
-    return status;
+    return 1;
 }
 
 struct control_server_client {

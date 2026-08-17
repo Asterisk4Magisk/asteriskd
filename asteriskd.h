@@ -2002,13 +2002,10 @@ int asteriskd_runtime_supervise(
     struct asteriskd_runtime *, const struct asteriskd_config *,
     struct asteriskd_state_document *, const struct asteriskd_control_live_context *,
     const struct asteriskd_runtime_effect_backend *);
-struct asteriskd_recovery_result;
 int asteriskd_runtime_start_system(
     const char *, bool *, struct asteriskd_control_result *);
 int asteriskd_runtime_monitor_system(
     const char *, bool *, struct asteriskd_control_result *);
-int asteriskd_runtime_recover_system(
-    const char *, struct asteriskd_recovery_result *);
 
 enum asteriskd_control_backend_result {
     ASTERISKD_CONTROL_BACKEND_OK = 0,
@@ -2035,40 +2032,6 @@ enum asteriskd_control_listener_result asteriskd_control_listener_open_with_back
     int *, const struct asteriskd_control_listener_backend *, void *);
 enum asteriskd_control_listener_result asteriskd_control_listener_open(int *);
 
-enum asteriskd_sync_target {
-    ASTERISKD_SYNC_FILE,
-    ASTERISKD_SYNC_DIRECTORY,
-};
-
-enum asteriskd_sync_result {
-    ASTERISKD_SYNC_OK = 0,
-    ASTERISKD_SYNC_INVALID = 1,
-    ASTERISKD_SYNC_IO = 2,
-};
-
-enum asteriskd_sync_open_flags {
-    ASTERISKD_SYNC_OPEN_READ = 1U << 0,
-    ASTERISKD_SYNC_OPEN_WRITE = 1U << 1,
-    ASTERISKD_SYNC_OPEN_DIRECTORY = 1U << 2,
-    ASTERISKD_SYNC_OPEN_NOFOLLOW = 1U << 3,
-    ASTERISKD_SYNC_OPEN_CLOEXEC = 1U << 4,
-    ASTERISKD_SYNC_OPEN_NONBLOCK = 1U << 5,
-};
-
-struct asteriskd_sync_backend {
-    int (*open_root)(void *, uint32_t, int *);
-    int (*openat_fd)(void *, int, const char *, uint32_t, int *);
-    int (*fstat_fd)(void *, int, enum asteriskd_file_kind *);
-    int (*fsync_fd)(void *, int);
-    int (*close_fd)(void *, int);
-};
-
-enum asteriskd_sync_result asteriskd_sync_path_with_backend(
-    const char *, enum asteriskd_sync_target,
-    const struct asteriskd_sync_backend *, void *);
-enum asteriskd_sync_result asteriskd_sync_path(
-    const char *, enum asteriskd_sync_target);
-
 enum asteriskd_cli_command {
     ASTERISKD_CLI_START,
     ASTERISKD_CLI_MONITOR,
@@ -2076,57 +2039,16 @@ enum asteriskd_cli_command {
     ASTERISKD_CLI_STOP,
     ASTERISKD_CLI_SHUTDOWN,
     ASTERISKD_CLI_WATCH,
-    ASTERISKD_CLI_SYNC,
-    ASTERISKD_CLI_RECOVER,
 };
 
 struct asteriskd_cli_invocation {
     enum asteriskd_cli_command command;
-    enum asteriskd_sync_target sync_target;
     bool watch_until_running;
     char path[ASTERISKD_MAX_PATH];
 };
 
 int asteriskd_cli_parse(
     int, const char *const *, struct asteriskd_cli_invocation *);
-
-enum asteriskd_recovery_result_code {
-    ASTERISKD_RECOVERY_CLEAN,
-    ASTERISKD_RECOVERY_RECOVERED,
-    ASTERISKD_RECOVERY_REQUIRED,
-    ASTERISKD_RECOVERY_ALREADY_RUNNING,
-    ASTERISKD_RECOVERY_PERMISSION_DENIED,
-    ASTERISKD_RECOVERY_INTERNAL_ERROR,
-    ASTERISKD_RECOVERY_RESULT_CODE_COUNT,
-};
-
-struct asteriskd_recovery_result {
-    enum asteriskd_recovery_result_code code;
-    bool has_identity;
-    enum asteriskd_owner owner;
-    enum asteriskd_core_type core_type;
-    enum asteriskd_mode mode;
-    bool has_core_owned_ebpf_boundary;
-    bool core_owned_ebpf_boundary;
-    bool has_message;
-    char *message;
-    size_t message_length;
-};
-
-bool asteriskd_recovery_result_valid(const struct asteriskd_recovery_result *);
-int asteriskd_recovery_result_set_message(
-    struct asteriskd_recovery_result *, const char *, size_t);
-int asteriskd_recovery_result_encode_line(
-    const struct asteriskd_recovery_result *, char *, size_t, size_t *);
-int asteriskd_recovery_result_exit_code(enum asteriskd_recovery_result_code);
-void asteriskd_recovery_result_destroy(struct asteriskd_recovery_result *);
-int asteriskd_recovery_classify_state_with_backend(
-    const struct asteriskd_runtime_directory *,
-    const struct asteriskd_state_file_backend *, void *,
-    struct asteriskd_recovery_result *);
-int asteriskd_recovery_classify_state(
-    const struct asteriskd_runtime_directory *,
-    struct asteriskd_recovery_result *);
 
 enum asteriskd_control_connect_result {
     ASTERISKD_CONTROL_CONNECT_ERROR = -1,
@@ -2180,7 +2102,6 @@ enum asteriskd_control_client_result asteriskd_control_client_run(
 
 struct asteriskd_cli_backend {
     uint32_t (*effective_uid)(void *);
-    enum asteriskd_sync_result (*sync_path)(void *, const char *, enum asteriskd_sync_target);
     enum asteriskd_control_client_result (*control_client)(
         void *, enum asteriskd_control_method, const char *,
         asteriskd_control_line_sink, void *, struct asteriskd_control_response *);
@@ -2188,8 +2109,6 @@ struct asteriskd_cli_backend {
         void *, const char *, bool *, struct asteriskd_control_result *);
     int (*run_monitor)(
         void *, const char *, bool *, struct asteriskd_control_result *);
-    int (*recovery_gate)(
-        void *, const char *, struct asteriskd_recovery_result *);
     int (*write_stdout)(void *, const char *, size_t);
     int (*write_stderr)(void *, const char *, size_t);
 };

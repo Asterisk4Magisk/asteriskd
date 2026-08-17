@@ -345,14 +345,10 @@ static int runtime_lifecycle_acquire(void *opaque) {
     return 0;
 }
 
-static bool runtime_recovered_ebpf_boundary_state(
-    const struct asteriskd_state_document *state);
-
 static int runtime_lifecycle_recover(void *opaque) {
     struct asteriskd_runtime *runtime = opaque;
     if (runtime->effects->recover(runtime->effects->context) != 0 ||
-        (!asteriskd_state_is_canonical_stopped(runtime->state) &&
-         !runtime_recovered_ebpf_boundary_state(runtime->state))) {
+        !asteriskd_state_is_canonical_stopped(runtime->state)) {
         return ASTERISKD_CONFIG_IO;
     }
     asteriskd_state_clear_failure(runtime->state);
@@ -363,11 +359,6 @@ static int runtime_lifecycle_recover(void *opaque) {
 static int runtime_lifecycle_start_core(void *opaque) {
     struct asteriskd_runtime *runtime = opaque;
     if (runtime_set_phase(runtime, ASTERISKD_PHASE_STARTING) != 0) return ASTERISKD_CONFIG_IO;
-    if (runtime->config->mode == ASTERISKD_MODE_EBPF &&
-        !runtime->state->recovery.core_owned_ebpf_boundary) {
-        runtime->state->recovery.core_owned_ebpf_boundary = true;
-        if (runtime_save(runtime) != 0) return ASTERISKD_CONFIG_IO;
-    }
     if (!runtime->starting_event_published) {
         if (runtime_publish_event(runtime, ASTERISKD_CONTROL_EVENT_STARTING) != 0) {
             return ASTERISKD_CONFIG_IO;
@@ -505,10 +496,6 @@ static int runtime_lifecycle_stop_core(void *opaque) {
     struct asteriskd_runtime *runtime = opaque;
     if (runtime->effects->stop_core(runtime->effects->context) != 0) return ASTERISKD_CONFIG_IO;
     if (runtime_clear_child(runtime, ASTERISKD_CHILD_CORE) != 0) return ASTERISKD_CONFIG_IO;
-    if (runtime->config->mode == ASTERISKD_MODE_EBPF) {
-        runtime->state->recovery.core_owned_ebpf_boundary = false;
-        if (runtime_save(runtime) != 0) return ASTERISKD_CONFIG_IO;
-    }
     return 0;
 }
 
@@ -791,16 +778,6 @@ static int runtime_finish(struct asteriskd_runtime *runtime,
     return 1;
 }
 
-static bool runtime_recovered_ebpf_boundary_state(
-    const struct asteriskd_state_document *state) {
-    return state != NULL && state->initialized && state->phase == ASTERISKD_PHASE_FAILED &&
-        state->owner == ASTERISKD_OWNER_BOX && state->core_type == ASTERISKD_CORE_SING_BOX &&
-        state->mode == ASTERISKD_MODE_EBPF && state->recovery.core_owned_ebpf_boundary &&
-        !state->children.core_present && !state->children.helper_present &&
-        !state->matcher.configured && !state->matcher.active && !state->rules.active &&
-        state->rules.generation == 0U && state->rules.categories == 0U;
-}
-
 int asteriskd_runtime_prepare_start_state(
     struct asteriskd_state_store *store,
     struct asteriskd_state_document *state,
@@ -815,13 +792,13 @@ int asteriskd_runtime_prepare_start_state(
     }
     if (state->owner == config->owner && state->core_type == config->core_type &&
         state->mode == config->mode) return ASTERISKD_STATE_OK;
-    if (state->owner != config->owner || state->core_type != config->core_type ||
-        !asteriskd_state_is_canonical_stopped(state)) {
+    if (state->owner != config->owner || state->core_type != config->core_type) {
         if (error != NULL && error_size != 0U) {
             (void)snprintf(error, error_size, "%s", "start state identity mismatch");
         }
         return ASTERISKD_STATE_INCOMPATIBLE;
     }
+    if (!asteriskd_state_is_canonical_stopped(state)) return ASTERISKD_STATE_OK;
 
     struct asteriskd_state_document replacement;
     int initialized = asteriskd_state_document_init(
@@ -849,7 +826,8 @@ int asteriskd_runtime_supervise(struct asteriskd_runtime *runtime,
         live->supervisor_pid <= 0 || runtime->dispatching || runtime->supervising ||
         !state->initialized ||
         state->owner != config->owner ||
-        state->core_type != config->core_type || state->mode != config->mode ||
+        state->core_type != config->core_type ||
+        (state->mode != config->mode && asteriskd_state_is_canonical_stopped(state)) ||
         !runtime_effects_valid(effects, config)) return ASTERISKD_CONFIG_INVALID;
     runtime->config = config;
     runtime->state = state;
@@ -1011,10 +989,8 @@ static bool runtime_event_is_final(enum asteriskd_control_event_type type) {
 }
 
 static bool action_should_cancel(
-    bool stop_requested, bool recovery_cancelled,
-    bool cleanup_in_progress, bool recovery_only) {
-    return (recovery_only && recovery_cancelled) ||
-        (!cleanup_in_progress && stop_requested);
+    bool stop_requested, bool cleanup_in_progress) {
+    return !cleanup_in_progress && stop_requested;
 }
 
 #if defined(ASTERISKD_TESTING)
@@ -1023,10 +999,8 @@ bool asteriskd_test_runtime_event_is_final(enum asteriskd_control_event_type typ
 }
 
 bool asteriskd_test_action_should_cancel(
-    bool stop_requested, bool recovery_cancelled,
-    bool cleanup_in_progress, bool recovery_only) {
-    return action_should_cancel(
-        stop_requested, recovery_cancelled, cleanup_in_progress, recovery_only);
+    bool stop_requested, bool cleanup_in_progress) {
+    return action_should_cancel(stop_requested, cleanup_in_progress);
 }
 #endif
 
@@ -1163,7 +1137,6 @@ struct asteriskd_system_supervisor {
     int readiness_result;
     struct asteriskd_stop_coordinator stop_coordinator;
     int stop_result;
-    bool ebpf_graceful_cleanup_verified;
     struct asteriskd_network_runtime network;
     bool network_opened;
     struct asteriskd_typed_wal_sink network_wal_sink;
@@ -1175,9 +1148,6 @@ struct asteriskd_system_supervisor {
     struct asteriskd_address_set local_ipv4_snapshot;
     struct asteriskd_address_set local_ipv6_snapshot;
     bool has_global_ipv6_address;
-    bool recovery_only;
-    bool recovery_cancelled;
-    bool recovery_kill_escalated;
     bool cleanup_in_progress;
 };
 
@@ -1745,18 +1715,16 @@ static int system_runtime_snapshot(
 
 static int system_runtime_request_stop(void *opaque) {
     struct asteriskd_system_supervisor *system = opaque;
-    if (!system->service_running && !system->recovery_only) return 1;
+    if (!system->service_running) return 1;
     system->stop_requested = true;
-    if (system->recovery_only) system->recovery_cancelled = true;
     return 0;
 }
 
 static int system_runtime_request_shutdown(void *opaque) {
     struct asteriskd_system_supervisor *system = opaque;
     system->shutdown_requested = true;
-    if (system->service_running || system->recovery_only) {
+    if (system->service_running) {
         system->stop_requested = true;
-        if (system->recovery_only) system->recovery_cancelled = true;
     }
     return 0;
 }
@@ -1764,11 +1732,6 @@ static int system_runtime_request_shutdown(void *opaque) {
 static int system_accept_pump_delta(struct asteriskd_system_supervisor *system,
     struct asteriskd_runtime_delta *delta) {
     if (system == NULL || delta == NULL) return -1;
-    if (system->recovery_only && system->recovery_cancelled &&
-        (delta->flags & ASTERISKD_DELTA_STOP_REQUESTED) != 0U) {
-        delta->flags &= ~ASTERISKD_DELTA_STOP_REQUESTED;
-        delta->stop_reason = ASTERISKD_LIFECYCLE_REASON_NONE;
-    }
     return delta->flags == 0U ? 0 :
         asteriskd_runtime_accept_delta(system->runtime, delta);
 }
@@ -1797,11 +1760,18 @@ static int system_effect_event(void *opaque, enum asteriskd_control_event_type t
         runtime_event_is_final(type), (uint64_t)now);
 }
 
-static int system_recover_state(struct asteriskd_system_supervisor *system);
+static int system_cleanup_start_state(struct asteriskd_system_supervisor *system);
 static int system_effect_stop_core(void *opaque);
+static void system_runtime_reset_cycle(struct asteriskd_system_supervisor *system);
 
 static int system_effect_recover(void *opaque) {
-    return system_recover_state(opaque);
+    struct asteriskd_system_supervisor *system = opaque;
+    if (system_cleanup_start_state(system) != 0) return -1;
+    system_runtime_reset_cycle(system);
+    char error[128U];
+    return asteriskd_runtime_prepare_start_state(
+        &system->store, &system->state, &system->loaded_config.config,
+        error, sizeof(error)) == ASTERISKD_STATE_OK ? 0 : -1;
 }
 
 static bool system_core_setup_done(void *opaque) {
@@ -1859,7 +1829,7 @@ static bool system_core_readiness_done(void *opaque) {
         system->readiness_result = ASTERISKD_READINESS_IO;
         return true;
     }
-    bool stop = system->recovery_cancelled || atomic_load_explicit(
+    bool stop = atomic_load_explicit(
         &system->runtime->lifecycle.stop_was_requested, memory_order_acquire);
     system->readiness_result = asteriskd_readiness_poll(
         &system->loaded_config.config, &system->readiness, &system->core_identity,
@@ -1947,7 +1917,7 @@ static bool system_helper_readiness_done(void *opaque) {
         system->helper_readiness_result = ASTERISKD_READINESS_IO;
         return true;
     }
-    bool stop = system->recovery_cancelled || atomic_load_explicit(
+    bool stop = atomic_load_explicit(
         &system->runtime->lifecycle.stop_was_requested, memory_order_acquire);
     system->helper_readiness_result = asteriskd_readiness_poll(
         &system->loaded_config.config, &system->helper_readiness, &system->helper_identity,
@@ -2200,8 +2170,7 @@ static int system_action_run_spec(struct asteriskd_system_supervisor *system,
     failure_phase = "cancelled";
     if (action_should_cancel(atomic_load_explicit(
             &system->runtime->lifecycle.stop_was_requested,
-            memory_order_acquire), system->recovery_cancelled,
-            system->cleanup_in_progress, system->recovery_only)) {
+            memory_order_acquire), system->cleanup_in_progress)) {
         goto failed;
     }
     failure_phase = "exit-wait";
@@ -2529,8 +2498,19 @@ static int system_effect_capability(void *opaque) {
     };
     struct asteriskd_platform_capability_result result;
     char error[256U];
-    return asteriskd_platform_capability_ensure(
+    int prepared = asteriskd_platform_capability_ensure(
         &system->loaded_config.config, &backend, &result, error, sizeof(error));
+    if (prepared != 0) return prepared;
+    if (error[0] != '\0') {
+        char message[320U];
+        int written = snprintf(message, sizeof(message),
+            "optional SELinux policy setup incomplete; continuing: %s", error);
+        if (written > 0 && (size_t)written < sizeof(message)) {
+            (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_WARNING,
+                ASTERISKD_COMPONENT_RUNTIME, ASTERISKD_LOG_EVENT_CAPABILITY_ADJUSTED, message);
+        }
+    }
+    return 0;
 }
 
 static const char *system_xtables_path(enum asteriskd_ip_family family) {
@@ -3763,8 +3743,7 @@ static bool system_foreign_tc_netlink_done(void *opaque) {
     struct asteriskd_system_supervisor *system = opaque;
     if (action_should_cancel(atomic_load_explicit(
             &system->runtime->lifecycle.stop_was_requested, memory_order_acquire),
-            system->recovery_cancelled, system->cleanup_in_progress,
-            system->recovery_only)) {
+            system->cleanup_in_progress)) {
         system->foreign_tc_netlink_failed = true;
         system->foreign_tc_netlink_done = true;
     }
@@ -6422,7 +6401,6 @@ static int system_recovery_signal_if_matching(
 }
 
 static int system_recovery_stop_children(struct asteriskd_system_supervisor *system) {
-    system->recovery_kill_escalated = false;
     const struct asteriskd_child_identity *core = system->state.children.core_present
         ? &system->state.children.core : NULL;
     const struct asteriskd_child_identity *helper = system->state.children.helper_present
@@ -6458,7 +6436,6 @@ static int system_recovery_stop_children(struct asteriskd_system_supervisor *sys
     }
     if (wait.unreadable) return -1;
     if (!system_recovery_children_gone(&wait)) {
-        system->recovery_kill_escalated = true;
         if (system_recovery_signal_if_matching(helper,
                 helper == NULL ? NULL : &helper_spec, SIGKILL) != 0 ||
             system_recovery_signal_if_matching(core,
@@ -6483,84 +6460,6 @@ static bool system_recovery_used_dummy_ipv6(
                 ASTERISKD_INTERFACE_IPV6_DUMMY) return true;
     }
     return false;
-}
-
-static int system_recovery_publish_event(
-    struct asteriskd_system_supervisor *system,
-    enum asteriskd_control_event_type type) {
-    struct asteriskd_control_snapshot snapshot;
-    memset(&snapshot, 0, sizeof(snapshot));
-    if (asteriskd_control_snapshot_from_state(
-            &system->state, &system->live, &snapshot) != 0) return -1;
-    int result = system_effect_event(system, type, &snapshot,
-        snapshot.has_error ? &snapshot.error : NULL, snapshot.has_error);
-    asteriskd_control_snapshot_destroy(&snapshot);
-    return result;
-}
-
-static int system_recover_ebpf_boundary(
-    struct asteriskd_system_supervisor *system) {
-    if (asteriskd_state_set_phase(&system->state, ASTERISKD_PHASE_STARTING) !=
-            ASTERISKD_STATE_OK ||
-        system_effect_save(system, &system->state) != 0 ||
-        system_recovery_publish_event(system, ASTERISKD_CONTROL_EVENT_STARTING) != 0) return -1;
-    struct asteriskd_child_identity identity;
-    memset(&identity, 0, sizeof(identity));
-    if (system_effect_start_core(system, &identity) != 0) {
-        if (!system->core_spawned) return -1;
-        goto cleanup_core;
-    }
-    if (asteriskd_state_set_child(&system->state, &identity, NULL, 0U) != ASTERISKD_STATE_OK ||
-        system_effect_save(system, &system->state) != 0) goto cleanup_core;
-    if (system_effect_wait_core(system) != 0 || system->recovery_cancelled) goto cleanup_core;
-
-cleanup_core:
-    if (asteriskd_state_set_phase(&system->state, ASTERISKD_PHASE_STOPPING) !=
-            ASTERISKD_STATE_OK ||
-        system_effect_save(system, &system->state) != 0 ||
-        system_recovery_publish_event(system, ASTERISKD_CONTROL_EVENT_STOPPING) != 0 ||
-        system_effect_stop_core(system) != 0) return -1;
-    if (system->state.children.core_present && asteriskd_state_clear_child(
-            &system->state, ASTERISKD_CHILD_CORE) != ASTERISKD_STATE_OK) return -1;
-    system->state.recovery.core_owned_ebpf_boundary = false;
-    if (system_effect_save(system, &system->state) != 0) return -1;
-    char error[256U];
-    if (asteriskd_wal_recover(&system->store, &system->state,
-            &system_wal_backend, system, error, sizeof(error)) != ASTERISKD_STATE_OK ||
-        asteriskd_state_mark_stopped(
-            &system->state, error, sizeof(error)) != ASTERISKD_STATE_OK ||
-        system_effect_save(system, &system->state) != 0 ||
-        system_recovery_publish_event(system, ASTERISKD_CONTROL_EVENT_STOPPED) != 0) return -1;
-    return 0;
-}
-
-static bool system_has_ebpf_boundary(
-    const struct asteriskd_state_document *state) {
-    return state != NULL && state->initialized &&
-        state->owner == ASTERISKD_OWNER_BOX &&
-        state->core_type == ASTERISKD_CORE_SING_BOX &&
-        state->mode == ASTERISKD_MODE_EBPF &&
-        state->recovery.core_owned_ebpf_boundary;
-}
-
-static int system_prepare_ebpf_boundary(
-    struct asteriskd_system_supervisor *system) {
-    if (!system_has_ebpf_boundary(&system->state)) return -1;
-    if (asteriskd_state_set_phase(&system->state, ASTERISKD_PHASE_RECOVERING) !=
-            ASTERISKD_STATE_OK || system_effect_save(system, &system->state) != 0) return -1;
-    if ((system->state.children.core_present || system->state.children.helper_present) &&
-        system_recovery_stop_children(system) != 0) return -1;
-    if (system->recovery_kill_escalated) return -1;
-    char error[128U];
-    if (asteriskd_state_set_matcher(&system->state, false, false) != ASTERISKD_STATE_OK ||
-        asteriskd_state_set_rules(&system->state, false, 0U, 0U) != ASTERISKD_STATE_OK) return -1;
-    if (!system->state.failure.present && asteriskd_state_set_failure(
-            &system->state, ASTERISKD_FAILURE_START_FAILED,
-            ASTERISKD_COMPONENT_CORE, "core-owned eBPF cleanup pending",
-            false, 0, false, 0, error, sizeof(error)) != ASTERISKD_STATE_OK) return -1;
-    if (asteriskd_state_set_phase(&system->state, ASTERISKD_PHASE_FAILED) !=
-            ASTERISKD_STATE_OK || system_effect_save(system, &system->state) != 0) return -1;
-    return 0;
 }
 
 static int system_stopped_iptables_residue_inspect(
@@ -6760,16 +6659,12 @@ static int system_cleanup_stopped_bpf_residue(
     return 0;
 }
 
-static int system_recover_state(struct asteriskd_system_supervisor *system) {
+static int system_cleanup_start_state(struct asteriskd_system_supervisor *system) {
     if (asteriskd_state_is_canonical_stopped(&system->state)) {
         return system_cleanup_stopped_iptables_residue(system) == 0
             ? system_cleanup_stopped_bpf_residue(system) : -1;
     }
     system->cleanup_in_progress = true;
-    if (system_has_ebpf_boundary(&system->state)) {
-        if (system_prepare_ebpf_boundary(system) != 0) return -1;
-        return system->recovery_only ? system_recover_ebpf_boundary(system) : 0;
-    }
     if (asteriskd_state_set_phase(
             &system->state, ASTERISKD_PHASE_RECOVERING) != ASTERISKD_STATE_OK ||
         system_effect_save(system, &system->state) != 0) return -1;
@@ -6786,20 +6681,10 @@ static int system_recover_state(struct asteriskd_system_supervisor *system) {
         asteriskd_state_set_matcher(&system->state,
             system->loaded_config.config.matcher.enabled, false) != ASTERISKD_STATE_OK ||
         asteriskd_state_set_rules(&system->state, false, 0U, 0U) != ASTERISKD_STATE_OK) return -1;
-    if (system->recovery_only) {
-        if (asteriskd_state_set_phase(&system->state, ASTERISKD_PHASE_STOPPING) !=
-                ASTERISKD_STATE_OK ||
-            system_effect_save(system, &system->state) != 0) return -1;
-        if (system_recovery_publish_event(
-                system, ASTERISKD_CONTROL_EVENT_STOPPING) != 0) return -1;
-    }
-    if (
-        asteriskd_state_mark_stopped(&system->state, error, sizeof(error)) != ASTERISKD_STATE_OK ||
+    system->state.recovery.core_owned_ebpf_boundary = false;
+    if (asteriskd_state_mark_stopped(
+            &system->state, error, sizeof(error)) != ASTERISKD_STATE_OK ||
         system_effect_save(system, &system->state) != 0) return -1;
-    if (system->recovery_only) {
-        if (system_recovery_publish_event(
-                system, ASTERISKD_CONTROL_EVENT_STOPPED) != 0) return -1;
-    }
     return 0;
 }
 
@@ -6956,8 +6841,7 @@ static int system_effect_stop_children(
     if (core == NULL && helper == NULL) {
         if (include_helper) asteriskd_child_process_close(&system->helper_process);
         asteriskd_child_process_close(&system->core_process);
-        return system->loaded_config.config.mode != ASTERISKD_MODE_EBPF ||
-            system->ebpf_graceful_cleanup_verified ? 0 : -1;
+        return 0;
     }
     if ((core != NULL && !system->core_identity_ready) ||
         (helper != NULL && !system->helper_identity_ready) ||
@@ -6987,10 +6871,6 @@ static int system_effect_stop_children(
     if (system->stop_result == ASTERISKD_STOP_COMPLETE) {
         if (core != NULL) system->core_reaped = true;
         if (helper != NULL) system->helper_reaped = true;
-    }
-    if (system->loaded_config.config.mode == ASTERISKD_MODE_EBPF && core != NULL &&
-        system->stop_result == ASTERISKD_STOP_COMPLETE && !killed) {
-        system->ebpf_graceful_cleanup_verified = true;
     }
     if (include_helper) asteriskd_child_process_close(&system->helper_process);
     asteriskd_child_process_close(&system->core_process);
@@ -7363,7 +7243,7 @@ static int system_runtime_run(const char *config_path, bool initial_start,
         *has_early_result = true;
         (void)system_start_result(early_result, ASTERISKD_CONTROL_RESULT_START_FAILED,
             state_result == ASTERISKD_STATE_INCOMPATIBLE
-                ? "existing state requires explicit recovery"
+                ? "existing state belongs to another application"
                 : "start state preparation failed", NULL);
         system_runtime_cleanup(&system);
         (void)sigprocmask(SIG_SETMASK, &previous, NULL);
@@ -7526,255 +7406,6 @@ int asteriskd_runtime_monitor_system(const char *config_path,
     return system_runtime_run(config_path, false, has_early_result, early_result);
 }
 
-static int system_recovery_result_fill(
-    struct asteriskd_recovery_result *result,
-    enum asteriskd_recovery_result_code code,
-    const struct asteriskd_state_document *state,
-    const char *message) {
-    memset(result, 0, sizeof(*result));
-    result->code = code;
-    if (state != NULL) {
-        result->has_identity = true;
-        result->owner = state->owner;
-        result->core_type = state->core_type;
-        result->mode = state->mode;
-        result->has_core_owned_ebpf_boundary = true;
-        result->core_owned_ebpf_boundary = state->recovery.core_owned_ebpf_boundary;
-    }
-    if (message != NULL && asteriskd_recovery_result_set_message(
-            result, message, strlen(message)) != 0) return -1;
-    return asteriskd_recovery_result_valid(result) ? 0 : -1;
-}
-
-static int system_recovery_peer_result(struct asteriskd_recovery_result *result) {
-    struct asteriskd_control_response response;
-    memset(&response, 0, sizeof(response));
-    enum asteriskd_control_client_result client = asteriskd_control_client_run(
-        ASTERISKD_CONTROL_METHOD_STATUS, "recover", NULL, NULL, &response);
-    int filled;
-    if (client == ASTERISKD_CONTROL_CLIENT_OK && response.result.has_snapshot) {
-        memset(result, 0, sizeof(*result));
-        result->code = ASTERISKD_RECOVERY_ALREADY_RUNNING;
-        result->has_identity = true;
-        result->owner = response.result.snapshot.owner;
-        result->core_type = response.result.snapshot.core_type;
-        result->mode = response.result.snapshot.mode;
-        static const char peer_message[] = "protocol-valid supervisor owns the runtime";
-        filled = asteriskd_recovery_result_set_message(result,
-            peer_message, sizeof(peer_message) - 1U) == 0 &&
-            asteriskd_recovery_result_valid(result) ? 0 : -1;
-    } else {
-        filled = system_recovery_result_fill(result,
-            ASTERISKD_RECOVERY_REQUIRED, NULL,
-            "control address is occupied without a valid supervisor response");
-    }
-    asteriskd_control_response_destroy(&response);
-    return filled;
-}
-
-int asteriskd_runtime_recover_system(
-    const char *config_path,
-    struct asteriskd_recovery_result *result) {
-    if (result != NULL) memset(result, 0, sizeof(*result));
-    if (config_path == NULL || result == NULL) return -1;
-    char error[256U];
-    struct asteriskd_runtime_directory pre_directory;
-    if (asteriskd_runtime_directory_open(
-            config_path, &pre_directory, error, sizeof(error)) != 0) {
-        return system_recovery_result_fill(result,
-            ASTERISKD_RECOVERY_INTERNAL_ERROR, NULL,
-            "runtime directory initialization failed");
-    }
-    struct asteriskd_state_store pre_store;
-    int initialized = asteriskd_state_store_init(&pre_store, pre_directory.fd,
-        pre_directory.device, pre_directory.inode, error, sizeof(error));
-    if (initialized != ASTERISKD_STATE_OK) {
-        asteriskd_runtime_directory_release(&pre_directory);
-        return system_recovery_result_fill(result,
-            ASTERISKD_RECOVERY_INTERNAL_ERROR, NULL,
-            "state store initialization failed");
-    }
-    struct asteriskd_state_document pre_state;
-    memset(&pre_state, 0, sizeof(pre_state));
-    int loaded = asteriskd_state_store_load(
-        &pre_store, &pre_state, error, sizeof(error));
-    asteriskd_state_store_close(&pre_store);
-    asteriskd_runtime_directory_release(&pre_directory);
-    if (loaded != ASTERISKD_STATE_OK) {
-        asteriskd_state_document_destroy(&pre_state);
-        return system_recovery_result_fill(result, ASTERISKD_RECOVERY_REQUIRED, NULL,
-            "state evidence cannot be safely recovered");
-    }
-    if (asteriskd_state_is_canonical_stopped(&pre_state)) {
-        int filled = system_recovery_result_fill(
-            result, ASTERISKD_RECOVERY_CLEAN, &pre_state, NULL);
-        asteriskd_state_document_destroy(&pre_state);
-        return filled;
-    }
-
-    struct asteriskd_system_supervisor system;
-    memset(&system, 0, sizeof(system));
-    system.signal_fd = -1;
-    system.foreign_tc_netlink_fd = -1;
-    system.core_process.pid = -1;
-    system.core_process.process_group_id = -1;
-    system.core_process.pidfd = -1;
-    system.core_process.stdout_fd = -1;
-    system.core_process.stderr_fd = -1;
-    system.core_process.setup_status_fd = -1;
-    system.helper_process.pid = -1;
-    system.helper_process.process_group_id = -1;
-    system.helper_process.pidfd = -1;
-    system.helper_process.stdout_fd = -1;
-    system.helper_process.stderr_fd = -1;
-    system.helper_process.setup_status_fd = -1;
-    system.action_process.pid = -1;
-    system.action_process.process_group_id = -1;
-    system.action_process.pidfd = -1;
-    system.action_process.stdout_fd = -1;
-    system.action_process.stderr_fd = -1;
-    system.action_process.setup_status_fd = -1;
-    if (asteriskd_config_load(config_path, &system.loaded_config,
-            error, sizeof(error)) != 0 ||
-        system.loaded_config.config.owner != pre_state.owner ||
-        system.loaded_config.config.core_type != pre_state.core_type ||
-        system.loaded_config.config.mode != pre_state.mode) {
-        int filled = system_recovery_result_fill(result,
-            ASTERISKD_RECOVERY_REQUIRED, &pre_state,
-            "dirty state requires its intact matching configuration");
-        asteriskd_state_document_destroy(&pre_state);
-        system_runtime_cleanup(&system);
-        return filled;
-    }
-    struct asteriskd_state_document trusted_identity;
-    memset(&trusted_identity, 0, sizeof(trusted_identity));
-    trusted_identity.owner = pre_state.owner;
-    trusted_identity.core_type = pre_state.core_type;
-    trusted_identity.mode = pre_state.mode;
-    trusted_identity.recovery.core_owned_ebpf_boundary =
-        pre_state.recovery.core_owned_ebpf_boundary;
-    asteriskd_state_document_destroy(&pre_state);
-
-    sigset_t blocked;
-    sigset_t previous;
-    sigemptyset(&blocked);
-    sigaddset(&blocked, SIGTERM);
-    sigaddset(&blocked, SIGINT);
-    sigaddset(&blocked, SIGCHLD);
-    if (sigprocmask(SIG_BLOCK, &blocked, &previous) != 0) {
-        system_runtime_cleanup(&system);
-        return system_recovery_result_fill(result,
-            ASTERISKD_RECOVERY_INTERNAL_ERROR, NULL,
-            "failed to block recovery signals");
-    }
-    system.signal_fd = signalfd(-1, &blocked, SFD_NONBLOCK | SFD_CLOEXEC);
-    system.signal_fd_owned = system.signal_fd >= 0;
-    int listener = -1;
-    enum asteriskd_control_listener_result listened = system.signal_fd_owned
-        ? asteriskd_control_listener_open(&listener) : ASTERISKD_CONTROL_LISTENER_ERROR;
-    if (listened != ASTERISKD_CONTROL_LISTENER_OK) {
-        int filled = listened == ASTERISKD_CONTROL_LISTENER_IN_USE
-            ? system_recovery_peer_result(result)
-            : system_recovery_result_fill(result,
-                ASTERISKD_RECOVERY_INTERNAL_ERROR, NULL,
-                "recovery control initialization failed");
-        system_runtime_cleanup(&system);
-        (void)sigprocmask(SIG_SETMASK, &previous, NULL);
-        return filled;
-    }
-
-    struct asteriskd_clock_backend clock = {
-        .local_time = system_runtime_local_time,
-        .context = &system,
-    };
-    const unsigned char *secret = system.loaded_config.config.has_age_secret_key
-        ? (const unsigned char *)system.loaded_config.config.age_secret_key : NULL;
-    size_t secret_length = secret == NULL ? 0U : strlen((const char *)secret);
-    if (asteriskd_log_open(&system.logger, system.loaded_config.config.log_path,
-            secret, secret_length, &clock, error, sizeof(error)) != 0 ||
-        asteriskd_state_store_init(&system.store, system.loaded_config.directory.fd,
-            system.loaded_config.directory.device, system.loaded_config.directory.inode,
-            error, sizeof(error)) != ASTERISKD_STATE_OK ||
-        asteriskd_state_store_load(&system.store, &system.state,
-            error, sizeof(error)) != ASTERISKD_STATE_OK) {
-        (void)close(listener);
-        system_runtime_cleanup(&system);
-        (void)sigprocmask(SIG_SETMASK, &previous, NULL);
-        return system_recovery_result_fill(result,
-            ASTERISKD_RECOVERY_REQUIRED, &trusted_identity,
-            "recovery logger or state initialization failed");
-    }
-    system.live.supervisor_pid = (int)getpid();
-    system.live.ipv6_enabled = system.loaded_config.config.enable_ipv6;
-    struct asteriskd_control_callbacks callbacks = {
-        .snapshot = system_runtime_snapshot,
-        .request_stop = system_runtime_request_stop,
-        .request_shutdown = system_runtime_request_shutdown,
-        .context = &system,
-    };
-    struct asteriskd_runtime_reactor_backend reactor_backend = system_runtime_reactor_backend();
-    if (asteriskd_control_server_create(&system.control, listener, &callbacks) != 0 ||
-        asteriskd_runtime_create(&system.runtime, &reactor_backend, &system) != 0) {
-        if (system.control == NULL) (void)close(listener);
-        system_runtime_cleanup(&system);
-        (void)sigprocmask(SIG_SETMASK, &previous, NULL);
-        return system_recovery_result_fill(result,
-            ASTERISKD_RECOVERY_INTERNAL_ERROR, NULL,
-            "recovery reactor initialization failed");
-    }
-    asteriskd_control_server_enable_accepting(system.control, true);
-    system.recovery_only = true;
-    int recovered = system_recover_state(&system);
-    struct asteriskd_state_document result_state = system.state;
-    result_state.recovery.records = NULL;
-    result_state.recovery.record_capacity = 0U;
-    bool dedicated_recovered = recovered == 0 &&
-        asteriskd_state_is_canonical_stopped(&system.state) && !system.recovery_cancelled;
-    int filled = dedicated_recovered
-        ? system_recovery_result_fill(result, ASTERISKD_RECOVERY_RECOVERED,
-            &result_state, NULL)
-        : system_recovery_result_fill(result, ASTERISKD_RECOVERY_REQUIRED,
-            &result_state, system.recovery_cancelled
-                ? "recovery was cancelled by a control stop"
-                : "cleanup incomplete; recovery evidence retained");
-    struct asteriskd_control_snapshot final_snapshot;
-    struct asteriskd_control_result final_result;
-    memset(&final_snapshot, 0, sizeof(final_snapshot));
-    memset(&final_result, 0, sizeof(final_result));
-    if (asteriskd_control_snapshot_from_state(
-            &system.state, &system.live, &final_snapshot) == 0) {
-        final_result.code = recovered == 0 && asteriskd_state_is_canonical_stopped(&system.state)
-            ? ASTERISKD_CONTROL_RESULT_OK : ASTERISKD_CONTROL_RESULT_STOP_FAILED;
-        final_result.has_snapshot = true;
-        (void)asteriskd_control_snapshot_copy(&final_result.snapshot, &final_snapshot);
-        if (final_result.code == ASTERISKD_CONTROL_RESULT_STOP_FAILED) {
-            static const char incomplete[] = "cleanup incomplete";
-            (void)asteriskd_control_result_set_message(
-                &final_result, incomplete, sizeof(incomplete) - 1U);
-        }
-        int64_t now = 0;
-        if (system_runtime_clock(&system, &now) == 0) {
-            (void)asteriskd_control_server_finish_stop(
-                system.control, &final_result, (uint64_t)now);
-            asteriskd_control_server_enable_accepting(system.control, false);
-            if (!asteriskd_control_server_drained(system.control)) {
-                struct asteriskd_deadline deadline = {
-                    .armed = true,
-                    .monotonic_milliseconds = now + ASTERISKD_CONTROL_WATCH_STALL_MILLIS,
-                };
-                struct asteriskd_runtime_delta ignored;
-                (void)asteriskd_runtime_pump_until(system.runtime, &deadline,
-                    system_control_drained, &system, &ignored);
-            }
-        }
-    }
-    asteriskd_control_result_destroy(&final_result);
-    asteriskd_control_snapshot_destroy(&final_snapshot);
-    asteriskd_control_server_enable_accepting(system.control, false);
-    system_runtime_cleanup(&system);
-    (void)sigprocmask(SIG_SETMASK, &previous, NULL);
-    return filled;
-}
 #endif
 
 #if !defined(__linux__) && !defined(__ANDROID__)
@@ -7792,17 +7423,6 @@ int asteriskd_runtime_start_system(
     return 1;
 }
 
-int asteriskd_runtime_recover_system(
-    const char *config_path,
-    struct asteriskd_recovery_result *result) {
-    (void)config_path;
-    if (result == NULL) return -1;
-    memset(result, 0, sizeof(*result));
-    result->code = ASTERISKD_RECOVERY_INTERNAL_ERROR;
-    static const char unavailable[] = "system recovery is unavailable on this host";
-    return asteriskd_recovery_result_set_message(
-        result, unavailable, sizeof(unavailable) - 1U);
-}
 #endif
 
 void asteriskd_runtime_destroy(struct asteriskd_runtime *runtime) {

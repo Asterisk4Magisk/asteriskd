@@ -19,30 +19,28 @@ every top-level `.c` file as one PIE executable; `tests/` is host-only.
 
 ```text
 asteriskd start --config ABSOLUTE_PATH
+asteriskd monitor --config ABSOLUTE_PATH
 asteriskd status
 asteriskd stop
+asteriskd shutdown
 asteriskd watch
-asteriskd recover --config ABSOLUTE_CONFIG_PATH
-asteriskd sync --file ABSOLUTE_PATH
-asteriskd sync --directory ABSOLUTE_PATH
 ```
 
-`start`, `status`, `stop`, `watch`, and `recover` require effective UID 0.
-`status` and `stop` write exactly one protocol-v1 JSON response line. `watch`
-writes an initial response and then JSON event lines until the final event or
-disconnect. `recover` writes exactly one dedicated `recoveryResult` line after
-its command grammar is accepted. CLI usage errors write only to stderr and exit
-64.
+All commands require effective UID 0. `status`, `stop`, and `shutdown` write
+exactly one protocol-v1 JSON response line. `stop` ends the active service
+cycle while keeping the supervisor available for configured service actions;
+`shutdown` also exits the supervisor after the active service has stopped.
+`start` launches the supervisor and immediately starts a service cycle;
+`monitor` launches it idle and waits for configured service-control actions.
+`watch` writes an initial response and then JSON event lines until the final
+event or disconnect. CLI usage errors write only to stderr and exit 64.
 
-`sync` is a private publication primitive. It performs component-wise
-no-symlink traversal, verifies the exact final file/directory type, calls
-`fsync(2)`, and never writes or truncates the destination.
-
-`start` and `recover` open and verify the config-parent directory themselves.
-They do not accept inherited publication descriptors and do not acquire a
-filesystem lock. Applications perform a read-only status preflight, recover
-the old state, and publish through same-directory fsync plus atomic rename. The
-abstract control-socket bind is the cross-process single-instance authority.
+`start` and `monitor` open and verify the config-parent directory themselves.
+They do not accept inherited publication descriptors or acquire a filesystem
+lock.
+Applications perform a read-only status preflight and publish the latest config
+through same-directory temporary files plus atomic rename. The abstract
+control-socket bind is the cross-process single-instance authority.
 
 ## Control plane
 
@@ -53,10 +51,11 @@ objects. Each connection sends one request. Limits are enforced for request
 size, client count, per-client output, incomplete-input timeout, and stalled
 watch output.
 
-Public methods are `status`, `stop`, and `watch`. `start`, `recover`, and `sync`
-are CLI operations, not server methods. A valid bound peer blocks publication
-regardless of whether its snapshot phase is starting, running, stopping, or
-failed.
+Public methods are `status`, `stop`, `shutdown`, and `watch`. `start` and
+`monitor` are CLI operations, not server methods. Ordinary publication requires
+the control socket to be absent. Explicit boot refresh may publish while the
+matching owner reports
+`running`; every other owner or phase blocks publication.
 
 Snapshots expose semantic state only: phase, owner/core/mode, supervisor/core/
 helper PIDs, matcher status, daemon-rule generation/categories, IPv4/IPv6
@@ -97,18 +96,19 @@ Supported combinations:
 `ebpf` is a standalone mode, not the optional matcher. It is parsed for every
 owner/core pair, but only AsteriskBOX/sing-box is runnable today. In that mode
 sing-box owns its cgroup BPF, route, shared-interface TC, UID/direct policy, and
-`route_localnet`; daemon rule state remains inactive. A crash or forced kill
-retains a core-owned recovery boundary for a later sing-box cleanup start.
+`route_localnet`; daemon rule state remains inactive. Core-owned eBPF lifecycle
+and residue cleanup remain the core's responsibility.
 
 The matcher is an independent required overlay for `tproxy`, `tun`, or
-`tun2socks`. If configured, capability setup, one-shot loading, complete pin
-verification, or policy-map verification failure aborts startup; there is no
-silent fallback to non-matcher rules.
+`tun2socks`. For both the matcher and bpf2socks, optional SELinux policy setup
+is best-effort and emits a warning when unavailable or unsuccessful. One-shot
+loading, complete pin verification, or policy-map verification failure still
+aborts startup; there is no silent fallback to non-matcher rules.
 
-## Lifecycle, readiness, and recovery
+## Lifecycle, readiness, and cleanup
 
 The durable phases are `starting`, `applying-rules`, `running`, `stopping`,
-`stopped`, and `failed`; validation/acquisition/initial recovery are live-only
+`stopped`, and `failed`; validation, acquisition, and startup cleanup are live-only
 until the existing state has been classified. Core readiness is adapter-specific
 and identity-bound. TUN/HEV and bpf2socks modes require the core SOCKS listener
 before helper readiness. BOX `ebpf` requires the same verified core identity to
@@ -120,12 +120,10 @@ parent-directory fsync. Cleanup signals a persisted PID only after the complete
 `/proc` identity (PID/PGID/start ticks/executable device+inode/full argv)
 matches. PID-only or substring matching is forbidden.
 
-`recover` classifies state before opening the config, log, or control socket.
-Missing or canonical-stopped state is a no-side-effect clean result. Dirty
-trusted state requires the intact old configuration, binds the control address,
-and performs the same ownership-safe reverse cleanup used by normal shutdown.
-Invalid, incompatible, ambiguous, or foreign evidence is preserved and returns
-`recovery-required`.
+`start` uses the latest published configuration. Before launching the core it
+cleans daemon-owned residue from a previous interrupted run using the durable
+journal; it never restores an older application configuration. Foreign owner or
+core identity remains incompatible and is left untouched.
 
 ## Network and logging
 

@@ -409,12 +409,11 @@ static int decode_tc_filter_message(
     uint32_t protocol = network_to_host_u16((uint16_t)(message.info & UINT32_C(0xffff)));
     if (priority != ASTERISKD_ANDROID_TETHER_TC_PRIORITY ||
         protocol != ASTERISKD_ETH_PROTOCOL_IPV6) return 0;
-    if (*present || message.parent != ASTERISKD_TC_PARENT_CLSACT_INGRESS ||
-        message.handle == 0U) return -1;
+    if (*present || message.parent != ASTERISKD_TC_PARENT_CLSACT_INGRESS) return -1;
     struct route_attribute_view attributes[17U];
     if (route_attributes(bytes + sizeof(message), length - sizeof(message),
             attributes, sizeof(attributes) / sizeof(attributes[0])) != 0 ||
-        attributes[1U].data == NULL || attributes[2U].data == NULL) return -1;
+        attributes[1U].data == NULL) return -1;
     for (size_t type = 1U; type < sizeof(attributes) / sizeof(attributes[0]); ++type) {
         if (attributes[type].data == NULL) continue;
         if (type != 1U && type != 2U && type != 3U && type != 7U &&
@@ -427,6 +426,8 @@ static int decode_tc_filter_message(
     if (attributes[11U].data != NULL &&
         !attribute_u32(&attributes[11U], &chain)) return -1;
     if (chain != 0U) return -1;
+    if (message.handle == 0U) return attributes[2U].data == NULL ? 0 : -1;
+    if (attributes[2U].data == NULL) return -1;
 
     struct route_attribute_view options[12U];
     if (route_attributes(attributes[2U].data, attributes[2U].length,
