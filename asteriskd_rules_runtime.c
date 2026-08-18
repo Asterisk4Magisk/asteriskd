@@ -376,12 +376,12 @@ void asteriskd_rules_runtime_init(struct asteriskd_rules_runtime *runtime) {
 }
 
 static bool rules_backend_complete(const struct asteriskd_rules_backend *backend) {
-    return backend != NULL && backend->wal_apply_plan != NULL &&
-        backend->wal_apply_private != NULL &&
-        backend->wal_apply_route != NULL && backend->wal_apply_hook != NULL &&
+    return backend != NULL && backend->apply_plan != NULL &&
+        backend->apply_private != NULL &&
+        backend->apply_route != NULL && backend->apply_hook != NULL &&
         backend->probe_private != NULL && backend->probe_route != NULL &&
-        backend->probe_hook != NULL && backend->wal_remove_private != NULL &&
-        backend->wal_remove_route != NULL && backend->wal_remove_hook != NULL;
+        backend->probe_hook != NULL && backend->remove_private != NULL &&
+        backend->remove_route != NULL && backend->remove_hook != NULL;
 }
 
 static bool runtime_has_cleanup(const struct asteriskd_rules_runtime *runtime) {
@@ -423,7 +423,7 @@ int asteriskd_rules_install(
     for (size_t index = 0U; index < plan.hook_group_count; ++index) {
         runtime->hook_cleanup_required[index] = true;
     }
-    if (backend->wal_apply_plan(backend->ctx, &runtime->plan) != 0) {
+    if (backend->apply_plan(backend->ctx, &runtime->plan) != 0) {
         return ASTERISKD_CONFIG_IO;
     }
     runtime->installed = true;
@@ -487,7 +487,7 @@ static int reconcile_private(
         if (backend->probe_private(backend->ctx, &runtime->plan.private_groups[index], &state) != 0 ||
             state == ASTERISKD_RULES_SLOT_FOREIGN) return ASTERISKD_CONFIG_IO;
         if (state == ASTERISKD_RULES_SLOT_ABSENT &&
-            backend->wal_apply_private(backend->ctx, &runtime->plan.private_groups[index]) != 0) {
+            backend->apply_private(backend->ctx, &runtime->plan.private_groups[index]) != 0) {
             return ASTERISKD_CONFIG_IO;
         }
     }
@@ -503,7 +503,7 @@ static int reconcile_routes(
         if (backend->probe_route(backend->ctx, &runtime->plan.routes[index], &state) != 0 ||
             state == ASTERISKD_RULES_SLOT_FOREIGN) return ASTERISKD_CONFIG_IO;
         if (state == ASTERISKD_RULES_SLOT_ABSENT &&
-            backend->wal_apply_route(backend->ctx, &runtime->plan.routes[index]) != 0) {
+            backend->apply_route(backend->ctx, &runtime->plan.routes[index]) != 0) {
             return ASTERISKD_CONFIG_IO;
         }
     }
@@ -519,7 +519,7 @@ static int reconcile_hooks(
         if (backend->probe_hook(backend->ctx, &runtime->plan.hook_groups[index], &state) != 0 ||
             state == ASTERISKD_RULES_SLOT_FOREIGN) return ASTERISKD_CONFIG_IO;
         if (state == ASTERISKD_RULES_SLOT_ABSENT &&
-            backend->wal_apply_hook(backend->ctx, &runtime->plan.hook_groups[index]) != 0) {
+            backend->apply_hook(backend->ctx, &runtime->plan.hook_groups[index]) != 0) {
             return ASTERISKD_CONFIG_IO;
         }
     }
@@ -549,7 +549,7 @@ int asteriskd_rules_remove(
     for (size_t count = runtime->plan.hook_group_count; count > 0U; --count) {
         size_t index = count - 1U;
         if (!runtime->hook_cleanup_required[index]) continue;
-        if (backend->wal_remove_hook(backend->ctx, &runtime->plan.hook_groups[index]) == 0) {
+        if (backend->remove_hook(backend->ctx, &runtime->plan.hook_groups[index]) == 0) {
             runtime->hook_cleanup_required[index] = false;
         } else {
             result = ASTERISKD_CONFIG_IO;
@@ -558,7 +558,7 @@ int asteriskd_rules_remove(
     for (size_t count = runtime->plan.route_count; count > 0U; --count) {
         size_t index = count - 1U;
         if (!runtime->route_cleanup_required[index]) continue;
-        if (backend->wal_remove_route(backend->ctx, &runtime->plan.routes[index]) == 0) {
+        if (backend->remove_route(backend->ctx, &runtime->plan.routes[index]) == 0) {
             runtime->route_cleanup_required[index] = false;
         } else {
             result = ASTERISKD_CONFIG_IO;
@@ -567,33 +567,12 @@ int asteriskd_rules_remove(
     for (size_t count = runtime->plan.private_group_count; count > 0U; --count) {
         size_t index = count - 1U;
         if (!runtime->private_cleanup_required[index]) continue;
-        if (backend->wal_remove_private(backend->ctx, &runtime->plan.private_groups[index]) == 0) {
+        if (backend->remove_private(backend->ctx, &runtime->plan.private_groups[index]) == 0) {
             runtime->private_cleanup_required[index] = false;
         } else {
             result = ASTERISKD_CONFIG_IO;
         }
     }
     if (!runtime_has_cleanup(runtime)) runtime->installed = false;
-    return result;
-}
-
-static bool rules_recovery_kind(enum asteriskd_recovery_kind kind) {
-    return kind == ASTERISKD_RECOVERY_IPTABLES_CHAIN ||
-        kind == ASTERISKD_RECOVERY_IPTABLES_RULE || kind == ASTERISKD_RECOVERY_IP_RULE ||
-        kind == ASTERISKD_RECOVERY_ROUTE || kind == ASTERISKD_RECOVERY_DUMMY_INTERFACE;
-}
-
-int asteriskd_rules_recover(
-    const struct asteriskd_recovery_record *records,
-    size_t count,
-    const struct asteriskd_rules_backend *backend) {
-    if ((records == NULL && count != 0U) || backend == NULL ||
-        backend->wal_recover_record == NULL) return ASTERISKD_CONFIG_INVALID;
-    int result = 0;
-    for (size_t remaining = count; remaining > 0U; --remaining) {
-        const struct asteriskd_recovery_record *record = &records[remaining - 1U];
-        if (!rules_recovery_kind(record->kind)) continue;
-        if (backend->wal_recover_record(backend->ctx, record) != 0) result = ASTERISKD_CONFIG_IO;
-    }
     return result;
 }

@@ -206,25 +206,27 @@ static bool security_interface(const char *name) {
     return strcmp(name, "all") != 0 && strcmp(name, "default") != 0 && strcmp(name, "lo") != 0;
 }
 
-static bool immediate_request_same(const struct asteriskd_typed_wal_request *left,
-    const struct asteriskd_typed_wal_request *right) {
-    return left->source == right->source && left->action == right->action &&
-        left->record.kind == ASTERISKD_RECOVERY_SYSCTL &&
-        right->record.kind == ASTERISKD_RECOVERY_SYSCTL &&
-        left->record.resource.sysctl.sysctl_id == right->record.resource.sysctl.sysctl_id &&
-        left->record.resource.sysctl.interface_index ==
-            right->record.resource.sysctl.interface_index &&
-        strcmp(left->record.resource.sysctl.interface_name,
-            right->record.resource.sysctl.interface_name) == 0;
+static bool immediate_request_same(
+    const struct asteriskd_network_effect_request *left,
+    const struct asteriskd_network_effect_request *right) {
+    return left->effect.kind == ASTERISKD_EFFECT_SYSCTL &&
+        right->effect.kind == ASTERISKD_EFFECT_SYSCTL &&
+        left->effect.resource.sysctl.sysctl_id ==
+            right->effect.resource.sysctl.sysctl_id &&
+        left->effect.resource.sysctl.interface_index ==
+            right->effect.resource.sysctl.interface_index &&
+        strcmp(left->effect.resource.sysctl.interface_name,
+            right->effect.resource.sysctl.interface_name) == 0;
 }
 
 static int queue_immediate_request(void *opaque,
-    const struct asteriskd_typed_wal_request *request, char *error, size_t error_size) {
+    const struct asteriskd_network_effect_request *request,
+    char *error, size_t error_size) {
     struct asteriskd_network_runtime *runtime = opaque;
     if (runtime == NULL || request == NULL ||
-        request->source != ASTERISKD_TYPED_WAL_IPV6_IMMEDIATE ||
-        request->action != ASTERISKD_TYPED_WAL_APPLY ||
-        request->record.kind != ASTERISKD_RECOVERY_SYSCTL) {
+        request->effect.kind != ASTERISKD_EFFECT_SYSCTL ||
+        request->effect.resource.sysctl.sysctl_id !=
+            ASTERISKD_SYSCTL_DISABLE_IPV6) {
         network_error(error, error_size, "invalid immediate network request");
         return ASTERISKD_CONFIG_INVALID;
     }
@@ -252,21 +254,16 @@ static int enforce_ipv6_security(
         interface_index, &current, &exists) != 0) return ASTERISKD_CONFIG_IO;
     if (!exists || current == 1U) return 0;
     if (current != 0U) return ASTERISKD_CONFIG_IO;
-    struct asteriskd_recovery_record record;
-    memset(&record, 0, sizeof(record));
-    record.status = ASTERISKD_RECOVERY_INTENT;
-    record.kind = ASTERISKD_RECOVERY_SYSCTL;
-    record.resource.sysctl.sysctl_id = ASTERISKD_SYSCTL_DISABLE_IPV6;
-    (void)snprintf(record.resource.sysctl.interface_name,
-        sizeof(record.resource.sysctl.interface_name), "%s", interface_name);
-    record.resource.sysctl.interface_index = interface_index;
-    record.resource.sysctl.original_value = 0U;
-    record.resource.sysctl.desired_value = 1U;
-    const struct asteriskd_typed_wal_sink queue = {
-        .dispatch = queue_immediate_request,
-        .context = runtime,
-    };
-    return asteriskd_network_wal_ipv6_immediate(&queue, &record, NULL, 0U);
+    struct asteriskd_network_effect_request request;
+    memset(&request, 0, sizeof(request));
+    request.effect.kind = ASTERISKD_EFFECT_SYSCTL;
+    request.effect.resource.sysctl.sysctl_id = ASTERISKD_SYSCTL_DISABLE_IPV6;
+    (void)snprintf(request.effect.resource.sysctl.interface_name,
+        sizeof(request.effect.resource.sysctl.interface_name),
+        "%s", interface_name);
+    request.effect.resource.sysctl.interface_index = interface_index;
+    request.effect.resource.sysctl.desired_value = 1U;
+    return queue_immediate_request(runtime, &request, NULL, 0U);
 }
 
 static int attribute_payload(
@@ -508,10 +505,11 @@ int asteriskd_network_reopen(
     return 0;
 }
 
-int asteriskd_network_set_wal_sink(
-    struct asteriskd_network_runtime *runtime, const struct asteriskd_typed_wal_sink *sink) {
+int asteriskd_network_set_effect_sink(
+    struct asteriskd_network_runtime *runtime,
+    const struct asteriskd_network_effect_sink *sink) {
     if (runtime == NULL || sink == NULL || sink->dispatch == NULL) return ASTERISKD_CONFIG_INVALID;
-    runtime->wal_sink = sink;
+    runtime->effect_sink = sink;
     return 0;
 }
 
@@ -524,12 +522,13 @@ int asteriskd_network_apply_immediate(
     if (error != NULL && error_size != 0U) error[0] = '\0';
     if (runtime == NULL ||
         (runtime->immediate_request_count != 0U &&
-            (runtime->wal_sink == NULL || runtime->wal_sink->dispatch == NULL))) {
+            (runtime->effect_sink == NULL ||
+             runtime->effect_sink->dispatch == NULL))) {
         network_error(error, error_size, "invalid immediate network apply input");
         return ASTERISKD_CONFIG_INVALID;
     }
     while (runtime->immediate_request_count != 0U) {
-        if (runtime->wal_sink->dispatch(runtime->wal_sink->context,
+        if (runtime->effect_sink->dispatch(runtime->effect_sink->context,
                 &runtime->immediate_requests[0], error, error_size) != 0) {
             return ASTERISKD_CONFIG_IO;
         }

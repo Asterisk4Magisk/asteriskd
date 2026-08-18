@@ -47,13 +47,12 @@ bool asteriskd_tc_qdisc_cleanup_restored(bool qdisc_present,
 
 static struct asteriskd_tc_plan_operation *append_operation(
     struct asteriskd_tc_plan *plan, enum asteriskd_tc_plan_operation_kind kind,
-    enum asteriskd_recovery_kind recovery_kind) {
+    enum asteriskd_resource_operation_kind operation_kind) {
     if (plan->operation_count >= sizeof(plan->operations) / sizeof(plan->operations[0])) return NULL;
     struct asteriskd_tc_plan_operation *operation = &plan->operations[plan->operation_count++];
     memset(operation, 0, sizeof(*operation));
     operation->kind = kind;
-    operation->recovery.status = ASTERISKD_RECOVERY_INTENT;
-    operation->recovery.kind = recovery_kind;
+    operation->operation.kind = operation_kind;
     return operation;
 }
 
@@ -64,9 +63,9 @@ static void copy_interface(char destination[ASTERISKD_MAX_INTERFACE_NAME], const
 static int append_route_localnet(
     struct asteriskd_tc_plan *plan, const struct asteriskd_tc_interface_probe *probe) {
     struct asteriskd_tc_plan_operation *operation = append_operation(
-        plan, ASTERISKD_TC_PLAN_SET_ROUTE_LOCALNET, ASTERISKD_RECOVERY_SYSCTL);
+        plan, ASTERISKD_TC_PLAN_SET_ROUTE_LOCALNET, ASTERISKD_RESOURCE_OPERATION_SYSCTL);
     if (operation == NULL) return -1;
-    struct asteriskd_sysctl_resource *resource = &operation->recovery.resource.sysctl;
+    struct asteriskd_sysctl_resource *resource = &operation->operation.resource.sysctl;
     resource->sysctl_id = ASTERISKD_SYSCTL_ROUTE_LOCALNET;
     copy_interface(resource->interface_name, probe->interface_name);
     resource->interface_index = probe->interface_index;
@@ -78,9 +77,9 @@ static int append_route_localnet(
 static int append_qdisc(
     struct asteriskd_tc_plan *plan, const struct asteriskd_tc_interface_probe *probe) {
     struct asteriskd_tc_plan_operation *operation = append_operation(
-        plan, ASTERISKD_TC_PLAN_CREATE_CLSACT, ASTERISKD_RECOVERY_TC_QDISC);
+        plan, ASTERISKD_TC_PLAN_CREATE_CLSACT, ASTERISKD_RESOURCE_OPERATION_TC_QDISC);
     if (operation == NULL) return -1;
-    struct asteriskd_tc_qdisc_resource *resource = &operation->recovery.resource.tc_qdisc;
+    struct asteriskd_tc_qdisc_resource *resource = &operation->operation.resource.tc_qdisc;
     resource->qdisc_id = ASTERISKD_QDISC_HOTSPOT_CLSACT;
     copy_interface(resource->interface_name, probe->interface_name);
     resource->interface_index = probe->interface_index;
@@ -94,12 +93,12 @@ static int append_filter(
     bool ingress = direction == ASTERISKD_TC_DIRECTION_INGRESS;
     struct asteriskd_tc_plan_operation *operation = append_operation(plan,
         ingress ? ASTERISKD_TC_PLAN_CREATE_INGRESS : ASTERISKD_TC_PLAN_CREATE_EGRESS,
-        ASTERISKD_RECOVERY_TC_FILTER);
+        ASTERISKD_RESOURCE_OPERATION_TC_FILTER);
     if (operation == NULL) return -1;
     operation->priority = ASTERISKD_HOTSPOT_TC_PRIORITY;
     operation->handle = ASTERISKD_HOTSPOT_TC_HANDLE;
     operation->direct_action = true;
-    struct asteriskd_tc_filter_resource *resource = &operation->recovery.resource.tc_filter;
+    struct asteriskd_tc_filter_resource *resource = &operation->operation.resource.tc_filter;
     resource->filter_id = ingress ? ASTERISKD_FILTER_HOTSPOT_INGRESS :
         ASTERISKD_FILTER_HOTSPOT_EGRESS;
     resource->direction = direction;

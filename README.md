@@ -1,16 +1,15 @@
 # asteriskd v2
 
-`asteriskd` is the single foreground root supervisor for AsteriskNG, AsteriskBOX,
+`asteriskd` is the single root supervisor for AsteriskNG, AsteriskBOX,
 and AsteriskMETA. It owns the selected core process, required helper, optional
-matcher, daemon-managed routing/firewall/BPF/TC state, recovery journal, network
+matcher, daemon-managed routing/firewall/BPF/TC state, in-memory effect journal, network
 reconciliation, structured log, and the local control socket for the whole
 runtime lifetime.
 
 The supervisor does not daemonize and does not restart a failed child. A core or
 required-helper exit causes a fail-stop: new traffic entry is removed first,
-owned effects are restored in reverse order, and the foreground command exits
-nonzero. A clean explicit stop exits zero only after the durable state is
-canonical stopped.
+owned effects are cleaned in reverse order, and a non-resident supervisor exits
+nonzero. A clean explicit stop succeeds only after telemetry reaches `stopped`.
 
 The source root is build-system agnostic. The Android parent project compiles
 every top-level `.c` file as one PIE executable; `tests/` is host-only.
@@ -62,9 +61,9 @@ helper PIDs, matcher status, daemon-rule generation/categories, IPv4/IPv6
 readiness, and a sanitized error. Private iptables names, BPF pin paths, argv,
 environment, and configuration content are never exposed.
 
-## Configuration v2
+## Configuration v3
 
-The configuration is strict UTF-8 JSON (`schemaVersion: 2`) with a maximum size
+The configuration is strict UTF-8 JSON (`schemaVersion: 3`) with a maximum size
 of 8 MiB. Every object is closed: unknown, duplicate, or missing keys are
 invalid, including keys whose value is nullable. Validation completes before
 the logger, state, socket, child, or external network effects are created.
@@ -105,32 +104,28 @@ is best-effort and emits a warning when unavailable or unsuccessful. One-shot
 loading, complete pin verification, or policy-map verification failure still
 aborts startup; there is no silent fallback to non-matcher rules.
 
-## Lifecycle, readiness, and cleanup
+## Lifecycle, admission, and cleanup
 
-The durable phases are `starting`, `applying-rules`, `running`, `stopping`,
-`stopped`, and `failed`; validation, acquisition, and startup cleanup are live-only
-until the existing state has been classified. Core readiness is adapter-specific
-and identity-bound. TUN/HEV and bpf2socks modes require the core SOCKS listener
-before helper readiness. BOX `ebpf` requires the same verified core identity to
-survive a fixed 1000 ms window and does not wait for a shared interface.
+The abstract control listener is acquired before any ROOT resource operation.
+Each service cycle then reconciles the fixed Asterisk-owned catalog: hooks,
+private chains, policy rules/routes, `xdummy`, TC filters, and the shared
+`/sys/fs/bpf/asterisk` namespace are removed in dependency order and the final
+absence is verified. Admission fails closed when a fixed name is occupied by a
+foreign object or absence cannot be proved. The catalog is independent of the
+current owner, mode, IPv6 setting, matcher setting, saved phase, and saved
+configuration. Old per-application names are intentionally ignored.
 
-All external mutations use an intent-before-effect, verify, applied-after-effect
-write-ahead journal. State replacement is temp-file + file fsync + rename +
-parent-directory fsync. Cleanup signals a persisted PID only after the complete
-`/proc` identity (PID/PGID/start ticks/executable device+inode/full argv)
-matches. PID-only or substring matching is forbidden.
+Core readiness is adapter-specific and identity-bound. TUN/HEV and bpf2socks
+modes require the core SOCKS listener before helper readiness. BOX `ebpf`
+requires the same verified core identity to survive a fixed 1000 ms window and
+does not wait for a shared interface.
 
-The pre-2.0 Android hotspot compatibility cleanup is the deliberate exception:
-for configured hotspot interface selectors, startup removes the trusted
-`prog_offload_schedcls_tether_` IPv6 filter with the legacy `tc` command and
-does not journal or restore that Android-owned filter. Version-2 state records
-from the removed foreign-filter design are accepted only for one-way migration
-and are discarded; obsolete app-owned recovery pins are cleaned as residue.
-
-`start` uses the latest published configuration. Before launching the core it
-cleans daemon-owned residue from a previous interrupted run using the durable
-journal; it never restores an older application configuration. Foreign owner or
-core identity remains incompatible and is left untouched.
+The state file is telemetry only. It is replaced through a temp file, file
+fsync, rename, and parent-directory fsync; startup never loads it to decide what
+to clean or restore. Current-cycle sysctl and tether/dnsmasq original values are
+kept only in supervisor memory and are restored best-effort on graceful cleanup.
+A crash or `SIGKILL` deliberately leaves those shared values untouched for the
+operator or a later normal service action to handle.
 
 ## Network and logging
 
@@ -138,7 +133,8 @@ One reactor owns signals, control clients, child setup/log/pidfd events,
 route-netlink input, debounce deadlines, readiness, action commands, and stop
 deadlines. Netlink subscribes before the initial snapshot, drains to `EAGAIN`,
 and performs a full reconcile after the 1500 ms trailing debounce or any
-integrity loss. System-IPv6 disablement uses immediate per-interface WAL writes.
+integrity loss. System-IPv6 disablement records original values only in the
+resident supervisor's in-memory effect journal.
 
 The daemon is the only writer of `asteriskd.log`. It opens the file through a
 no-symlink path, anchors ownership to the pre-existing app-owned log directory,
@@ -147,8 +143,8 @@ UTF-8-repaired, control-escaped, truncated at the fixed limit, and redacted for
 the exact AGE secret before persistence.
 
 The only persistent runtime artifacts are the app-published core config and
-`asteriskd.json`, daemon-owned `asteriskd.state`, app-owned `startup.sh` when
-boot is enabled, and the single app-level `asteriskd.log`.
+`asteriskd.json`, daemon-owned telemetry file `asteriskd.state`, app-owned
+`startup.sh` when boot is enabled, and the single app-level `asteriskd.log`.
 
 ## Verification and device boundary
 

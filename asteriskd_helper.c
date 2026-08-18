@@ -219,15 +219,6 @@ static int render_direct_family(const char values[][ASTERISKD_MAX_CIDR], size_t 
     return writer_take(&writer, document);
 }
 
-static const char *owner_pin_namespace(enum asteriskd_owner owner) {
-    switch (owner) {
-        case ASTERISKD_OWNER_NG: return "/sys/fs/bpf/asteriskng/bpf2socks";
-        case ASTERISKD_OWNER_BOX: return "/sys/fs/bpf/asteriskbox/bpf2socks";
-        case ASTERISKD_OWNER_META: return "/sys/fs/bpf/asteriskmeta/bpf2socks";
-    }
-    return NULL;
-}
-
 static unsigned policy_mode(enum asteriskd_app_policy_mode mode) {
     switch (mode) {
         case ASTERISKD_APP_POLICY_BLACKLIST: return 0U;
@@ -239,8 +230,8 @@ static unsigned policy_mode(enum asteriskd_app_policy_mode mode) {
 
 static int render_bpf(const struct asteriskd_config *config, int direct_ipv4_fd, int direct_ipv6_fd, struct asteriskd_helper_documents *documents) {
     const struct asteriskd_bpf_helper_config *bpf = &config->helper.value.bpf;
-    const char *pin_namespace = owner_pin_namespace(config->owner);
-    if (pin_namespace == NULL || policy_mode(config->app_policy_mode) > 2U) return ASTERISKD_CONFIG_INVALID;
+    const char *pin_namespace = asteriskd_owned_resource_catalog()->bpf2_root;
+    if (policy_mode(config->app_policy_mode) > 2U) return ASTERISKD_CONFIG_INVALID;
     bool direct = config->direct_cidrs != NULL;
     if (direct && (direct_ipv4_fd < 0 || direct_ipv6_fd < 0 || direct_ipv4_fd == direct_ipv6_fd)) return ASTERISKD_CONFIG_INVALID;
     if (direct) {

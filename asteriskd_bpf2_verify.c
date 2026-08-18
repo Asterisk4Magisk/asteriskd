@@ -3,15 +3,6 @@
 #include <stdio.h>
 #include <string.h>
 
-static const char *owner_pin_root(enum asteriskd_owner owner) {
-    switch (owner) {
-        case ASTERISKD_OWNER_NG: return "/sys/fs/bpf/asteriskng/bpf2socks";
-        case ASTERISKD_OWNER_BOX: return "/sys/fs/bpf/asteriskbox/bpf2socks";
-        case ASTERISKD_OWNER_META: return "/sys/fs/bpf/asteriskmeta/bpf2socks";
-    }
-    return NULL;
-}
-
 const char *asteriskd_bpf2_tc_filter_attachment_name(enum asteriskd_program_id program_id) {
     return program_id == ASTERISKD_PROGRAM_BPF2SOCKS_INGRESS
         ? "tc_ingress:[*fsobj]"
@@ -51,8 +42,8 @@ int asteriskd_bpf2_pin_plan_build(
     if (plan != NULL) memset(plan, 0, sizeof(*plan));
     if (config == NULL || plan == NULL || config->mode != ASTERISKD_MODE_BPF2SOCKS ||
         config->helper.type != ASTERISKD_HELPER_BPF2SOCKS) return ASTERISKD_CONFIG_INVALID;
-    const char *root = owner_pin_root(config->owner);
-    if (root == NULL || append_pin(plan, ASTERISKD_PIN_BPF2SOCKS_LOCAL_ADDRESS_V4,
+    const char *root = asteriskd_owned_resource_catalog()->bpf2_root;
+    if (append_pin(plan, ASTERISKD_PIN_BPF2SOCKS_LOCAL_ADDRESS_V4,
         root, "local_addr_v4", false, NULL) != 0 ||
         (config->enable_ipv6 && append_pin(plan, ASTERISKD_PIN_BPF2SOCKS_LOCAL_ADDRESS_V6,
             root, "local_addr_v6", false, NULL) != 0) ||
@@ -67,7 +58,7 @@ int asteriskd_bpf2_pin_plan_build(
 }
 
 int asteriskd_bpf2_pin_records_build(
-    const struct asteriskd_bpf2_pin_plan *plan, struct asteriskd_recovery_record *records,
+    const struct asteriskd_bpf2_pin_plan *plan, struct asteriskd_resource_operation *records,
     size_t capacity, size_t *count) {
     if (count != NULL) *count = 0U;
     if (plan == NULL || records == NULL || count == NULL ||
@@ -76,8 +67,7 @@ int asteriskd_bpf2_pin_records_build(
     }
     memset(records, 0, capacity * sizeof(*records));
     for (size_t index = 0U; index < plan->pin_count; ++index) {
-        records[index].status = ASTERISKD_RECOVERY_INTENT;
-        records[index].kind = ASTERISKD_RECOVERY_BPF_PIN;
+        records[index].kind = ASTERISKD_RESOURCE_OPERATION_BPF_PIN;
         records[index].resource.bpf_pin.pin_id = plan->pins[index].pin_id;
         records[index].resource.bpf_pin.original_presence = false;
     }

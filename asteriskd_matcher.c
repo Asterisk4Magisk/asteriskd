@@ -135,15 +135,6 @@ static int render_uid_array(
     return writer->result;
 }
 
-static const char *owner_pin_root(enum asteriskd_owner owner) {
-    switch (owner) {
-        case ASTERISKD_OWNER_NG: return "/sys/fs/bpf/asteriskng";
-        case ASTERISKD_OWNER_BOX: return "/sys/fs/bpf/asteriskbox";
-        case ASTERISKD_OWNER_META: return "/sys/fs/bpf/asteriskmeta";
-    }
-    return NULL;
-}
-
 static int render_direct_family(
     const char values[][ASTERISKD_MAX_CIDR],
     size_t count,
@@ -179,9 +170,9 @@ int asteriskd_matcher_render_documents(
         matcher_error(error, error_size, "invalid matcher document configuration");
         return ASTERISKD_CONFIG_INVALID;
     }
-    const char *root = owner_pin_root(config->owner);
-    if (root == NULL || (config->direct_cidrs != NULL &&
-        (direct_ipv4_fd < 0 || direct_ipv6_fd < 0))) {
+    const char *root = asteriskd_owned_resource_catalog()->bpf_root;
+    if (config->direct_cidrs != NULL &&
+        (direct_ipv4_fd < 0 || direct_ipv6_fd < 0)) {
         matcher_error(error, error_size, "invalid matcher descriptor configuration");
         return ASTERISKD_CONFIG_INVALID;
     }
@@ -337,14 +328,9 @@ int asteriskd_matcher_pin_plan_build(
     struct asteriskd_matcher_pin_plan *plan) {
     if (plan != NULL) memset(plan, 0, sizeof(*plan));
     if (config == NULL || plan == NULL || !config->matcher.enabled) return ASTERISKD_CONFIG_INVALID;
-    const char *root = owner_pin_root(config->owner);
-    if (root == NULL) return ASTERISKD_CONFIG_INVALID;
     static const enum asteriskd_pin_id ids[] = {
         ASTERISKD_PIN_MATCHER_OUTPUT_V4, ASTERISKD_PIN_MATCHER_OUTPUT_V6,
         ASTERISKD_PIN_MATCHER_PREROUTING_V4, ASTERISKD_PIN_MATCHER_PREROUTING_V6,
-    };
-    static const char *const suffixes[] = {
-        "xt_output_v4", "xt_output_v6", "xt_prerouting_v4", "xt_prerouting_v6",
     };
     static const char *const names[] = {
         "ast_xt_out4", "ast_xt_out6", "ast_xt_pre4", "ast_xt_pre6",
@@ -355,8 +341,8 @@ int asteriskd_matcher_pin_plan_build(
         size_t source = config->enable_ipv6 ? index : ipv4_indices[index];
         struct asteriskd_matcher_pin_expectation *pin = &plan->pins[index];
         pin->pin_id = ids[source];
-        int written = snprintf(pin->path, sizeof(pin->path), "%s/%s", root, suffixes[source]);
-        if (written <= 0 || (size_t)written >= sizeof(pin->path) ||
+        if (copy_path(pin->path, sizeof(pin->path),
+                asteriskd_owned_pin_path(ids[source])) != 0 ||
             copy_path(pin->program_name, sizeof(pin->program_name), names[source]) != 0) {
             memset(plan, 0, sizeof(*plan));
             return ASTERISKD_CONFIG_INVALID;
@@ -367,7 +353,7 @@ int asteriskd_matcher_pin_plan_build(
 }
 
 int asteriskd_matcher_pin_records_build(
-    const struct asteriskd_matcher_pin_plan *plan, struct asteriskd_recovery_record *records,
+    const struct asteriskd_matcher_pin_plan *plan, struct asteriskd_resource_operation *records,
     size_t capacity, size_t *count) {
     if (count != NULL) *count = 0U;
     if (plan == NULL || records == NULL || count == NULL ||
@@ -376,8 +362,7 @@ int asteriskd_matcher_pin_records_build(
     }
     memset(records, 0, capacity * sizeof(*records));
     for (size_t index = 0U; index < plan->pin_count; ++index) {
-        records[index].status = ASTERISKD_RECOVERY_INTENT;
-        records[index].kind = ASTERISKD_RECOVERY_BPF_PIN;
+        records[index].kind = ASTERISKD_RESOURCE_OPERATION_BPF_PIN;
         records[index].resource.bpf_pin.pin_id = plan->pins[index].pin_id;
         records[index].resource.bpf_pin.original_presence = false;
     }

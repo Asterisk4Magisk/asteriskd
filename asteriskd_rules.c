@@ -42,11 +42,10 @@ static struct asteriskd_private_chain_group *transaction_add_private_group(
     group->family = family;
     group->table = table;
     group->chain_id = chain_id;
-    group->recovery.status = ASTERISKD_RECOVERY_INTENT;
-    group->recovery.kind = ASTERISKD_RECOVERY_IPTABLES_CHAIN;
-    group->recovery.resource.iptables_chain.family = family;
-    group->recovery.resource.iptables_chain.table = table;
-    group->recovery.resource.iptables_chain.chain_id = chain_id;
+    group->operation.kind = ASTERISKD_RESOURCE_OPERATION_IPTABLES_CHAIN;
+    group->operation.resource.iptables_chain.family = family;
+    group->operation.resource.iptables_chain.table = table;
+    group->operation.resource.iptables_chain.chain_id = chain_id;
     return group;
 }
 
@@ -63,12 +62,11 @@ static struct asteriskd_traffic_hook_group *transaction_add_hook_group(
     group->table = table;
     group->chain_id = chain_id;
     group->rule_id = rule_id;
-    group->recovery.status = ASTERISKD_RECOVERY_INTENT;
-    group->recovery.kind = ASTERISKD_RECOVERY_IPTABLES_RULE;
-    group->recovery.resource.iptables_rule.family = family;
-    group->recovery.resource.iptables_rule.table = table;
-    group->recovery.resource.iptables_rule.chain_id = chain_id;
-    group->recovery.resource.iptables_rule.rule_id = rule_id;
+    group->operation.kind = ASTERISKD_RESOURCE_OPERATION_IPTABLES_RULE;
+    group->operation.resource.iptables_rule.family = family;
+    group->operation.resource.iptables_rule.table = table;
+    group->operation.resource.iptables_rule.chain_id = chain_id;
+    group->operation.resource.iptables_rule.rule_id = rule_id;
     return group;
 }
 
@@ -109,12 +107,11 @@ static int transaction_add_dns_hooks(struct asteriskd_rule_transaction_plan *pla
 }
 
 static int transaction_add_fake_dns(
-    const struct asteriskd_config *config,
     struct asteriskd_rule_transaction_plan *plan) {
-    const char *output = config->owner == ASTERISKD_OWNER_NG ?
-        "ASTERISK_FAKE_DNS_ICMP" : "ASTERISK_FAKE_IP_ICMP";
-    const char *prerouting = config->owner == ASTERISKD_OWNER_NG ?
-        "ASTERISK_FAKE_DNS_ICMP_PRE" : "ASTERISK_FAKE_IP_ICMP_PRE";
+    const struct asteriskd_owned_resource_catalog *catalog =
+        asteriskd_owned_resource_catalog();
+    const char *output = catalog->fake_dns_output_chain;
+    const char *prerouting = catalog->fake_dns_prerouting_chain;
     struct asteriskd_private_chain_group *group = transaction_add_private_group(plan,
         ASTERISKD_IP_FAMILY_IPV4, ASTERISKD_IP_TABLE_NAT, ASTERISKD_CHAIN_FAKE_DNS);
     if (group == NULL || transaction_copy_text(group->names[0], ASTERISKD_MAX_CHAIN_NAME, output) != 0 ||
@@ -175,7 +172,7 @@ int asteriskd_rule_transaction_plan_build(
     }
     if (config->enable_local_dns && config->mode != ASTERISKD_MODE_BPF2SOCKS &&
         transaction_add_dns_hooks(plan) != 0) return ASTERISKD_CONFIG_INVALID;
-    if (config->enable_fake_dns && transaction_add_fake_dns(config, plan) != 0) {
+    if (config->enable_fake_dns && transaction_add_fake_dns(plan) != 0) {
         return ASTERISKD_CONFIG_INVALID;
     }
     plan->hooks_are_last = true;

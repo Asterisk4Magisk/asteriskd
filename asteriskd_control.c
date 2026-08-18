@@ -36,7 +36,7 @@ static const char *const control_event_names[] = {
     "helper-failed", "failed",
 };
 static const char *const control_phase_names[] = {
-    "validating", "acquiring", "recovering", "starting", "applying-rules",
+    "validating", "acquiring", "starting", "applying-rules",
     "running", "stopping", "stopped", "failed",
 };
 static const char *const control_owner_names[] = {"asteriskng", "asteriskbox", "asteriskmeta"};

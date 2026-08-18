@@ -32,7 +32,7 @@ static const char *const component_names[] = {
 };
 static const char *const event_names[] = {
     "starting", "running", "stopping", "stopped", "child-output", "state-loaded",
-    "state-saved", "state-invalid", "recovery", "network-changed", "capability-adjusted",
+    "state-saved", "state-invalid", "network-changed", "capability-adjusted",
     "io-error", "diagnostic",
 };
 static const char *const stream_names[] = {"stdout", "stderr"};

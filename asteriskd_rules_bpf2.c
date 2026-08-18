@@ -31,13 +31,12 @@ int asteriskd_bpf2_token_route_plan_build(
     plan->local_table = true;
     if (slot == ASTERISKD_ROUTE_SLOT_OWNED) return 0;
     plan->create = true;
-    plan->recovery.status = ASTERISKD_RECOVERY_INTENT;
-    plan->recovery.kind = ASTERISKD_RECOVERY_ROUTE;
-    plan->recovery.resource.route.family = ASTERISKD_IP_FAMILY_IPV6;
-    plan->recovery.resource.route.route_id = ASTERISKD_ROUTE_TOKEN;
-    (void)snprintf(plan->recovery.resource.route.interface_name,
-        sizeof(plan->recovery.resource.route.interface_name), "%s", "lo");
-    plan->recovery.resource.route.interface_index = loopback_interface_index;
-    plan->recovery.resource.route.original_presence = false;
+    plan->operation.kind = ASTERISKD_RESOURCE_OPERATION_ROUTE;
+    plan->operation.resource.route.family = ASTERISKD_IP_FAMILY_IPV6;
+    plan->operation.resource.route.route_id = ASTERISKD_ROUTE_TOKEN;
+    (void)snprintf(plan->operation.resource.route.interface_name,
+        sizeof(plan->operation.resource.route.interface_name), "%s", "lo");
+    plan->operation.resource.route.interface_index = loopback_interface_index;
+    plan->operation.resource.route.original_presence = false;
     return 0;
 }

@@ -288,12 +288,14 @@ int asteriskd_runtime_pump_until(struct asteriskd_runtime *runtime,
 static bool runtime_effects_valid(const struct asteriskd_runtime_effect_backend *effects,
     const struct asteriskd_config *config) {
     if (effects == NULL || effects->save_state == NULL || effects->publish_event == NULL ||
-        effects->recover == NULL || effects->start_core == NULL || effects->wait_core == NULL ||
+        effects->reconcile_owned_resources == NULL ||
+        effects->start_core == NULL || effects->wait_core == NULL ||
         effects->open_network == NULL || effects->apply_rules == NULL || effects->verify == NULL ||
         effects->network_immediate == NULL || effects->reconcile == NULL ||
         effects->quiesce_traffic == NULL ||
         effects->remove_rules == NULL || effects->close_network == NULL ||
-        effects->stop_core == NULL || effects->restore == NULL || effects->release == NULL) return false;
+        effects->stop_core == NULL || effects->restore_best_effort == NULL ||
+        effects->release == NULL) return false;
     if (config->matcher.enabled &&
         (effects->ensure_platform_capability == NULL || effects->start_matcher == NULL ||
          effects->stop_matcher == NULL)) return false;
@@ -345,10 +347,10 @@ static int runtime_lifecycle_acquire(void *opaque) {
     return 0;
 }
 
-static int runtime_lifecycle_recover(void *opaque) {
+static int runtime_lifecycle_reconcile(void *opaque) {
     struct asteriskd_runtime *runtime = opaque;
-    if (runtime->effects->recover(runtime->effects->context) != 0 ||
-        !asteriskd_state_is_canonical_stopped(runtime->state)) {
+    if (runtime->effects->reconcile_owned_resources(
+            runtime->effects->context) != 0) {
         return ASTERISKD_CONFIG_IO;
     }
     asteriskd_state_clear_failure(runtime->state);
@@ -499,9 +501,9 @@ static int runtime_lifecycle_stop_core(void *opaque) {
     return 0;
 }
 
-static int runtime_lifecycle_restore(void *opaque) {
+static int runtime_lifecycle_restore_best_effort(void *opaque) {
     struct asteriskd_runtime *runtime = opaque;
-    return runtime->effects->restore(runtime->effects->context);
+    return runtime->effects->restore_best_effort(runtime->effects->context);
 }
 
 static int runtime_lifecycle_release(void *opaque) {
@@ -511,7 +513,7 @@ static int runtime_lifecycle_release(void *opaque) {
 
 static const struct asteriskd_lifecycle_backend runtime_lifecycle_backend = {
     .acquire = runtime_lifecycle_acquire,
-    .recover = runtime_lifecycle_recover,
+    .reconcile = runtime_lifecycle_reconcile,
     .start_core = runtime_lifecycle_start_core,
     .wait_core = runtime_lifecycle_wait_core,
     .ensure_platform_capability = runtime_lifecycle_capability,
@@ -528,7 +530,7 @@ static const struct asteriskd_lifecycle_backend runtime_lifecycle_backend = {
     .stop_matcher = runtime_lifecycle_stop_matcher,
     .stop_helper = runtime_lifecycle_stop_helper,
     .stop_core = runtime_lifecycle_stop_core,
-    .restore = runtime_lifecycle_restore,
+    .restore_best_effort = runtime_lifecycle_restore_best_effort,
     .release = runtime_lifecycle_release,
 };
 
@@ -773,48 +775,12 @@ static int runtime_finish(struct asteriskd_runtime *runtime,
         return abnormal ? 1 : 0;
     }
     (void)runtime_set_failure(runtime, ASTERISKD_FAILURE_STOP_FAILED,
-        ASTERISKD_COMPONENT_RUNTIME, "cleanup incomplete; recovery evidence retained", NULL);
+        ASTERISKD_COMPONENT_RUNTIME, "critical cleanup incomplete", NULL);
     (void)runtime_publish_event(runtime, ASTERISKD_CONTROL_EVENT_FAILED);
     return 1;
 }
 
-int asteriskd_runtime_prepare_start_state(
-    struct asteriskd_state_store *store,
-    struct asteriskd_state_document *state,
-    const struct asteriskd_config *config,
-    char *error,
-    size_t error_size) {
-    if (store == NULL || state == NULL || config == NULL || !state->initialized) {
-        if (error != NULL && error_size != 0U) {
-            (void)snprintf(error, error_size, "%s", "invalid start state");
-        }
-        return ASTERISKD_STATE_INVALID;
-    }
-    if (state->owner == config->owner && state->core_type == config->core_type &&
-        state->mode == config->mode) return ASTERISKD_STATE_OK;
-    if (state->owner != config->owner || state->core_type != config->core_type) {
-        if (error != NULL && error_size != 0U) {
-            (void)snprintf(error, error_size, "%s", "start state identity mismatch");
-        }
-        return ASTERISKD_STATE_INCOMPATIBLE;
-    }
-    if (!asteriskd_state_is_canonical_stopped(state)) return ASTERISKD_STATE_OK;
-
-    struct asteriskd_state_document replacement;
-    int initialized = asteriskd_state_document_init(
-        &replacement, config->owner, config->core_type, config->mode);
-    if (initialized != ASTERISKD_STATE_OK) return initialized;
-    int saved = asteriskd_state_store_save(store, &replacement, error, error_size);
-    if (saved != ASTERISKD_STATE_OK) {
-        asteriskd_state_document_destroy(&replacement);
-        return saved;
-    }
-    asteriskd_state_document_destroy(state);
-    *state = replacement;
-    return ASTERISKD_STATE_OK;
-}
-
-bool asteriskd_runtime_recover_before_helper_stop(enum asteriskd_mode mode) {
+bool asteriskd_runtime_remove_tc_before_helper_stop(enum asteriskd_mode mode) {
     return mode == ASTERISKD_MODE_BPF2SOCKS;
 }
 
@@ -827,7 +793,7 @@ int asteriskd_runtime_supervise(struct asteriskd_runtime *runtime,
         !state->initialized ||
         state->owner != config->owner ||
         state->core_type != config->core_type ||
-        (state->mode != config->mode && asteriskd_state_is_canonical_stopped(state)) ||
+        state->mode != config->mode ||
         !runtime_effects_valid(effects, config)) return ASTERISKD_CONFIG_INVALID;
     runtime->config = config;
     runtime->state = state;
@@ -993,6 +959,15 @@ static bool action_should_cancel(
     return !cleanup_in_progress && stop_requested;
 }
 
+static bool cycle_failure_requires_shutdown(bool service_control_enabled) {
+    return !service_control_enabled;
+}
+
+static bool admission_reconcile_ready(
+    bool listener_acquired, bool action_reactor_ready) {
+    return listener_acquired && action_reactor_ready;
+}
+
 #if defined(ASTERISKD_TESTING)
 bool asteriskd_test_runtime_event_is_final(enum asteriskd_control_event_type type) {
     return runtime_event_is_final(type);
@@ -1001,6 +976,16 @@ bool asteriskd_test_runtime_event_is_final(enum asteriskd_control_event_type typ
 bool asteriskd_test_action_should_cancel(
     bool stop_requested, bool cleanup_in_progress) {
     return action_should_cancel(stop_requested, cleanup_in_progress);
+}
+
+bool asteriskd_test_cycle_failure_requires_shutdown(
+    bool service_control_enabled) {
+    return cycle_failure_requires_shutdown(service_control_enabled);
+}
+
+bool asteriskd_test_admission_reconcile_ready(
+    bool listener_acquired, bool action_reactor_ready) {
+    return admission_reconcile_ready(listener_acquired, action_reactor_ready);
 }
 #endif
 
@@ -1062,6 +1047,7 @@ struct asteriskd_system_supervisor {
     bool service_running;
     bool shutdown_requested;
     bool service_start_requested;
+    struct asteriskd_effect_journal volatile_effects;
     bool stop_requested;
     bool stopping_children;
     struct asteriskd_process_spec core_spec;
@@ -1106,7 +1092,7 @@ struct asteriskd_system_supervisor {
     struct asteriskd_tc_filter_expectation tc_filter_netlink_expectation;
     enum asteriskd_rules_slot_state tc_filter_netlink_state;
     enum asteriskd_rules_slot_state tc_qdisc_netlink_state;
-    enum asteriskd_wal_pin_batch_kind active_pin_batch;
+    enum asteriskd_pin_batch_kind active_pin_batch;
     bool pin_batch_active;
     struct asteriskd_child_process action_process;
     struct asteriskd_child_setup_stream action_setup;
@@ -1132,7 +1118,7 @@ struct asteriskd_system_supervisor {
     int stop_result;
     struct asteriskd_network_runtime network;
     bool network_opened;
-    struct asteriskd_typed_wal_sink network_wal_sink;
+    struct asteriskd_network_effect_sink network_effect_sink;
     struct asteriskd_rules_runtime rules_runtime;
     struct asteriskd_rules_backend rules_backend;
     bool rules_initialized;
@@ -1750,18 +1736,18 @@ static int system_effect_event(void *opaque, enum asteriskd_control_event_type t
         runtime_event_is_final(type), (uint64_t)now);
 }
 
-static int system_cleanup_start_state(struct asteriskd_system_supervisor *system);
+static int system_reconcile_owned_resources(
+    struct asteriskd_system_supervisor *, char *, size_t);
+static void system_reconcile_error(char *, size_t, const char *);
 static int system_effect_stop_core(void *opaque);
 static void system_runtime_reset_cycle(struct asteriskd_system_supervisor *system);
 
-static int system_effect_recover(void *opaque) {
+static int system_effect_reconcile_owned_resources(void *opaque) {
     struct asteriskd_system_supervisor *system = opaque;
-    if (system_cleanup_start_state(system) != 0) return -1;
+    char error[256U];
+    if (system_reconcile_owned_resources(system, error, sizeof(error)) != 0) return -1;
     system_runtime_reset_cycle(system);
-    char error[128U];
-    return asteriskd_runtime_prepare_start_state(
-        &system->store, &system->state, &system->loaded_config.config,
-        error, sizeof(error)) == ASTERISKD_STATE_OK ? 0 : -1;
+    return 0;
 }
 
 static bool system_core_setup_done(void *opaque) {
@@ -3459,6 +3445,27 @@ static int system_ip_command(struct asteriskd_system_supervisor *system,
     return system_action_run_argv(system, argv, capture, exit_status);
 }
 
+static int system_ip_unscoped_command(
+    struct asteriskd_system_supervisor *system,
+    const char *const *arguments,
+    size_t argument_count,
+    bool capture,
+    int *exit_status) {
+    const char *argv[24U];
+    size_t count = 0U;
+
+    if (argument_count > 22U ||
+        (argument_count != 0U && arguments == NULL) ||
+        exit_status == NULL) return -1;
+    argv[count++] = "/system/bin/ip";
+    for (size_t index = 0U; index < argument_count; ++index) {
+        if (arguments[index] == NULL || arguments[index][0] == '\0') return -1;
+        argv[count++] = arguments[index];
+    }
+    argv[count] = NULL;
+    return system_action_run_argv(system, argv, capture, exit_status);
+}
+
 static int system_ip_zero(struct asteriskd_system_supervisor *system,
     enum asteriskd_ip_family family, const char *const *arguments, size_t argument_count) {
     if (system->rule_commands.active) {
@@ -3925,71 +3932,6 @@ static int system_tc_apply_filter(struct asteriskd_system_supervisor *system,
     return system_tc_zero(system, arguments, 15U);
 }
 
-static int system_tc_remove_filter(struct asteriskd_system_supervisor *system,
-    const struct asteriskd_tc_filter_resource *resource) {
-    enum asteriskd_rules_slot_state state = ASTERISKD_RULES_SLOT_FOREIGN;
-    int probed = system_tc_probe_filter(system, resource, &state);
-    if (probed != 0 || state == ASTERISKD_RULES_SLOT_FOREIGN) {
-        char message[192U];
-        int written = snprintf(message, sizeof(message),
-            "TC filter cleanup probe failed: direction=%u probe=%d state=%u",
-            (unsigned)resource->direction, probed, (unsigned)state);
-        if (written > 0 && (size_t)written < sizeof(message)) {
-            (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
-                ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
-        }
-        return -1;
-    }
-    if (state == ASTERISKD_RULES_SLOT_ABSENT) return 0;
-    const char *direction = system_tc_direction(resource->direction);
-    const char *arguments[] = {"filter", "del", "dev", resource->interface_name,
-        direction, "pref", "1", "handle", "1", "bpf"};
-    int exit_status = -1;
-    int result = system_tc_command(system, arguments, 10U, false, &exit_status);
-    if (result != 0 || exit_status != 0) {
-        char message[192U];
-        int written = snprintf(message, sizeof(message),
-            "TC filter cleanup command failed: direction=%u result=%d exit=%d",
-            (unsigned)resource->direction, result, exit_status);
-        if (written > 0 && (size_t)written < sizeof(message)) {
-            (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
-                ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
-        }
-        return -1;
-    }
-    return 0;
-}
-
-static int system_tc_inspect_qdisc_cleanup(struct asteriskd_system_supervisor *system,
-    const struct asteriskd_tc_qdisc_resource *resource, bool *present,
-    enum asteriskd_tc_qdisc_cleanup_decision *decision) {
-    if (present == NULL || decision == NULL ||
-        system_tc_probe_qdisc(system, resource, present) != 0) return -1;
-    *decision = ASTERISKD_TC_QDISC_CLEANUP_DELETE;
-    if (!*present) return 0;
-    const char *ingress[] = {"filter", "show", "dev", resource->interface_name, "ingress"};
-    const char *egress[] = {"filter", "show", "dev", resource->interface_name, "egress"};
-    int exit_status = -1;
-    if (system_tc_command(system, ingress, 5U, true, &exit_status) != 0 ||
-        exit_status != 0) return -1;
-    bool ingress_occupied = system->action_stdout_length != 0U;
-    if (system_tc_command(system, egress, 5U, true, &exit_status) != 0 ||
-        exit_status != 0) return -1;
-    bool egress_occupied = system->action_stdout_length != 0U;
-    *decision = asteriskd_tc_qdisc_cleanup_decide(ingress_occupied, egress_occupied);
-    return 0;
-}
-
-static int system_tc_remove_qdisc(struct asteriskd_system_supervisor *system,
-    const struct asteriskd_tc_qdisc_resource *resource) {
-    bool present = false;
-    enum asteriskd_tc_qdisc_cleanup_decision decision;
-    if (system_tc_inspect_qdisc_cleanup(
-            system, resource, &present, &decision) != 0) return -1;
-    if (asteriskd_tc_qdisc_cleanup_restored(present, decision)) return 0;
-    const char *arguments[] = {"qdisc", "del", "dev", resource->interface_name, "clsact"};
-    return system_tc_zero(system, arguments, 5U);
-}
 
 static int system_apply_route_effect(struct asteriskd_system_supervisor *system,
     const struct asteriskd_route_effect *effect) {
@@ -4064,36 +4006,6 @@ static bool system_dummy_effect_matches(
     return up && found;
 }
 
-static const struct asteriskd_recovery_record *system_dummy_recovery_record(
-    const struct asteriskd_system_supervisor *system,
-    const struct asteriskd_route_effect *effect) {
-    if (system == NULL || effect == NULL ||
-        effect->kind != ASTERISKD_ROUTE_EFFECT_DUMMY_INTERFACE) return NULL;
-    const struct asteriskd_recovery_record *match = NULL;
-    for (size_t index = 0U; index < system->state.recovery.record_count; ++index) {
-        const struct asteriskd_recovery_record *record =
-            &system->state.recovery.records[index];
-        if (record->kind != ASTERISKD_RECOVERY_DUMMY_INTERFACE ||
-            record->resource.dummy_interface.interface_id != effect->interface_id) continue;
-        if (match != NULL) return NULL;
-        match = record;
-    }
-    return match;
-}
-
-static bool system_dummy_recovery_identity_matches(
-    const struct asteriskd_system_supervisor *system,
-    const struct asteriskd_route_effect *effect) {
-    const struct asteriskd_recovery_record *record =
-        system_dummy_recovery_record(system, effect);
-    if (record == NULL || record->resource.dummy_interface.original_presence) return false;
-    if (record->status == ASTERISKD_RECOVERY_INTENT) return true;
-    return record->status == ASTERISKD_RECOVERY_APPLIED &&
-        record->resource.dummy_interface.has_interface_index &&
-        system_dummy_effect_matches(
-            effect, record->resource.dummy_interface.interface_index);
-}
-
 static int system_probe_route_effect(struct asteriskd_system_supervisor *system,
     const struct asteriskd_route_effect *effect, bool *present);
 static int system_classify_route_effect(struct asteriskd_system_supervisor *system,
@@ -4133,7 +4045,9 @@ static int system_remove_route_effect(struct asteriskd_system_supervisor *system
                 sizeof(normal) / sizeof(normal[0]));
     }
     if (effect->kind == ASTERISKD_ROUTE_EFFECT_DUMMY_INTERFACE) {
-        if (!system_dummy_recovery_identity_matches(system, effect)) return -1;
+        uint32_t interface_index = if_nametoindex(effect->interface_name);
+        if (interface_index == 0U ||
+            !system_dummy_effect_matches(effect, interface_index)) return -1;
         const char *arguments[] = {"link", "del", effect->interface_name, "type", "dummy"};
         return system_ip_zero(system, effect->family, arguments, 5U);
     }
@@ -4200,18 +4114,18 @@ static int system_classify_route_effect(struct asteriskd_system_supervisor *syst
 
 static const struct asteriskd_route_effect *system_find_route_effect(
     const struct asteriskd_system_supervisor *system,
-    const struct asteriskd_recovery_record *record) {
+    const struct asteriskd_resource_operation *record) {
     for (size_t index = 0U; index < system->rules_runtime.plan.route_count; ++index) {
         const struct asteriskd_route_effect *effect = &system->rules_runtime.plan.routes[index];
-        if (record->kind == ASTERISKD_RECOVERY_IP_RULE &&
+        if (record->kind == ASTERISKD_RESOURCE_OPERATION_IP_RULE &&
             effect->kind == ASTERISKD_ROUTE_EFFECT_IP_RULE &&
             effect->family == record->resource.ip_rule.family &&
             effect->ip_rule_id == record->resource.ip_rule.rule_id) return effect;
-        if (record->kind == ASTERISKD_RECOVERY_ROUTE &&
+        if (record->kind == ASTERISKD_RESOURCE_OPERATION_ROUTE &&
             effect->kind == ASTERISKD_ROUTE_EFFECT_ROUTE &&
             effect->family == record->resource.route.family &&
             effect->route_id == record->resource.route.route_id) return effect;
-        if (record->kind == ASTERISKD_RECOVERY_DUMMY_INTERFACE &&
+        if (record->kind == ASTERISKD_RESOURCE_OPERATION_DUMMY_INTERFACE &&
             effect->kind == ASTERISKD_ROUTE_EFFECT_DUMMY_INTERFACE &&
             effect->interface_id == record->resource.dummy_interface.interface_id) return effect;
     }
@@ -4219,16 +4133,15 @@ static const struct asteriskd_route_effect *system_find_route_effect(
 }
 
 static int system_route_record(struct asteriskd_system_supervisor *system,
-    const struct asteriskd_route_effect *effect, struct asteriskd_recovery_record *record) {
+    const struct asteriskd_route_effect *effect, struct asteriskd_resource_operation *record) {
     (void)system;
     memset(record, 0, sizeof(*record));
-    record->status = ASTERISKD_RECOVERY_INTENT;
     if (effect->kind == ASTERISKD_ROUTE_EFFECT_IP_RULE) {
-        record->kind = ASTERISKD_RECOVERY_IP_RULE;
+        record->kind = ASTERISKD_RESOURCE_OPERATION_IP_RULE;
         record->resource.ip_rule.family = effect->family;
         record->resource.ip_rule.rule_id = effect->ip_rule_id;
     } else if (effect->kind == ASTERISKD_ROUTE_EFFECT_ROUTE) {
-        record->kind = ASTERISKD_RECOVERY_ROUTE;
+        record->kind = ASTERISKD_RESOURCE_OPERATION_ROUTE;
         record->resource.route.family = effect->family;
         record->resource.route.route_id = effect->route_id;
         if (snprintf(record->resource.route.interface_name,
@@ -4237,7 +4150,7 @@ static int system_route_record(struct asteriskd_system_supervisor *system,
         record->resource.route.interface_index = if_nametoindex(effect->interface_name);
         if (record->resource.route.interface_index == 0U) return -1;
     } else if (effect->kind == ASTERISKD_ROUTE_EFFECT_DUMMY_INTERFACE) {
-        record->kind = ASTERISKD_RECOVERY_DUMMY_INTERFACE;
+        record->kind = ASTERISKD_RESOURCE_OPERATION_DUMMY_INTERFACE;
         record->resource.dummy_interface.interface_id = effect->interface_id;
     } else {
         return -1;
@@ -4414,150 +4327,162 @@ static int system_sysctl_write(
     return count == (ssize_t)sizeof(bytes) ? 0 : -1;
 }
 
-static int system_wal_probe_original(void *opaque,
-    const struct asteriskd_recovery_record *record,
-    struct asteriskd_wal_original_delta *delta, char *error, size_t error_size) {
-    struct asteriskd_system_supervisor *system = opaque;
-    if (record == NULL || delta == NULL) return -1;
-    memset(delta, 0, sizeof(*delta));
-    if (record->kind == ASTERISKD_RECOVERY_SYSCTL) {
-        uint8_t value = 0U;
-        if (system_sysctl_read(&record->resource.sysctl, &value) != 0) return -1;
-        delta->kind = ASTERISKD_WAL_ORIGINAL_DELTA_SYSCTL_VALUE;
-        delta->original_value = value;
-        return 0;
+static int system_effect_probe_original(
+    void *opaque, struct asteriskd_effect *effect,
+    char *error, size_t error_size) {
+    uint8_t value = 0U;
+    (void)opaque;
+    if (effect == NULL || effect->kind != ASTERISKD_EFFECT_SYSCTL ||
+        system_sysctl_read(&effect->resource.sysctl, &value) != 0) {
+        system_reconcile_error(error, error_size,
+            "failed to read original sysctl value");
+        return -1;
     }
-    if (record->kind == ASTERISKD_RECOVERY_BPF_PIN) {
-        const char *path = system_pin_path(system, record->resource.bpf_pin.pin_id);
-        const struct asteriskd_bpf_pin_ownership_backend *backend =
-            asteriskd_system_bpf_pin_ownership_backend();
-        bool exists = true;
-        uint64_t object_id = 0U;
-        if (path == NULL || backend == NULL ||
-            backend->probe(backend->context, path, &exists, &object_id) != 0 ||
-            (exists && object_id == 0U) || (!exists && object_id != 0U)) {
-            if (error != NULL && error_size != 0U) {
-                (void)snprintf(error, error_size, "%s", "cannot inspect BPF pin before mutation");
-            }
-            return -1;
-        }
-        delta->kind = ASTERISKD_WAL_ORIGINAL_DELTA_PRESENCE;
-        delta->original_presence = exists;
-        return 0;
-    }
-    if (record->kind == ASTERISKD_RECOVERY_TC_QDISC) {
-        bool present = false;
-        if (system_tc_probe_qdisc(system, &record->resource.tc_qdisc, &present) != 0 ||
-            present) return -1;
-        delta->kind = ASTERISKD_WAL_ORIGINAL_DELTA_PRESENCE;
-        delta->original_presence = false;
-        return 0;
-    }
-    if (record->kind == ASTERISKD_RECOVERY_TC_FILTER) {
-        enum asteriskd_rules_slot_state state = ASTERISKD_RULES_SLOT_FOREIGN;
-        if (system_tc_probe_filter(system, &record->resource.tc_filter, &state) != 0 ||
-            state != ASTERISKD_RULES_SLOT_ABSENT) return -1;
-        delta->kind = ASTERISKD_WAL_ORIGINAL_DELTA_PRESENCE;
-        delta->original_presence = false;
-        return 0;
-    }
-    if (record->kind == ASTERISKD_RECOVERY_IPTABLES_CHAIN) {
-        const struct asteriskd_private_chain_group *group =
-            system_find_private_group(system, &record->resource.iptables_chain);
-        bool all_present = false;
-        bool any_present = false;
-        if (group == NULL || system_probe_private_group(
-                system, group, &all_present, &any_present) != 0 ||
-            any_present) return -1;
-        delta->kind = ASTERISKD_WAL_ORIGINAL_DELTA_PRESENCE;
-        delta->original_presence = false;
-        return 0;
-    }
-    if (record->kind == ASTERISKD_RECOVERY_IPTABLES_RULE) {
-        const struct asteriskd_traffic_hook_group *group =
-            system_find_hook_group(system, &record->resource.iptables_rule);
-        bool all_present = false;
-        bool any_present = false;
-        if (group == NULL || system_probe_hook_group(
-                system, group, &all_present, &any_present) != 0 ||
-            any_present) return -1;
-        delta->kind = ASTERISKD_WAL_ORIGINAL_DELTA_PRESENCE;
-        delta->original_presence = false;
-        return 0;
-    }
-    if (record->kind == ASTERISKD_RECOVERY_IP_RULE ||
-        record->kind == ASTERISKD_RECOVERY_ROUTE ||
-        record->kind == ASTERISKD_RECOVERY_DUMMY_INTERFACE) {
-        const struct asteriskd_route_effect *effect = system_find_route_effect(system, record);
-        bool present = false;
-        if (effect == NULL || system_probe_route_effect(system, effect, &present) != 0 || present) {
-            return -1;
-        }
-        delta->kind = ASTERISKD_WAL_ORIGINAL_DELTA_PRESENCE;
-        delta->original_presence = false;
-        return 0;
-    }
-    return -1;
+    effect->resource.sysctl.original_value = value;
+    return 0;
 }
 
-static bool system_rule_recovery_kind(enum asteriskd_recovery_kind kind) {
-    return kind == ASTERISKD_RECOVERY_IPTABLES_CHAIN ||
-        kind == ASTERISKD_RECOVERY_IPTABLES_RULE ||
-        kind == ASTERISKD_RECOVERY_IP_RULE ||
-        kind == ASTERISKD_RECOVERY_ROUTE ||
-        kind == ASTERISKD_RECOVERY_DUMMY_INTERFACE;
+static int system_effect_apply_one(
+    void *opaque, const struct asteriskd_effect *effect,
+    char *error, size_t error_size) {
+    (void)opaque;
+    if (effect == NULL || effect->kind != ASTERISKD_EFFECT_SYSCTL ||
+        system_sysctl_write(&effect->resource.sysctl,
+            effect->resource.sysctl.desired_value) != 0) {
+        system_reconcile_error(error, error_size, "failed to apply sysctl value");
+        return -1;
+    }
+    return 0;
 }
 
-static int system_wal_apply(void *opaque, const struct asteriskd_recovery_record *records,
+static int system_effect_verify_value(
+    const struct asteriskd_effect *effect, uint8_t expected,
+    char *error, size_t error_size) {
+    uint8_t value = 0U;
+    if (effect == NULL || effect->kind != ASTERISKD_EFFECT_SYSCTL ||
+        system_sysctl_read(&effect->resource.sysctl, &value) != 0 ||
+        value != expected) {
+        system_reconcile_error(error, error_size, "sysctl verification failed");
+        return -1;
+    }
+    return 0;
+}
+
+static int system_effect_verify_applied_one(
+    void *opaque, const struct asteriskd_effect *effect,
+    char *error, size_t error_size) {
+    (void)opaque;
+    return system_effect_verify_value(effect,
+        effect->resource.sysctl.desired_value, error, error_size);
+}
+
+static int system_effect_undo_one(
+    void *opaque, const struct asteriskd_effect *effect,
+    char *error, size_t error_size) {
+    (void)opaque;
+    if (effect == NULL || effect->kind != ASTERISKD_EFFECT_SYSCTL ||
+        system_sysctl_write(&effect->resource.sysctl,
+            effect->resource.sysctl.original_value) != 0) {
+        system_reconcile_error(error, error_size, "failed to restore sysctl value");
+        return -1;
+    }
+    return 0;
+}
+
+static int system_effect_verify_restored_one(
+    void *opaque, const struct asteriskd_effect *effect,
+    char *error, size_t error_size) {
+    (void)opaque;
+    return system_effect_verify_value(effect,
+        effect->resource.sysctl.original_value, error, error_size);
+}
+
+static struct asteriskd_effect_backend system_effect_backend(
+    struct asteriskd_system_supervisor *system) {
+    const struct asteriskd_effect_backend backend = {
+        .context = system,
+        .probe_original = system_effect_probe_original,
+        .apply = system_effect_apply_one,
+        .verify_applied = system_effect_verify_applied_one,
+        .undo = system_effect_undo_one,
+        .verify_restored = system_effect_verify_restored_one,
+    };
+    return backend;
+}
+
+static int system_effect_apply_sysctl(
+    struct asteriskd_system_supervisor *system,
+    const struct asteriskd_sysctl_resource *resource,
+    char *error, size_t error_size) {
+    struct asteriskd_effect effect;
+    struct asteriskd_effect_backend backend = system_effect_backend(system);
+    if (system == NULL || resource == NULL) return -1;
+    memset(&effect, 0, sizeof(effect));
+    effect.kind = ASTERISKD_EFFECT_SYSCTL;
+    effect.resource.sysctl = *resource;
+    return asteriskd_effect_journal_apply(
+        &system->volatile_effects, &effect, &backend, error, error_size);
+}
+
+
+static bool system_rule_operation_kind(enum asteriskd_resource_operation_kind kind) {
+    return kind == ASTERISKD_RESOURCE_OPERATION_IPTABLES_CHAIN ||
+        kind == ASTERISKD_RESOURCE_OPERATION_IPTABLES_RULE ||
+        kind == ASTERISKD_RESOURCE_OPERATION_IP_RULE ||
+        kind == ASTERISKD_RESOURCE_OPERATION_ROUTE ||
+        kind == ASTERISKD_RESOURCE_OPERATION_DUMMY_INTERFACE;
+}
+
+static int system_apply_operations(void *opaque, const struct asteriskd_resource_operation *records,
     size_t count, char *error, size_t error_size) {
     struct asteriskd_system_supervisor *system = opaque;
     if (records == NULL || count == 0U) return -1;
-    if (count == 1U && records[0].kind == ASTERISKD_RECOVERY_SYSCTL) {
+    if (count == 1U && records[0].kind == ASTERISKD_RESOURCE_OPERATION_SYSCTL) {
         return system_sysctl_write(&records[0].resource.sysctl,
             records[0].resource.sysctl.desired_value);
     }
-    if (count == 1U && records[0].kind == ASTERISKD_RECOVERY_TC_QDISC) {
+    if (count == 1U && records[0].kind == ASTERISKD_RESOURCE_OPERATION_TC_QDISC) {
         return system_tc_apply_qdisc(system, &records[0].resource.tc_qdisc);
     }
-    if (count == 1U && records[0].kind == ASTERISKD_RECOVERY_TC_FILTER) {
+    if (count == 1U && records[0].kind == ASTERISKD_RESOURCE_OPERATION_TC_FILTER) {
         return system_tc_apply_filter(system, &records[0].resource.tc_filter);
     }
-    bool rule_batch = system_rule_recovery_kind(records[0].kind);
+    bool rule_batch = system_rule_operation_kind(records[0].kind);
     for (size_t index = 0U; rule_batch && index < count; ++index) {
-        enum asteriskd_recovery_kind kind = records[index].kind;
-        rule_batch = kind == ASTERISKD_RECOVERY_IPTABLES_CHAIN ||
-            kind == ASTERISKD_RECOVERY_IPTABLES_RULE ||
-            kind == ASTERISKD_RECOVERY_IP_RULE ||
-            kind == ASTERISKD_RECOVERY_ROUTE ||
-            kind == ASTERISKD_RECOVERY_DUMMY_INTERFACE;
+        enum asteriskd_resource_operation_kind kind = records[index].kind;
+        rule_batch = kind == ASTERISKD_RESOURCE_OPERATION_IPTABLES_CHAIN ||
+            kind == ASTERISKD_RESOURCE_OPERATION_IPTABLES_RULE ||
+            kind == ASTERISKD_RESOURCE_OPERATION_IP_RULE ||
+            kind == ASTERISKD_RESOURCE_OPERATION_ROUTE ||
+            kind == ASTERISKD_RESOURCE_OPERATION_DUMMY_INTERFACE;
     }
     if (rule_batch) {
-        enum asteriskd_recovery_kind previous_kind = ASTERISKD_RECOVERY_KIND_COUNT;
+        enum asteriskd_resource_operation_kind previous_kind = ASTERISKD_RESOURCE_OPERATION_KIND_COUNT;
         if (system_rule_batch_begin(&system->rule_commands) != 0) return -1;
         for (size_t index = 0U; index < count; ++index) {
-            const struct asteriskd_recovery_record *record = &records[index];
-            bool route = record->kind == ASTERISKD_RECOVERY_IP_RULE ||
-                record->kind == ASTERISKD_RECOVERY_ROUTE ||
-                record->kind == ASTERISKD_RECOVERY_DUMMY_INTERFACE;
-            bool previous_route = previous_kind == ASTERISKD_RECOVERY_IP_RULE ||
-                previous_kind == ASTERISKD_RECOVERY_ROUTE ||
-                previous_kind == ASTERISKD_RECOVERY_DUMMY_INTERFACE;
+            const struct asteriskd_resource_operation *record = &records[index];
+            bool route = record->kind == ASTERISKD_RESOURCE_OPERATION_IP_RULE ||
+                record->kind == ASTERISKD_RESOURCE_OPERATION_ROUTE ||
+                record->kind == ASTERISKD_RESOURCE_OPERATION_DUMMY_INTERFACE;
+            bool previous_route = previous_kind == ASTERISKD_RESOURCE_OPERATION_IP_RULE ||
+                previous_kind == ASTERISKD_RESOURCE_OPERATION_ROUTE ||
+                previous_kind == ASTERISKD_RESOURCE_OPERATION_DUMMY_INTERFACE;
             if (route && !previous_route &&
                 system_rule_batch_flush_xtables(system) != 0) goto rule_batch_failed;
-            if (record->kind == ASTERISKD_RECOVERY_IPTABLES_RULE && previous_route &&
+            if (record->kind == ASTERISKD_RESOURCE_OPERATION_IPTABLES_RULE && previous_route &&
                 system_rule_batch_flush_ip(system) != 0) goto rule_batch_failed;
             int result = -1;
-            if (record->kind == ASTERISKD_RECOVERY_IPTABLES_CHAIN) {
+            if (record->kind == ASTERISKD_RESOURCE_OPERATION_IPTABLES_CHAIN) {
                 const struct asteriskd_private_chain_group *group =
                     system_find_private_group(system, &record->resource.iptables_chain);
                 result = group == NULL ? -1 : system_create_private_group(system, group);
-            } else if (record->kind == ASTERISKD_RECOVERY_IPTABLES_RULE) {
+            } else if (record->kind == ASTERISKD_RESOURCE_OPERATION_IPTABLES_RULE) {
                 const struct asteriskd_traffic_hook_group *group =
                     system_find_hook_group(system, &record->resource.iptables_rule);
                 result = group == NULL ? -1 : system_apply_hook_group(system, group);
-            } else if (record->kind == ASTERISKD_RECOVERY_IP_RULE ||
-                record->kind == ASTERISKD_RECOVERY_ROUTE ||
-                record->kind == ASTERISKD_RECOVERY_DUMMY_INTERFACE) {
+            } else if (record->kind == ASTERISKD_RESOURCE_OPERATION_IP_RULE ||
+                record->kind == ASTERISKD_RESOURCE_OPERATION_ROUTE ||
+                record->kind == ASTERISKD_RESOURCE_OPERATION_DUMMY_INTERFACE) {
                 const struct asteriskd_route_effect *effect =
                     system_find_route_effect(system, record);
                 result = effect == NULL ? -1 : system_apply_route_effect(system, effect);
@@ -4565,15 +4490,15 @@ static int system_wal_apply(void *opaque, const struct asteriskd_recovery_record
             if (result != 0) {
                 if (error != NULL && error_size != 0U) {
                     (void)snprintf(error, error_size,
-                        "rule WAL batch apply failed at index %zu", index);
+                        "rule operation batch apply failed at index %zu", index);
                 }
                 goto rule_batch_failed;
             }
             previous_kind = record->kind;
         }
-        if (previous_kind == ASTERISKD_RECOVERY_IP_RULE ||
-            previous_kind == ASTERISKD_RECOVERY_ROUTE ||
-            previous_kind == ASTERISKD_RECOVERY_DUMMY_INTERFACE) {
+        if (previous_kind == ASTERISKD_RESOURCE_OPERATION_IP_RULE ||
+            previous_kind == ASTERISKD_RESOURCE_OPERATION_ROUTE ||
+            previous_kind == ASTERISKD_RESOURCE_OPERATION_DUMMY_INTERFACE) {
             if (system_rule_batch_flush_ip(system) != 0) goto rule_batch_failed;
         } else if (system_rule_batch_flush_xtables(system) != 0) {
             goto rule_batch_failed;
@@ -4587,7 +4512,7 @@ rule_batch_failed:
         system_rule_snapshot_destroy(&system->rule_snapshot);
         return -1;
     }
-    if (records[0].kind == ASTERISKD_RECOVERY_IPTABLES_CHAIN) {
+    if (records[0].kind == ASTERISKD_RESOURCE_OPERATION_IPTABLES_CHAIN) {
         const struct asteriskd_private_chain_group *group =
             system_find_private_group(system, &records[0].resource.iptables_chain);
         if (group != NULL && system_create_private_group(system, group) == 0) return 0;
@@ -4596,7 +4521,7 @@ rule_batch_failed:
         }
         return -1;
     }
-    if (count == 1U && records[0].kind == ASTERISKD_RECOVERY_IPTABLES_RULE) {
+    if (count == 1U && records[0].kind == ASTERISKD_RESOURCE_OPERATION_IPTABLES_RULE) {
         const struct asteriskd_traffic_hook_group *group =
             system_find_hook_group(system, &records[0].resource.iptables_rule);
         if (group == NULL) {
@@ -4611,20 +4536,20 @@ rule_batch_failed:
         }
         return -1;
     }
-    if (count == 1U && (records[0].kind == ASTERISKD_RECOVERY_IP_RULE ||
-            records[0].kind == ASTERISKD_RECOVERY_ROUTE ||
-            records[0].kind == ASTERISKD_RECOVERY_DUMMY_INTERFACE)) {
+    if (count == 1U && (records[0].kind == ASTERISKD_RESOURCE_OPERATION_IP_RULE ||
+            records[0].kind == ASTERISKD_RESOURCE_OPERATION_ROUTE ||
+            records[0].kind == ASTERISKD_RESOURCE_OPERATION_DUMMY_INTERFACE)) {
         const struct asteriskd_route_effect *effect = system_find_route_effect(system, &records[0]);
         return effect == NULL ? -1 : system_apply_route_effect(system, effect);
     }
     for (size_t index = 0U; index < count; ++index) {
-        if (records[index].kind != ASTERISKD_RECOVERY_BPF_PIN) return -1;
+        if (records[index].kind != ASTERISKD_RESOURCE_OPERATION_BPF_PIN) return -1;
     }
     if (!system->pin_batch_active) return -1;
-    bool matcher_batch = system->active_pin_batch == ASTERISKD_WAL_PIN_BATCH_MATCHER_IPV4 ||
-        system->active_pin_batch == ASTERISKD_WAL_PIN_BATCH_MATCHER_DUAL_STACK;
-    bool bpf2_batch = system->active_pin_batch == ASTERISKD_WAL_PIN_BATCH_BPF2SOCKS_IPV4 ||
-        system->active_pin_batch == ASTERISKD_WAL_PIN_BATCH_BPF2SOCKS_DUAL_STACK;
+    bool matcher_batch = system->active_pin_batch == ASTERISKD_PIN_BATCH_MATCHER_IPV4 ||
+        system->active_pin_batch == ASTERISKD_PIN_BATCH_MATCHER_DUAL_STACK;
+    bool bpf2_batch = system->active_pin_batch == ASTERISKD_PIN_BATCH_BPF2SOCKS_IPV4 ||
+        system->active_pin_batch == ASTERISKD_PIN_BATCH_BPF2SOCKS_DUAL_STACK;
     if ((!matcher_batch && !bpf2_batch) ||
         (matcher_batch ? system_run_matcher_loader(system) :
             system_start_and_verify_bpf2(system)) != 0) {
@@ -4638,22 +4563,21 @@ rule_batch_failed:
     return 0;
 }
 
-static int system_wal_verify_applied(void *opaque,
-    const struct asteriskd_recovery_record *record,
-    struct asteriskd_wal_applied_identity_delta *delta, char *error, size_t error_size) {
+static int system_verify_operation(void *opaque,
+    const struct asteriskd_resource_operation *record,
+    char *error, size_t error_size) {
     struct asteriskd_system_supervisor *system = opaque;
-    if (record == NULL || delta == NULL) return -1;
-    memset(delta, 0, sizeof(*delta));
-    if (system_rule_recovery_kind(record->kind) &&
+    if (record == NULL) return -1;
+    if (system_rule_operation_kind(record->kind) &&
         system->rule_snapshot.phase == SYSTEM_RULE_SNAPSHOT_NEEDS_VERIFY &&
         system_rule_snapshot_capture(system, &system->rules_runtime.plan,
             SYSTEM_RULE_SNAPSHOT_AFTER_APPLY) != 0) return -1;
-    if (record->kind == ASTERISKD_RECOVERY_SYSCTL) {
+    if (record->kind == ASTERISKD_RESOURCE_OPERATION_SYSCTL) {
         uint8_t value = 0U;
         return system_sysctl_read(&record->resource.sysctl, &value) == 0 &&
             value == record->resource.sysctl.desired_value ? 0 : -1;
     }
-    if (record->kind == ASTERISKD_RECOVERY_BPF_PIN) {
+    if (record->kind == ASTERISKD_RESOURCE_OPERATION_BPF_PIN) {
         uint64_t object_id = system_verified_pin_id(
             system, record->resource.bpf_pin.pin_id);
         if (object_id == 0U) {
@@ -4662,21 +4586,19 @@ static int system_wal_verify_applied(void *opaque,
             }
             return -1;
         }
-        delta->has_object_id = true;
-        delta->object_id = object_id;
         return 0;
     }
-    if (record->kind == ASTERISKD_RECOVERY_TC_QDISC) {
+    if (record->kind == ASTERISKD_RESOURCE_OPERATION_TC_QDISC) {
         bool present = false;
         return system_tc_probe_qdisc(system, &record->resource.tc_qdisc, &present) == 0 &&
             present ? 0 : -1;
     }
-    if (record->kind == ASTERISKD_RECOVERY_TC_FILTER) {
+    if (record->kind == ASTERISKD_RESOURCE_OPERATION_TC_FILTER) {
         enum asteriskd_rules_slot_state state = ASTERISKD_RULES_SLOT_FOREIGN;
         return system_tc_probe_filter(system, &record->resource.tc_filter, &state) == 0 &&
             state == ASTERISKD_RULES_SLOT_OWNED ? 0 : -1;
     }
-    if (record->kind == ASTERISKD_RECOVERY_IPTABLES_CHAIN) {
+    if (record->kind == ASTERISKD_RESOURCE_OPERATION_IPTABLES_CHAIN) {
         const struct asteriskd_private_chain_group *group =
             system_find_private_group(system, &record->resource.iptables_chain);
         bool all_present = false;
@@ -4702,7 +4624,7 @@ static int system_wal_verify_applied(void *opaque,
         }
         return 0;
     }
-    if (record->kind == ASTERISKD_RECOVERY_IPTABLES_RULE) {
+    if (record->kind == ASTERISKD_RESOURCE_OPERATION_IPTABLES_RULE) {
         const struct asteriskd_traffic_hook_group *group =
             system_find_hook_group(system, &record->resource.iptables_rule);
         bool all_present = false;
@@ -4714,364 +4636,64 @@ static int system_wal_verify_applied(void *opaque,
         }
         return -1;
     }
-    if (record->kind == ASTERISKD_RECOVERY_IP_RULE ||
-        record->kind == ASTERISKD_RECOVERY_ROUTE ||
-        record->kind == ASTERISKD_RECOVERY_DUMMY_INTERFACE) {
+    if (record->kind == ASTERISKD_RESOURCE_OPERATION_IP_RULE ||
+        record->kind == ASTERISKD_RESOURCE_OPERATION_ROUTE ||
+        record->kind == ASTERISKD_RESOURCE_OPERATION_DUMMY_INTERFACE) {
         const struct asteriskd_route_effect *effect = system_find_route_effect(system, record);
         bool present = false;
         if (effect == NULL || system_probe_route_effect(system, effect, &present) != 0 ||
             !present) return -1;
-        if (record->kind == ASTERISKD_RECOVERY_DUMMY_INTERFACE) {
-            uint32_t index = if_nametoindex(effect->interface_name);
-            if (index == 0U) return -1;
-            delta->has_interface_index = true;
-            delta->interface_index = index;
+        if (record->kind == ASTERISKD_RESOURCE_OPERATION_DUMMY_INTERFACE) {
+            if (if_nametoindex(effect->interface_name) == 0U) return -1;
         }
         return 0;
     }
     return -1;
 }
 
-static int system_wal_probe_recovery(void *opaque,
-    const struct asteriskd_recovery_record *record,
-    enum asteriskd_wal_resource_state *state, char *error, size_t error_size) {
-    struct asteriskd_system_supervisor *system = opaque;
-    if (record == NULL || state == NULL) return -1;
-    if (record->kind == ASTERISKD_RECOVERY_SYSCTL) {
-        uint8_t value = 0U;
-        int read_result = system_sysctl_read(&record->resource.sysctl, &value);
-        if (read_result == 1) {
-            *state = ASTERISKD_WAL_RESOURCE_ABSENT;
-        } else if (read_result != 0) {
-            *state = ASTERISKD_WAL_RESOURCE_AMBIGUOUS;
-        } else if (value == record->resource.sysctl.original_value) {
-            *state = ASTERISKD_WAL_RESOURCE_ORIGINAL;
-        } else if (value == record->resource.sysctl.desired_value) {
-            *state = ASTERISKD_WAL_RESOURCE_EXPECTED_EFFECT;
-        } else {
-            *state = ASTERISKD_WAL_RESOURCE_FOREIGN;
-        }
-        return 0;
+static int system_apply_and_verify(
+    struct asteriskd_system_supervisor *system,
+    const struct asteriskd_resource_operation *records,
+    size_t count, char *error, size_t error_size) {
+    size_t index;
+    if (system_apply_operations(system, records, count, error, error_size) != 0) return -1;
+    for (index = 0U; index < count; ++index) {
+        if (system_verify_operation(
+                system, &records[index], error, error_size) != 0) return -1;
     }
-    if (record->kind == ASTERISKD_RECOVERY_BPF_PIN) {
-        const char *path = system_pin_path(system, record->resource.bpf_pin.pin_id);
-        const struct asteriskd_bpf_pin_ownership_backend *backend =
-            asteriskd_system_bpf_pin_ownership_backend();
-        bool exists = true;
-        uint64_t object_id = 0U;
-        if (path == NULL || backend == NULL ||
-            backend->probe(backend->context, path, &exists, &object_id) != 0) {
-            *state = ASTERISKD_WAL_RESOURCE_AMBIGUOUS;
-        } else if (!exists && object_id == 0U) {
-            *state = ASTERISKD_WAL_RESOURCE_ABSENT;
-        } else if (exists && object_id == record->resource.bpf_pin.object_id) {
-            *state = ASTERISKD_WAL_RESOURCE_EXPECTED_EFFECT;
-        } else {
-            *state = ASTERISKD_WAL_RESOURCE_FOREIGN;
-        }
-        return 0;
-    }
-    if (record->kind == ASTERISKD_RECOVERY_TC_QDISC) {
-        if (if_nametoindex(record->resource.tc_qdisc.interface_name) !=
-                record->resource.tc_qdisc.interface_index) {
-            *state = ASTERISKD_WAL_RESOURCE_ABSENT;
-            return 0;
-        }
-        bool present = false;
-        if (system_tc_probe_qdisc(system, &record->resource.tc_qdisc, &present) != 0) {
-            *state = ASTERISKD_WAL_RESOURCE_AMBIGUOUS;
-        } else {
-            *state = present ? ASTERISKD_WAL_RESOURCE_EXPECTED_EFFECT :
-                ASTERISKD_WAL_RESOURCE_ABSENT;
-        }
-        return 0;
-    }
-    if (record->kind == ASTERISKD_RECOVERY_TC_FILTER) {
-        if (if_nametoindex(record->resource.tc_filter.interface_name) !=
-                record->resource.tc_filter.interface_index) {
-            *state = ASTERISKD_WAL_RESOURCE_ABSENT;
-            return 0;
-        }
-        enum asteriskd_rules_slot_state slot = ASTERISKD_RULES_SLOT_FOREIGN;
-        int probed = system_tc_probe_filter(system, &record->resource.tc_filter, &slot);
-        if (probed != 0 || slot == ASTERISKD_RULES_SLOT_FOREIGN) {
-            enum asteriskd_pin_id pin_id = system_tc_pin_id(
-                record->resource.tc_filter.program_id);
-            char message[224U];
-            int written = snprintf(message, sizeof(message),
-                "TC filter recovery probe failed: direction=%u probe=%d state=%u verified=%d objectId=%" PRIu64,
-                (unsigned)record->resource.tc_filter.direction, probed, (unsigned)slot,
-                system->bpf2_verified ? 1 : 0,
-                pin_id == ASTERISKD_PIN_COUNT ? UINT64_C(0) :
-                    system_verified_pin_id(system, pin_id));
-            if (written > 0 && (size_t)written < sizeof(message)) {
-                (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
-                    ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
-            }
-        }
-        if (probed != 0) {
-            *state = ASTERISKD_WAL_RESOURCE_AMBIGUOUS;
-        } else if (slot == ASTERISKD_RULES_SLOT_ABSENT) {
-            *state = ASTERISKD_WAL_RESOURCE_ABSENT;
-        } else if (slot == ASTERISKD_RULES_SLOT_OWNED) {
-            *state = ASTERISKD_WAL_RESOURCE_EXPECTED_EFFECT;
-        } else {
-            *state = ASTERISKD_WAL_RESOURCE_FOREIGN;
-        }
-        return 0;
-    }
-    if (record->kind == ASTERISKD_RECOVERY_IPTABLES_CHAIN) {
-        const struct asteriskd_private_chain_group *group =
-            system_find_private_group(system, &record->resource.iptables_chain);
-        bool all_present = false;
-        bool any_present = false;
-        if (group == NULL || system_probe_private_group(
-                system, group, &all_present, &any_present) != 0) {
-            *state = ASTERISKD_WAL_RESOURCE_AMBIGUOUS;
-        } else {
-            *state = any_present ? ASTERISKD_WAL_RESOURCE_EXPECTED_EFFECT :
-                ASTERISKD_WAL_RESOURCE_ABSENT;
-        }
-        return 0;
-    }
-    if (record->kind == ASTERISKD_RECOVERY_IPTABLES_RULE) {
-        const struct asteriskd_traffic_hook_group *group =
-            system_find_hook_group(system, &record->resource.iptables_rule);
-        bool all_present = false;
-        bool any_present = false;
-        if (group == NULL || system_probe_hook_group(
-                system, group, &all_present, &any_present) != 0) {
-            *state = ASTERISKD_WAL_RESOURCE_AMBIGUOUS;
-        } else {
-            *state = any_present ? ASTERISKD_WAL_RESOURCE_EXPECTED_EFFECT :
-                ASTERISKD_WAL_RESOURCE_ABSENT;
-        }
-        return 0;
-    }
-    if (record->kind == ASTERISKD_RECOVERY_IP_RULE ||
-        record->kind == ASTERISKD_RECOVERY_ROUTE ||
-        record->kind == ASTERISKD_RECOVERY_DUMMY_INTERFACE) {
-        const struct asteriskd_route_effect *effect = system_find_route_effect(system, record);
-        bool present = false;
-        if (effect == NULL || system_probe_route_effect(system, effect, &present) != 0) {
-            *state = ASTERISKD_WAL_RESOURCE_AMBIGUOUS;
-        } else if (record->kind == ASTERISKD_RECOVERY_DUMMY_INTERFACE && present &&
-            !system_dummy_recovery_identity_matches(system, effect)) {
-            *state = ASTERISKD_WAL_RESOURCE_FOREIGN;
-        } else {
-            *state = present ? ASTERISKD_WAL_RESOURCE_EXPECTED_EFFECT :
-                ASTERISKD_WAL_RESOURCE_ABSENT;
-        }
-        return 0;
-    }
-    (void)error;
-    (void)error_size;
-    return -1;
+    return 0;
 }
 
-static int system_wal_undo(void *opaque,
-    const struct asteriskd_recovery_record *record, char *error, size_t error_size) {
-    struct asteriskd_system_supervisor *system = opaque;
-    if (record == NULL) return -1;
-    if (record->kind == ASTERISKD_RECOVERY_SYSCTL) {
-        return system_sysctl_write(&record->resource.sysctl,
-            record->resource.sysctl.original_value);
-    }
-    if (record->kind == ASTERISKD_RECOVERY_BPF_PIN) {
-        const char *path = system_pin_path(system, record->resource.bpf_pin.pin_id);
-        return path == NULL ? -1 : asteriskd_bpf_pin_cleanup_owned(
-            path, record->resource.bpf_pin.object_id,
-            asteriskd_system_bpf_pin_ownership_backend(), error, error_size);
-    }
-    if (record->kind == ASTERISKD_RECOVERY_TC_FILTER) {
-        return system_tc_remove_filter(system, &record->resource.tc_filter);
-    }
-    if (record->kind == ASTERISKD_RECOVERY_TC_QDISC) {
-        return system_tc_remove_qdisc(system, &record->resource.tc_qdisc);
-    }
-    if (record->kind == ASTERISKD_RECOVERY_IPTABLES_CHAIN) {
-        const struct asteriskd_private_chain_group *group =
-            system_find_private_group(system, &record->resource.iptables_chain);
-        return group == NULL ? -1 : system_remove_private_group(system, group);
-    }
-    if (record->kind == ASTERISKD_RECOVERY_IPTABLES_RULE) {
-        const struct asteriskd_traffic_hook_group *group =
-            system_find_hook_group(system, &record->resource.iptables_rule);
-        return group == NULL ? -1 : system_remove_hook_group(system, group);
-    }
-    if (record->kind == ASTERISKD_RECOVERY_IP_RULE ||
-        record->kind == ASTERISKD_RECOVERY_ROUTE ||
-        record->kind == ASTERISKD_RECOVERY_DUMMY_INTERFACE) {
-        const struct asteriskd_route_effect *effect = system_find_route_effect(system, record);
-        return effect == NULL ? -1 : system_remove_route_effect(system, effect);
-    }
-    return -1;
-}
 
-static int system_wal_verify_restored(void *opaque,
-    const struct asteriskd_recovery_record *record, char *error, size_t error_size) {
-    struct asteriskd_system_supervisor *system = opaque;
-    if (record == NULL) return -1;
-    if (record->kind == ASTERISKD_RECOVERY_SYSCTL) {
-        uint8_t value = 0U;
-        int result = system_sysctl_read(&record->resource.sysctl, &value);
-        return result == 0 && value == record->resource.sysctl.original_value ? 0 : -1;
-    }
-    if (record->kind == ASTERISKD_RECOVERY_BPF_PIN) {
-        const char *path = system_pin_path(system, record->resource.bpf_pin.pin_id);
-        const struct asteriskd_bpf_pin_ownership_backend *backend =
-            asteriskd_system_bpf_pin_ownership_backend();
-        bool exists = true;
-        uint64_t object_id = 0U;
-        return path != NULL && backend != NULL &&
-            backend->probe(backend->context, path, &exists, &object_id) == 0 &&
-            !exists && object_id == 0U ? 0 : -1;
-    }
-    if (record->kind == ASTERISKD_RECOVERY_TC_FILTER) {
-        if (if_nametoindex(record->resource.tc_filter.interface_name) !=
-                record->resource.tc_filter.interface_index) return 0;
-        enum asteriskd_rules_slot_state state = ASTERISKD_RULES_SLOT_FOREIGN;
-        return system_tc_probe_filter(system, &record->resource.tc_filter, &state) == 0 &&
-            state == ASTERISKD_RULES_SLOT_ABSENT ? 0 : -1;
-    }
-    if (record->kind == ASTERISKD_RECOVERY_TC_QDISC) {
-        if (if_nametoindex(record->resource.tc_qdisc.interface_name) !=
-                record->resource.tc_qdisc.interface_index) return 0;
-        bool present = false;
-        enum asteriskd_tc_qdisc_cleanup_decision decision;
-        return system_tc_inspect_qdisc_cleanup(system,
-                &record->resource.tc_qdisc, &present, &decision) == 0 &&
-            asteriskd_tc_qdisc_cleanup_restored(present, decision) ? 0 : -1;
-    }
-    if (record->kind == ASTERISKD_RECOVERY_IPTABLES_CHAIN) {
-        const struct asteriskd_private_chain_group *group =
-            system_find_private_group(system, &record->resource.iptables_chain);
-        bool all_present = false;
-        bool any_present = false;
-        return group != NULL && system_probe_private_group(
-            system, group, &all_present, &any_present) == 0 && !any_present ? 0 : -1;
-    }
-    if (record->kind == ASTERISKD_RECOVERY_IPTABLES_RULE) {
-        const struct asteriskd_traffic_hook_group *group =
-            system_find_hook_group(system, &record->resource.iptables_rule);
-        bool all_present = false;
-        bool any_present = false;
-        return group != NULL && system_probe_hook_group(
-            system, group, &all_present, &any_present) == 0 && !any_present ? 0 : -1;
-    }
-    if (record->kind == ASTERISKD_RECOVERY_IP_RULE ||
-        record->kind == ASTERISKD_RECOVERY_ROUTE ||
-        record->kind == ASTERISKD_RECOVERY_DUMMY_INTERFACE) {
-        const struct asteriskd_route_effect *effect = system_find_route_effect(system, record);
-        bool present = true;
-        return effect != NULL && system_probe_route_effect(system, effect, &present) == 0 &&
-            !present ? 0 : -1;
-    }
-    (void)error;
-    (void)error_size;
-    return -1;
-}
-
-static const struct asteriskd_wal_effect_backend system_wal_backend = {
-    .probe_original = system_wal_probe_original,
-    .apply = system_wal_apply,
-    .verify_applied = system_wal_verify_applied,
-    .probe_recovery = system_wal_probe_recovery,
-    .undo = system_wal_undo,
-    .verify_restored = system_wal_verify_restored,
-};
-
-static bool system_rule_record_matches(
-    const struct asteriskd_recovery_record *left,
-    const struct asteriskd_recovery_record *right) {
-    if (left == NULL || right == NULL || left->kind != right->kind) return false;
-    switch (left->kind) {
-        case ASTERISKD_RECOVERY_IPTABLES_CHAIN:
-            return left->resource.iptables_chain.family == right->resource.iptables_chain.family &&
-                left->resource.iptables_chain.table == right->resource.iptables_chain.table &&
-                left->resource.iptables_chain.chain_id == right->resource.iptables_chain.chain_id;
-        case ASTERISKD_RECOVERY_IPTABLES_RULE:
-            return left->resource.iptables_rule.family == right->resource.iptables_rule.family &&
-                left->resource.iptables_rule.table == right->resource.iptables_rule.table &&
-                left->resource.iptables_rule.chain_id == right->resource.iptables_rule.chain_id &&
-                left->resource.iptables_rule.rule_id == right->resource.iptables_rule.rule_id;
-        case ASTERISKD_RECOVERY_IP_RULE:
-            return left->resource.ip_rule.family == right->resource.ip_rule.family &&
-                left->resource.ip_rule.rule_id == right->resource.ip_rule.rule_id;
-        case ASTERISKD_RECOVERY_ROUTE:
-            return left->resource.route.family == right->resource.route.family &&
-                left->resource.route.route_id == right->resource.route.route_id &&
-                strcmp(left->resource.route.interface_name,
-                    right->resource.route.interface_name) == 0;
-        case ASTERISKD_RECOVERY_DUMMY_INTERFACE:
-            return left->resource.dummy_interface.interface_id ==
-                right->resource.dummy_interface.interface_id;
-        case ASTERISKD_RECOVERY_TC_QDISC:
-            return left->resource.tc_qdisc.qdisc_id == right->resource.tc_qdisc.qdisc_id &&
-                left->resource.tc_qdisc.interface_index ==
-                    right->resource.tc_qdisc.interface_index &&
-                strcmp(left->resource.tc_qdisc.interface_name,
-                    right->resource.tc_qdisc.interface_name) == 0;
-        case ASTERISKD_RECOVERY_TC_FILTER:
-            return left->resource.tc_filter.filter_id == right->resource.tc_filter.filter_id &&
-                left->resource.tc_filter.direction == right->resource.tc_filter.direction &&
-                left->resource.tc_filter.interface_index ==
-                    right->resource.tc_filter.interface_index &&
-                strcmp(left->resource.tc_filter.interface_name,
-                    right->resource.tc_filter.interface_name) == 0;
-        case ASTERISKD_RECOVERY_SYSCTL:
-            return left->resource.sysctl.sysctl_id == right->resource.sysctl.sysctl_id &&
-                left->resource.sysctl.interface_index == right->resource.sysctl.interface_index &&
-                strcmp(left->resource.sysctl.interface_name,
-                    right->resource.sysctl.interface_name) == 0;
-        default:
-            return false;
-    }
-}
-
-static const struct asteriskd_recovery_record *system_durable_rule_record(
-    const struct asteriskd_system_supervisor *system,
-    const struct asteriskd_recovery_record *prototype) {
-    for (size_t index = 0U; index < system->state.recovery.record_count; ++index) {
-        const struct asteriskd_recovery_record *record =
-            &system->state.recovery.records[index];
-        if (system_rule_record_matches(record, prototype)) return record;
-    }
-    return NULL;
-}
-
-static int system_rules_wal_apply_plan(
+static int system_rules_apply_plan(
     void *opaque, const struct asteriskd_rule_transaction_plan *plan) {
     struct asteriskd_system_supervisor *system = opaque;
     if (plan == NULL || plan->no_op) return plan != NULL ? 0 : -1;
-    struct asteriskd_recovery_record records[
+    struct asteriskd_resource_operation records[
         ASTERISKD_RULE_TRANSACTION_MAX_GROUPS * 2U +
         ASTERISKD_RULE_TRANSACTION_MAX_ROUTES];
     size_t count = 0U;
     for (size_t index = 0U; index < plan->private_group_count; ++index) {
-        records[count++] = plan->private_groups[index].recovery;
+        records[count++] = plan->private_groups[index].operation;
     }
     for (size_t index = 0U; index < plan->route_count; ++index) {
         if (system_route_record(system, &plan->routes[index], &records[count]) != 0) return -1;
         ++count;
     }
     for (size_t index = 0U; index < plan->hook_group_count; ++index) {
-        records[count++] = plan->hook_groups[index].recovery;
+        records[count++] = plan->hook_groups[index].operation;
     }
     if (count == 0U) return -1;
     if (system_rule_snapshot_capture(
             system, plan, SYSTEM_RULE_SNAPSHOT_BEFORE_APPLY) != 0) return -1;
     char error[256U] = {0};
-    int applied = count == 1U
-        ? asteriskd_wal_apply(&system->store, &system->state, records,
-            &system_wal_backend, system, error, sizeof(error))
-        : asteriskd_wal_apply_batch(&system->store, &system->state, records, count,
-            &system_wal_backend, system, error, sizeof(error));
-    if (applied == ASTERISKD_STATE_OK) return 0;
+    int applied = system_apply_and_verify(
+        system, records, count, error, sizeof(error));
+    if (applied == 0) return 0;
     system_rule_snapshot_destroy(&system->rule_snapshot);
     char message[384U];
     int written = snprintf(message, sizeof(message),
-        "rule transaction WAL failed: result=%d records=%zu detail=%s",
+        "rule transaction failed: result=%d records=%zu detail=%s",
         applied, count, error[0] == '\0' ? "unavailable" : error);
     if (written > 0 && (size_t)written < sizeof(message)) {
         (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
@@ -5080,24 +4702,17 @@ static int system_rules_wal_apply_plan(
     return -1;
 }
 
-static int system_rules_wal_apply_private(
+static int system_rules_apply_private(
     void *opaque, const struct asteriskd_private_chain_group *group) {
     struct asteriskd_system_supervisor *system = opaque;
-    const struct asteriskd_recovery_record *durable =
-        system_durable_rule_record(system, &group->recovery);
-    if (durable != NULL) {
-        if ((durable->kind != ASTERISKD_RECOVERY_IPTABLES_CHAIN) ||
-            durable->resource.iptables_chain.original_presence) return -1;
-        return system_create_private_group(system, group);
-    }
-    struct asteriskd_recovery_record record = group->recovery;
+    struct asteriskd_resource_operation record = group->operation;
     char error[128U] = {0};
-    int applied = asteriskd_wal_apply(&system->store, &system->state, &record,
-        &system_wal_backend, system, error, sizeof(error));
-    if (applied == ASTERISKD_STATE_OK) return 0;
+    int applied = system_apply_and_verify(
+        system, &record, 1U, error, sizeof(error));
+    if (applied == 0) return 0;
     char message[256U];
     int written = snprintf(message, sizeof(message),
-        "private rules WAL failed: result=%d detail=%s", applied,
+        "private rules apply failed: result=%d detail=%s", applied,
         error[0] == '\0' ? "unavailable" : error);
     if (written > 0 && (size_t)written < sizeof(message)) {
         (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
@@ -5106,44 +4721,27 @@ static int system_rules_wal_apply_private(
     return -1;
 }
 
-static int system_rules_wal_apply_route(
+static int system_rules_apply_route(
     void *opaque, const struct asteriskd_route_effect *effect) {
     struct asteriskd_system_supervisor *system = opaque;
-    struct asteriskd_recovery_record record;
+    struct asteriskd_resource_operation record;
     if (system_route_record(system, effect, &record) != 0) return -1;
-    const struct asteriskd_recovery_record *durable =
-        system_durable_rule_record(system, &record);
-    if (durable != NULL) {
-        bool original_presence = durable->kind == ASTERISKD_RECOVERY_IP_RULE
-            ? durable->resource.ip_rule.original_presence
-            : durable->kind == ASTERISKD_RECOVERY_ROUTE
-                ? durable->resource.route.original_presence
-                : durable->resource.dummy_interface.original_presence;
-        return original_presence ? -1 : system_apply_route_effect(system, effect);
-    }
     char error[128U];
-    return asteriskd_wal_apply(&system->store, &system->state, &record,
-        &system_wal_backend, system, error, sizeof(error)) == ASTERISKD_STATE_OK ? 0 : -1;
+    return system_apply_and_verify(
+        system, &record, 1U, error, sizeof(error));
 }
 
-static int system_rules_wal_apply_hook(
+static int system_rules_apply_hook(
     void *opaque, const struct asteriskd_traffic_hook_group *group) {
     struct asteriskd_system_supervisor *system = opaque;
-    const struct asteriskd_recovery_record *durable =
-        system_durable_rule_record(system, &group->recovery);
-    if (durable != NULL) {
-        if ((durable->kind != ASTERISKD_RECOVERY_IPTABLES_RULE) ||
-            durable->resource.iptables_rule.original_presence) return -1;
-        return system_apply_hook_group(system, group);
-    }
-    struct asteriskd_recovery_record record = group->recovery;
+    struct asteriskd_resource_operation record = group->operation;
     char error[128U] = {0};
-    int applied = asteriskd_wal_apply(&system->store, &system->state, &record,
-        &system_wal_backend, system, error, sizeof(error));
-    if (applied == ASTERISKD_STATE_OK) return 0;
+    int applied = system_apply_and_verify(
+        system, &record, 1U, error, sizeof(error));
+    if (applied == 0) return 0;
     char message[256U];
     int written = snprintf(message, sizeof(message),
-        "hook rules WAL failed: result=%d family=%d table=%d detail=%s",
+        "hook rules apply failed: result=%d family=%d table=%d detail=%s",
         applied, (int)group->family, (int)group->table,
         error[0] == '\0' ? "unavailable" : error);
     if (written > 0 && (size_t)written < sizeof(message)) {
@@ -5162,7 +4760,7 @@ static int system_rules_probe_private(void *opaque,
     if (state == NULL || system_probe_private_group(
             system, group, &all_present, &any_present) != 0) return -1;
     if (!any_present) *state = ASTERISKD_RULES_SLOT_ABSENT;
-    else if (all_present && system_durable_rule_record(system, &group->recovery) != NULL) {
+    else if (all_present) {
         *state = system_verify_private_group_contents(system, group) == 0
             ? ASTERISKD_RULES_SLOT_OWNED : ASTERISKD_RULES_SLOT_FOREIGN;
     } else {
@@ -5175,13 +4773,12 @@ static int system_rules_probe_route(void *opaque,
     const struct asteriskd_route_effect *effect,
     enum asteriskd_rules_slot_state *state) {
     struct asteriskd_system_supervisor *system = opaque;
-    struct asteriskd_recovery_record record;
-    if (state == NULL || system_route_record(system, effect, &record) != 0 ||
+    if (state == NULL ||
         system_classify_route_effect(system, effect, state) != 0) return -1;
     if (*state == ASTERISKD_RULES_SLOT_OWNED) {
-        if (system_durable_rule_record(system, &record) == NULL ||
-            (effect->kind == ASTERISKD_ROUTE_EFFECT_DUMMY_INTERFACE &&
-             !system_dummy_recovery_identity_matches(system, effect))) {
+        if (effect->kind == ASTERISKD_ROUTE_EFFECT_DUMMY_INTERFACE &&
+            !system_dummy_effect_matches(
+                effect, if_nametoindex(effect->interface_name))) {
             *state = ASTERISKD_RULES_SLOT_FOREIGN;
         }
     }
@@ -5197,7 +4794,7 @@ static int system_rules_probe_hook(void *opaque,
     if (state == NULL || system_probe_hook_group(
             system, group, &all_present, &any_present) != 0) return -1;
     if (!any_present) *state = ASTERISKD_RULES_SLOT_ABSENT;
-    else if (all_present && system_durable_rule_record(system, &group->recovery) != NULL) {
+    else if (all_present) {
         *state = ASTERISKD_RULES_SLOT_OWNED;
     } else {
         *state = ASTERISKD_RULES_SLOT_FOREIGN;
@@ -5220,55 +4817,41 @@ static int system_rules_remove_hook(
     return system_remove_hook_group(opaque, group);
 }
 
-static int system_rules_recover_record(
-    void *opaque, const struct asteriskd_recovery_record *record) {
-    enum asteriskd_wal_resource_state state = ASTERISKD_WAL_RESOURCE_AMBIGUOUS;
-    char error[128U];
-    if (system_wal_probe_recovery(
-            opaque, record, &state, error, sizeof(error)) != 0) return -1;
-    if (state == ASTERISKD_WAL_RESOURCE_ORIGINAL ||
-        state == ASTERISKD_WAL_RESOURCE_ABSENT) return 0;
-    return state == ASTERISKD_WAL_RESOURCE_EXPECTED_EFFECT &&
-        system_wal_undo(opaque, record, error, sizeof(error)) == 0 &&
-        system_wal_verify_restored(opaque, record, error, sizeof(error)) == 0 ? 0 : -1;
-}
-
 static void system_rules_backend_init(struct asteriskd_system_supervisor *system) {
     asteriskd_rules_runtime_init(&system->rules_runtime);
     system->rules_backend = (struct asteriskd_rules_backend){
         .ctx = system,
-        .wal_apply_plan = system_rules_wal_apply_plan,
-        .wal_apply_private = system_rules_wal_apply_private,
-        .wal_apply_route = system_rules_wal_apply_route,
-        .wal_apply_hook = system_rules_wal_apply_hook,
+        .apply_plan = system_rules_apply_plan,
+        .apply_private = system_rules_apply_private,
+        .apply_route = system_rules_apply_route,
+        .apply_hook = system_rules_apply_hook,
         .probe_private = system_rules_probe_private,
         .probe_route = system_rules_probe_route,
         .probe_hook = system_rules_probe_hook,
-        .wal_remove_private = system_rules_remove_private,
-        .wal_remove_route = system_rules_remove_route,
-        .wal_remove_hook = system_rules_remove_hook,
-        .wal_recover_record = system_rules_recover_record,
+        .remove_private = system_rules_remove_private,
+        .remove_route = system_rules_remove_route,
+        .remove_hook = system_rules_remove_hook,
     };
     system->rules_initialized = true;
 }
 
-static int system_network_wal_dispatch(void *opaque,
-    const struct asteriskd_typed_wal_request *request, char *error, size_t error_size) {
+static int system_network_effect_dispatch(void *opaque,
+    const struct asteriskd_network_effect_request *request,
+    char *error, size_t error_size) {
     struct asteriskd_system_supervisor *system = opaque;
-    if (request == NULL || request->source != ASTERISKD_TYPED_WAL_IPV6_IMMEDIATE ||
-        request->action != ASTERISKD_TYPED_WAL_APPLY ||
-        request->record.kind != ASTERISKD_RECOVERY_SYSCTL) return ASTERISKD_STATE_INVALID;
-    struct asteriskd_recovery_record record = request->record;
-    return asteriskd_wal_apply(&system->store, &system->state, &record,
-        &system_wal_backend, system, error, error_size);
+    if (request == NULL ||
+        request->effect.kind != ASTERISKD_EFFECT_SYSCTL) {
+        return ASTERISKD_STATE_INVALID;
+    }
+    return system_effect_apply_sysctl(
+        system, &request->effect.resource.sysctl, error, error_size);
 }
 
 static int system_apply_ipv6_guard(
     struct asteriskd_system_supervisor *system, const char *name, uint32_t index) {
-    struct asteriskd_recovery_record record;
+    struct asteriskd_resource_operation record;
     memset(&record, 0, sizeof(record));
-    record.status = ASTERISKD_RECOVERY_INTENT;
-    record.kind = ASTERISKD_RECOVERY_SYSCTL;
+    record.kind = ASTERISKD_RESOURCE_OPERATION_SYSCTL;
     record.resource.sysctl.sysctl_id = ASTERISKD_SYSCTL_DISABLE_IPV6;
     (void)snprintf(record.resource.sysctl.interface_name,
         sizeof(record.resource.sysctl.interface_name), "%s", name);
@@ -5280,8 +4863,8 @@ static int system_apply_ipv6_guard(
     if (read_result == 1 || (read_result == 0 && current == 1U)) return 0;
     if (read_result != 0 || current != 0U) return -1;
     char error[128U];
-    return asteriskd_wal_apply(&system->store, &system->state, &record,
-        &system_wal_backend, system, error, sizeof(error));
+    return system_effect_apply_sysctl(
+        system, &record.resource.sysctl, error, sizeof(error));
 }
 
 static int system_apply_initial_ipv6_guard(struct asteriskd_system_supervisor *system) {
@@ -5321,22 +4904,21 @@ static int system_effect_start_matcher(void *opaque) {
             asteriskd_system_anonymous_file_backend(), &system->matcher_launch,
             error, sizeof(error)) != 0) return -1;
     system->matcher_launch_ready = true;
-    struct asteriskd_recovery_record records[4U];
+    struct asteriskd_resource_operation records[4U];
     size_t count = 0U;
     if (asteriskd_matcher_pin_records_build(
             &system->matcher_pin_plan, records, 4U, &count) != 0) return -1;
     system->active_pin_batch = system->loaded_config.config.enable_ipv6
-        ? ASTERISKD_WAL_PIN_BATCH_MATCHER_DUAL_STACK
-        : ASTERISKD_WAL_PIN_BATCH_MATCHER_IPV4;
+        ? ASTERISKD_PIN_BATCH_MATCHER_DUAL_STACK
+        : ASTERISKD_PIN_BATCH_MATCHER_IPV4;
     system->pin_batch_active = true;
-    int result = asteriskd_wal_apply_pin_batch(
-        &system->store, &system->state, system->active_pin_batch,
-        records, count, &system_wal_backend, system, error, sizeof(error));
+    int result = system_apply_and_verify(
+        system, records, count, error, sizeof(error));
     system->pin_batch_active = false;
     int destroyed = asteriskd_matcher_launch_destroy(
         asteriskd_system_anonymous_file_backend(), &system->matcher_launch);
     system->matcher_launch_ready = false;
-    return result == ASTERISKD_STATE_OK && destroyed == 0 ? 0 : -1;
+    return result == 0 && destroyed == 0 ? 0 : -1;
 }
 
 static int system_effect_start_helper(
@@ -5354,19 +4936,18 @@ static int system_effect_start_helper(
     system->bpf2_plan_ready = true;
     if (pin_backend == NULL || asteriskd_bpf2_pin_preflight(
             &system->bpf2_pin_plan, pin_backend, error, sizeof(error)) != 0) return -1;
-    struct asteriskd_recovery_record records[4U];
+    struct asteriskd_resource_operation records[4U];
     size_t count = 0U;
     if (asteriskd_bpf2_pin_records_build(
             &system->bpf2_pin_plan, records, 4U, &count) != 0) return -1;
     system->active_pin_batch = system->loaded_config.config.enable_ipv6
-        ? ASTERISKD_WAL_PIN_BATCH_BPF2SOCKS_DUAL_STACK
-        : ASTERISKD_WAL_PIN_BATCH_BPF2SOCKS_IPV4;
+        ? ASTERISKD_PIN_BATCH_BPF2SOCKS_DUAL_STACK
+        : ASTERISKD_PIN_BATCH_BPF2SOCKS_IPV4;
     system->pin_batch_active = true;
-    int result = asteriskd_wal_apply_pin_batch(
-        &system->store, &system->state, system->active_pin_batch,
-        records, count, &system_wal_backend, system, error, sizeof(error));
+    int result = system_apply_and_verify(
+        system, records, count, error, sizeof(error));
     system->pin_batch_active = false;
-    if (result != ASTERISKD_STATE_OK || !system->helper_identity_ready) return -1;
+    if (result != 0 || !system->helper_identity_ready) return -1;
     *identity = system->helper_identity;
     return 0;
 }
@@ -5378,10 +4959,10 @@ static int system_effect_open_network(void *opaque) {
             asteriskd_system_network_backend(), &system->network,
             error, sizeof(error)) != 0) return -1;
     system->network_opened = true;
-    system->network_wal_sink.dispatch = system_network_wal_dispatch;
-    system->network_wal_sink.context = system;
-    if (asteriskd_network_set_wal_sink(
-            &system->network, &system->network_wal_sink) != 0) return -1;
+    system->network_effect_sink.dispatch = system_network_effect_dispatch;
+    system->network_effect_sink.context = system;
+    if (asteriskd_network_set_effect_sink(
+            &system->network, &system->network_effect_sink) != 0) return -1;
     return system_apply_initial_ipv6_guard(system);
 }
 
@@ -5652,27 +5233,22 @@ static int system_clear_android_hotspot_offload(
 }
 
 static int system_tc_slot_for_qdisc(struct asteriskd_system_supervisor *system,
-    const struct asteriskd_recovery_record *prototype,
+    const struct asteriskd_resource_operation *prototype,
     enum asteriskd_tc_slot_state *slot) {
     bool present = false;
     if (system_tc_probe_qdisc(system, &prototype->resource.tc_qdisc, &present) != 0) return -1;
     if (!present) *slot = ASTERISKD_TC_SLOT_ABSENT;
-    else if (system_durable_rule_record(system, prototype) != NULL) {
-        *slot = ASTERISKD_TC_SLOT_OWNED;
-    } else {
-        *slot = ASTERISKD_TC_SLOT_COMPATIBLE;
-    }
+    else *slot = ASTERISKD_TC_SLOT_COMPATIBLE;
     return 0;
 }
 
 static int system_tc_slot_for_filter(struct asteriskd_system_supervisor *system,
-    const struct asteriskd_recovery_record *prototype,
+    const struct asteriskd_resource_operation *prototype,
     enum asteriskd_tc_slot_state *slot) {
     enum asteriskd_rules_slot_state state = ASTERISKD_RULES_SLOT_FOREIGN;
     if (system_tc_probe_filter(system, &prototype->resource.tc_filter, &state) != 0) return -1;
     if (state == ASTERISKD_RULES_SLOT_ABSENT) *slot = ASTERISKD_TC_SLOT_ABSENT;
-    else if (state == ASTERISKD_RULES_SLOT_OWNED &&
-        system_durable_rule_record(system, prototype) != NULL) {
+    else if (state == ASTERISKD_RULES_SLOT_OWNED) {
         *slot = ASTERISKD_TC_SLOT_OWNED;
     } else {
         *slot = ASTERISKD_TC_SLOT_FOREIGN;
@@ -5681,19 +5257,15 @@ static int system_tc_slot_for_filter(struct asteriskd_system_supervisor *system,
 }
 
 static int system_tc_apply_record(struct asteriskd_system_supervisor *system,
-    const struct asteriskd_recovery_record *prototype) {
-    const struct asteriskd_recovery_record *durable =
-        system_durable_rule_record(system, prototype);
+    const struct asteriskd_resource_operation *prototype) {
     char error[128U];
-    if (durable != NULL) {
-        struct asteriskd_wal_applied_identity_delta delta;
-        return system_wal_apply(system, durable, 1U, error, sizeof(error)) == 0 &&
-            system_wal_verify_applied(
-                system, durable, &delta, error, sizeof(error)) == 0 ? 0 : -1;
+    if (prototype->kind == ASTERISKD_RESOURCE_OPERATION_SYSCTL) {
+        return system_effect_apply_sysctl(
+            system, &prototype->resource.sysctl, error, sizeof(error));
     }
-    struct asteriskd_recovery_record record = *prototype;
-    return asteriskd_wal_apply(&system->store, &system->state, &record,
-        &system_wal_backend, system, error, sizeof(error)) == ASTERISKD_STATE_OK ? 0 : -1;
+    struct asteriskd_resource_operation record = *prototype;
+    return system_apply_and_verify(
+        system, &record, 1U, error, sizeof(error));
 }
 
 static int system_reconcile_hotspot_tc_interface(
@@ -5709,20 +5281,18 @@ static int system_reconcile_hotspot_tc_interface(
     sysctl.interface_index = index;
     if (system_sysctl_read(&sysctl, &probe.route_localnet_value) != 0) return -1;
 
-    struct asteriskd_recovery_record qdisc;
+    struct asteriskd_resource_operation qdisc;
     memset(&qdisc, 0, sizeof(qdisc));
-    qdisc.status = ASTERISKD_RECOVERY_INTENT;
-    qdisc.kind = ASTERISKD_RECOVERY_TC_QDISC;
+    qdisc.kind = ASTERISKD_RESOURCE_OPERATION_TC_QDISC;
     qdisc.resource.tc_qdisc.qdisc_id = ASTERISKD_QDISC_HOTSPOT_CLSACT;
     qdisc.resource.tc_qdisc.interface_index = index;
     (void)snprintf(qdisc.resource.tc_qdisc.interface_name,
         sizeof(qdisc.resource.tc_qdisc.interface_name), "%s", name);
     if (system_tc_slot_for_qdisc(system, &qdisc, &probe.qdisc) != 0) return -1;
 
-    struct asteriskd_recovery_record filter;
+    struct asteriskd_resource_operation filter;
     memset(&filter, 0, sizeof(filter));
-    filter.status = ASTERISKD_RECOVERY_INTENT;
-    filter.kind = ASTERISKD_RECOVERY_TC_FILTER;
+    filter.kind = ASTERISKD_RESOURCE_OPERATION_TC_FILTER;
     filter.resource.tc_filter.interface_index = index;
     (void)snprintf(filter.resource.tc_filter.interface_name,
         sizeof(filter.resource.tc_filter.interface_name), "%s", name);
@@ -5740,7 +5310,7 @@ static int system_reconcile_hotspot_tc_interface(
     if (asteriskd_tc_install_plan_build(&system->loaded_config.config,
             &probe, &plan, error, sizeof(error)) != 0) return -1;
     for (size_t operation = 0U; operation < plan.operation_count; ++operation) {
-        if (system_tc_apply_record(system, &plan.operations[operation].recovery) != 0) return -1;
+        if (system_tc_apply_record(system, &plan.operations[operation].operation) != 0) return -1;
     }
     return 0;
 }
@@ -5783,46 +5353,6 @@ static int system_reconcile_hotspot_tc(struct asteriskd_system_supervisor *syste
     return result;
 }
 
-static bool system_record_interface_generation_retired(
-    const struct asteriskd_recovery_record *record) {
-    const char *name = NULL;
-    uint32_t expected_index = 0U;
-    if (record->kind == ASTERISKD_RECOVERY_SYSCTL) {
-        name = record->resource.sysctl.interface_name;
-        expected_index = record->resource.sysctl.interface_index;
-    } else if (record->kind == ASTERISKD_RECOVERY_TC_QDISC) {
-        name = record->resource.tc_qdisc.interface_name;
-        expected_index = record->resource.tc_qdisc.interface_index;
-    } else if (record->kind == ASTERISKD_RECOVERY_TC_FILTER) {
-        name = record->resource.tc_filter.interface_name;
-        expected_index = record->resource.tc_filter.interface_index;
-    } else {
-        return false;
-    }
-    return expected_index > 0U && name != NULL && name[0] != '\0' &&
-        if_nametoindex(name) != expected_index;
-}
-
-static int system_recover_retired_interface_records(
-    struct asteriskd_system_supervisor *system) {
-    size_t index = 0U;
-    char error[128U];
-    while (index < system->state.recovery.record_count) {
-        const struct asteriskd_recovery_record *record =
-            &system->state.recovery.records[index];
-        if (!system_record_interface_generation_retired(record)) {
-            ++index;
-            continue;
-        }
-        uint64_t record_id = record->record_id;
-        int recovered = asteriskd_wal_recover_record_id(
-            &system->store, &system->state, record_id,
-            &system_wal_backend, system, error, sizeof(error));
-        if (recovered != ASTERISKD_STATE_OK) return -1;
-    }
-    return 0;
-}
-
 static uint32_t system_rule_categories(const struct asteriskd_config *config) {
     uint32_t categories = 0U;
     if (config->mode == ASTERISKD_MODE_TPROXY) {
@@ -5858,452 +5388,585 @@ static uint32_t system_rule_categories(const struct asteriskd_config *config) {
     return categories;
 }
 
-enum system_recovery_identity_state {
-    SYSTEM_RECOVERY_IDENTITY_ABSENT,
-    SYSTEM_RECOVERY_IDENTITY_MATCH,
-    SYSTEM_RECOVERY_IDENTITY_MISMATCH,
-    SYSTEM_RECOVERY_IDENTITY_UNREADABLE,
-};
-
-static bool system_recovery_identity_equal(
-    const struct asteriskd_child_identity *left,
-    const struct asteriskd_child_identity *right) {
-    if (left->role != right->role || left->type != right->type ||
-        left->pid != right->pid || left->process_group_id != right->process_group_id ||
-        left->start_time_ticks != right->start_time_ticks ||
-        left->exe_device != right->exe_device || left->exe_inode != right->exe_inode ||
-        left->argc != right->argc) return false;
-    for (size_t index = 0U; index < left->argc; ++index) {
-        if (strcmp(left->argv[index], right->argv[index]) != 0) return false;
+static void system_reconcile_error(
+    char *error, size_t error_size, const char *message) {
+    if (error != NULL && error_size != 0U) {
+        (void)snprintf(error, error_size, "%s", message);
     }
-    return true;
 }
 
-static enum system_recovery_identity_state system_recovery_identity_classify(
-    const struct asteriskd_child_identity *identity,
-    const struct asteriskd_process_spec *spec) {
-    if (identity == NULL || spec == NULL || identity->pid <= 0 ||
-        identity->process_group_id != identity->pid) return SYSTEM_RECOVERY_IDENTITY_UNREADABLE;
-    errno = 0;
-    if (kill(identity->pid, 0) != 0 && errno == ESRCH) return SYSTEM_RECOVERY_IDENTITY_ABSENT;
-    if (errno != 0 && errno != EPERM) return SYSTEM_RECOVERY_IDENTITY_UNREADABLE;
-    const struct asteriskd_process_identity_backend *backend =
-        asteriskd_system_process_identity_backend();
-    if (backend == NULL) return SYSTEM_RECOVERY_IDENTITY_UNREADABLE;
-    char stat_text[4096U];
-    size_t stat_length = 0U;
-    uint64_t device = 0U;
-    uint64_t inode = 0U;
-    unsigned char cmdline[ASTERISKD_MAX_PROCESS_ARGV * ASTERISKD_MAX_CHILD_ARG + 1U];
-    size_t cmdline_length = 0U;
-    bool readable = backend->read_stat(backend->context, identity->pid,
-            stat_text, sizeof(stat_text) - 1U, &stat_length) == 0 &&
-        backend->read_exe_identity(
-            backend->context, identity->pid, &device, &inode) == 0 &&
-        backend->read_cmdline(backend->context, identity->pid,
-            cmdline, sizeof(cmdline), &cmdline_length) == 0;
-    if (!readable) {
-        errno = 0;
-        return kill(identity->pid, 0) != 0 && errno == ESRCH
-            ? SYSTEM_RECOVERY_IDENTITY_ABSENT : SYSTEM_RECOVERY_IDENTITY_UNREADABLE;
+static size_t system_owned_hook_arguments(
+    const struct asteriskd_owned_hook *hook,
+    const char **arguments,
+    size_t capacity) {
+    if (hook == NULL || arguments == NULL) return 0U;
+    if (hook->udp_destination_port_53) {
+        if (capacity < 6U) return 0U;
+        arguments[0] = "-p";
+        arguments[1] = "udp";
+        arguments[2] = "--dport";
+        arguments[3] = "53";
+        arguments[4] = "-j";
+        arguments[5] = hook->target;
+        return 6U;
     }
-    struct asteriskd_child_identity observed;
-    char error[64U];
-    if (asteriskd_process_identity_read(backend, identity->pid,
-            identity->role, identity->type, spec, &observed,
-            error, sizeof(error)) != 0) return SYSTEM_RECOVERY_IDENTITY_MISMATCH;
-    return system_recovery_identity_equal(identity, &observed)
-        ? SYSTEM_RECOVERY_IDENTITY_MATCH : SYSTEM_RECOVERY_IDENTITY_MISMATCH;
+    if (capacity < 2U) return 0U;
+    arguments[0] = "-j";
+    arguments[1] = hook->target;
+    return 2U;
 }
 
-static int system_recovery_spec_from_identity(
-    const struct asteriskd_child_identity *identity,
-    const struct asteriskd_config *config,
-    struct asteriskd_process_spec *spec) {
-    if (identity == NULL || config == NULL || spec == NULL || identity->argc == 0U ||
-        identity->argc > ASTERISKD_MAX_CHILD_ARGV) return -1;
-    memset(spec, 0, sizeof(*spec));
-    if (snprintf(spec->executable_path, sizeof(spec->executable_path), "%s",
-            identity->argv[0]) <= 0 ||
-        snprintf(spec->working_directory, sizeof(spec->working_directory), "%s",
-            config->working_directory) <= 0) return -1;
-    spec->argc = identity->argc;
-    for (size_t index = 0U; index < identity->argc; ++index) {
-        if (snprintf(spec->argv[index], sizeof(spec->argv[index]), "%s",
-                identity->argv[index]) <= 0) return -1;
+static const struct asteriskd_owned_chain *system_owned_hook_target_chain(
+    const struct asteriskd_owned_hook *hook) {
+    const struct asteriskd_owned_resource_catalog *catalog =
+        asteriskd_owned_resource_catalog();
+
+    if (hook == NULL) return NULL;
+    for (size_t index = 0U; index < catalog->chain_count; ++index) {
+        const struct asteriskd_owned_chain *candidate = &catalog->chains[index];
+        if (candidate->family == hook->family && candidate->table == hook->table &&
+            strcmp(candidate->name, hook->target) == 0) return candidate;
     }
-    return 0;
+    return NULL;
 }
 
-struct system_recovery_wait {
-    struct asteriskd_system_supervisor *system;
-    const struct asteriskd_child_identity *core;
-    const struct asteriskd_process_spec *core_spec;
-    const struct asteriskd_child_identity *helper;
-    const struct asteriskd_process_spec *helper_spec;
-    bool unreadable;
-};
-
-static bool system_recovery_children_gone(void *opaque) {
-    struct system_recovery_wait *wait = opaque;
-    const struct asteriskd_child_identity *identities[2U] = {wait->core, wait->helper};
-    const struct asteriskd_process_spec *specs[2U] = {wait->core_spec, wait->helper_spec};
-    bool gone = true;
-    for (size_t index = 0U; index < 2U; ++index) {
-        if (identities[index] == NULL) continue;
-        enum system_recovery_identity_state state =
-            system_recovery_identity_classify(identities[index], specs[index]);
-        if (state == SYSTEM_RECOVERY_IDENTITY_MATCH) gone = false;
-        else if (state == SYSTEM_RECOVERY_IDENTITY_UNREADABLE) wait->unreadable = true;
-    }
-    return gone || wait->unreadable;
+static bool system_owned_hook_rule_probe_required(
+    const struct asteriskd_owned_hook *hook, bool target_chain_present) {
+    return system_owned_hook_target_chain(hook) == NULL || target_chain_present;
 }
 
-static int system_recovery_signal_if_matching(
-    const struct asteriskd_child_identity *identity,
-    const struct asteriskd_process_spec *spec,
-    int signal_number) {
-    if (identity == NULL) return 0;
-    enum system_recovery_identity_state state =
-        system_recovery_identity_classify(identity, spec);
-    if (state == SYSTEM_RECOVERY_IDENTITY_ABSENT ||
-        state == SYSTEM_RECOVERY_IDENTITY_MISMATCH) return 0;
-    if (state != SYSTEM_RECOVERY_IDENTITY_MATCH) return -1;
-    return kill(-identity->process_group_id, signal_number);
+#if defined(ASTERISKD_TESTING)
+bool asteriskd_test_owned_hook_rule_probe_required(
+    const struct asteriskd_owned_hook *hook, bool target_chain_present) {
+    return system_owned_hook_rule_probe_required(hook, target_chain_present);
 }
+#endif
 
-static int system_recovery_stop_children(struct asteriskd_system_supervisor *system) {
-    const struct asteriskd_child_identity *core = system->state.children.core_present
-        ? &system->state.children.core : NULL;
-    const struct asteriskd_child_identity *helper = system->state.children.helper_present
-        ? &system->state.children.helper : NULL;
-    if (core == NULL && helper == NULL) return 0;
-    struct asteriskd_process_spec core_spec;
-    struct asteriskd_process_spec helper_spec;
-    memset(&core_spec, 0, sizeof(core_spec));
-    memset(&helper_spec, 0, sizeof(helper_spec));
-    if ((core != NULL && system_recovery_spec_from_identity(
-            core, &system->loaded_config.config, &core_spec) != 0) ||
-        (helper != NULL && system_recovery_spec_from_identity(
-            helper, &system->loaded_config.config, &helper_spec) != 0)) return -1;
-    if (system_recovery_signal_if_matching(helper,
-            helper == NULL ? NULL : &helper_spec, SIGTERM) != 0 ||
-        system_recovery_signal_if_matching(core,
-            core == NULL ? NULL : &core_spec, SIGTERM) != 0) return -1;
-    struct system_recovery_wait wait = {
-        .system = system,
-        .core = core,
-        .core_spec = core == NULL ? NULL : &core_spec,
-        .helper = helper,
-        .helper_spec = helper == NULL ? NULL : &helper_spec,
-    };
-    int64_t now = 0;
-    if (system_runtime_clock(system, &now) != 0) return -1;
-    struct asteriskd_deadline deadline = {
-        .armed = true,
-        .monotonic_milliseconds = now + (int64_t)ASTERISKD_PROCESS_TERM_GRACE_MILLIS,
-    };
-    if (!system_recovery_children_gone(&wait)) {
-        (void)system_pump_condition(system, &deadline, system_recovery_children_gone);
-    }
-    if (wait.unreadable) return -1;
-    if (!system_recovery_children_gone(&wait)) {
-        if (system_recovery_signal_if_matching(helper,
-                helper == NULL ? NULL : &helper_spec, SIGKILL) != 0 ||
-            system_recovery_signal_if_matching(core,
-                core == NULL ? NULL : &core_spec, SIGKILL) != 0 ||
-            system_runtime_clock(system, &now) != 0) return -1;
-        deadline.monotonic_milliseconds = now + (int64_t)ASTERISKD_PROCESS_KILL_REAP_MILLIS;
-        (void)system_pump_condition(system, &deadline, system_recovery_children_gone);
-    }
-    if (wait.unreadable || !system_recovery_children_gone(&wait)) return -1;
-    if (helper != NULL && asteriskd_state_clear_child(
-            &system->state, ASTERISKD_CHILD_HELPER) != ASTERISKD_STATE_OK) return -1;
-    if (core != NULL && asteriskd_state_clear_child(
-            &system->state, ASTERISKD_CHILD_CORE) != ASTERISKD_STATE_OK) return -1;
-    return system_effect_save(system, &system->state);
-}
+static int system_owned_chain_presence(
+    struct asteriskd_system_supervisor *,
+    const struct asteriskd_owned_chain *, bool *);
 
-static bool system_recovery_used_dummy_ipv6(
-    const struct asteriskd_state_document *state) {
-    for (size_t index = 0U; index < state->recovery.record_count; ++index) {
-        if (state->recovery.records[index].kind == ASTERISKD_RECOVERY_DUMMY_INTERFACE &&
-            state->recovery.records[index].resource.dummy_interface.interface_id ==
-                ASTERISKD_INTERFACE_IPV6_DUMMY) return true;
-    }
-    return false;
-}
-
-static int system_stopped_iptables_residue_inspect(
+static int system_reconcile_hook(
     struct asteriskd_system_supervisor *system,
-    const struct asteriskd_rule_transaction_plan *plan,
-    bool *present) {
-    if (system == NULL || plan == NULL || present == NULL) return -1;
-    *present = false;
-    for (size_t group_index = 0U;
-            group_index < plan->private_group_count; ++group_index) {
-        const struct asteriskd_private_chain_group *group =
-            &plan->private_groups[group_index];
-        const struct system_rule_view *view =
-            &system->rule_snapshot.xtables[group->family][group->table];
-        if (!view->present) return -1;
-        for (size_t name_index = 0U; name_index < group->name_count; ++name_index) {
-            size_t declarations = 0U;
-            size_t rules = 0U;
-            const char *name = group->names[name_index];
-            if (asteriskd_xtables_private_chain_counts(
-                    view->bytes, view->length, name,
-                    &declarations, &rules) != 0) return -1;
-            if (declarations == 0U && rules == 0U) continue;
-            if (declarations != 1U ||
-                system_verify_private_chain_contents(system, group, name) != 0) return -1;
-            *present = true;
-        }
-    }
-    for (size_t group_index = 0U;
-            group_index < plan->hook_group_count; ++group_index) {
-        const struct asteriskd_traffic_hook_group *group =
-            &plan->hook_groups[group_index];
-        for (size_t hook_index = 0U; hook_index < group->hook_count; ++hook_index) {
-            size_t matches = 0U;
-            size_t position = 0U;
-            if (system_hook_match_count(system, group, &group->hooks[hook_index],
-                    &matches, &position) != 0 || matches > 1U) return -1;
-            if (matches == 1U) *present = true;
-        }
-    }
-    return 0;
-}
+    const struct asteriskd_owned_hook *hook,
+    bool remove) {
+    const char *arguments[6U];
+    size_t argument_count = system_owned_hook_arguments(
+        hook, arguments, sizeof(arguments) / sizeof(arguments[0]));
+    size_t attempt;
 
-static int system_cleanup_stopped_iptables_residue(
-    struct asteriskd_system_supervisor *system) {
-    if (!system->rules_initialized) system_rules_backend_init(system);
-    if (system_detect_global_ipv6(&system->has_global_ipv6_address) != 0 ||
-        asteriskd_rule_transaction_plan_build(
-            &system->loaded_config.config, system->has_global_ipv6_address,
-            &system->rules_runtime.plan) != 0) return -1;
-    const struct asteriskd_rule_transaction_plan *plan = &system->rules_runtime.plan;
-    if (plan->no_op) return 0;
-    struct asteriskd_rule_transaction_plan snapshot_plan = *plan;
-    snapshot_plan.route_count = 0U;
-    if (system_rule_snapshot_capture(system, &snapshot_plan,
-            SYSTEM_RULE_SNAPSHOT_BEFORE_APPLY) != 0) return -1;
-    bool present = false;
-    if (system_stopped_iptables_residue_inspect(system, plan, &present) != 0) goto failed;
-    if (!present) {
-        system_rule_snapshot_destroy(&system->rule_snapshot);
-        return 0;
+    if (argument_count == 0U) return -1;
+    const struct asteriskd_owned_chain *target_chain =
+        system_owned_hook_target_chain(hook);
+    if (target_chain != NULL) {
+        bool target_present = false;
+        if (system_owned_chain_presence(system, target_chain, &target_present) != 0) return -1;
+        if (!system_owned_hook_rule_probe_required(hook, target_present)) return 0;
     }
-    if (system_rule_batch_begin(&system->rule_commands) != 0) goto failed;
-    for (size_t remaining = plan->hook_group_count; remaining > 0U; --remaining) {
-        if (system_remove_hook_group(
-                system, &plan->hook_groups[remaining - 1U]) != 0) goto failed;
+    for (attempt = 0U; attempt < 64U; ++attempt) {
+        int exit_status = -1;
+        if (system_xtables(system, hook->family, hook->table,
+                "-C", hook->builtin_chain, arguments, argument_count,
+                &exit_status) != 0) return -1;
+        if (exit_status == 1) return 0;
+        if (exit_status != 0 || !remove) return -1;
+        if (system_xtables(system, hook->family, hook->table,
+                "-D", hook->builtin_chain, arguments, argument_count,
+                &exit_status) != 0 || exit_status != 0) return -1;
     }
-    for (size_t remaining = plan->private_group_count; remaining > 0U; --remaining) {
-        if (system_remove_private_group(
-                system, &plan->private_groups[remaining - 1U]) != 0) goto failed;
-    }
-    if (system_rule_batch_flush_xtables(system) != 0) goto failed;
-    system_rule_batch_destroy(&system->rule_commands);
-    if (system_rule_snapshot_capture(system, &snapshot_plan,
-            SYSTEM_RULE_SNAPSHOT_AFTER_APPLY) != 0) goto failed;
-    present = false;
-    if (system_stopped_iptables_residue_inspect(system, plan, &present) != 0 || present) {
-        goto failed;
-    }
-    system_rule_snapshot_destroy(&system->rule_snapshot);
-    (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_INFO,
-        ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC,
-        "removed verified asteriskd iptables residue from stopped state");
-    return 0;
-
-failed:
-    system_rule_batch_destroy(&system->rule_commands);
-    system_rule_snapshot_destroy(&system->rule_snapshot);
     return -1;
 }
 
-static int system_cleanup_stopped_bpf2_tc_interface(
-    struct asteriskd_system_supervisor *system,
-    const char *name, uint32_t index) {
-    struct asteriskd_tc_filter_resource filter;
-    memset(&filter, 0, sizeof(filter));
-    filter.interface_index = index;
-    if (snprintf(filter.interface_name,
-            sizeof(filter.interface_name), "%s", name) <= 0) return -1;
-    filter.filter_id = ASTERISKD_FILTER_HOTSPOT_EGRESS;
-    filter.direction = ASTERISKD_TC_DIRECTION_EGRESS;
-    filter.program_id = ASTERISKD_PROGRAM_BPF2SOCKS_EGRESS;
-    if (system_tc_remove_filter(system, &filter) != 0) return -1;
-    filter.filter_id = ASTERISKD_FILTER_HOTSPOT_INGRESS;
-    filter.direction = ASTERISKD_TC_DIRECTION_INGRESS;
-    filter.program_id = ASTERISKD_PROGRAM_BPF2SOCKS_INGRESS;
-    return system_tc_remove_filter(system, &filter);
+static int system_reconcile_hooks(
+    struct asteriskd_system_supervisor *system, bool remove) {
+    const struct asteriskd_owned_resource_catalog *catalog =
+        asteriskd_owned_resource_catalog();
+    size_t index;
+
+    for (index = 0U; index < catalog->hook_count; ++index) {
+        if (system_reconcile_hook(system, &catalog->hooks[index], remove) != 0) {
+            return -1;
+        }
+    }
+    return 0;
 }
 
-static int system_cleanup_stopped_bpf2_tc(
-    struct asteriskd_system_supervisor *system) {
-    struct ifaddrs *addresses = NULL;
-    if (getifaddrs(&addresses) != 0) return -1;
-    char handled[ASTERISKD_MAX_ADDRESSES][ASTERISKD_MAX_INTERFACE_NAME];
-    size_t handled_count = 0U;
-    int result = 0;
-    for (const struct ifaddrs *entry = addresses; entry != NULL; entry = entry->ifa_next) {
-        if (entry->ifa_name == NULL || !system_hotspot_interface_selected(
-                &system->loaded_config.config, entry->ifa_name)) continue;
-        bool duplicate = false;
-        for (size_t index = 0U; index < handled_count; ++index) {
-            if (strcmp(handled[index], entry->ifa_name) == 0) duplicate = true;
+static int system_owned_chain_presence(
+    struct asteriskd_system_supervisor *system,
+    const struct asteriskd_owned_chain *chain,
+    bool *present) {
+    int exit_status = -1;
+
+    if (present == NULL ||
+        system_xtables(system, chain->family, chain->table,
+            "-S", chain->name, NULL, 0U, &exit_status) != 0 ||
+        (exit_status != 0 && exit_status != 1)) return -1;
+    *present = exit_status == 0;
+    return 0;
+}
+
+static int system_reconcile_private_chains(
+    struct asteriskd_system_supervisor *system, bool remove) {
+    const struct asteriskd_owned_resource_catalog *catalog =
+        asteriskd_owned_resource_catalog();
+    size_t index;
+
+    for (index = 0U; index < catalog->chain_count; ++index) {
+        const struct asteriskd_owned_chain *chain = &catalog->chains[index];
+        bool present = false;
+        int exit_status = -1;
+
+        if (system_owned_chain_presence(system, chain, &present) != 0) return -1;
+        if (!present) continue;
+        if (!remove) return -1;
+        if (system_xtables(system, chain->family, chain->table,
+                "-F", chain->name, NULL, 0U, &exit_status) != 0 ||
+            exit_status != 0) return -1;
+    }
+    if (!remove) return 0;
+
+    for (index = catalog->chain_count; index > 0U; --index) {
+        const struct asteriskd_owned_chain *chain = &catalog->chains[index - 1U];
+        bool present = false;
+        int exit_status = -1;
+
+        if (system_owned_chain_presence(system, chain, &present) != 0) return -1;
+        if (!present) continue;
+        if (system_xtables(system, chain->family, chain->table,
+                "-X", chain->name, NULL, 0U, &exit_status) != 0 ||
+            exit_status != 0) return -1;
+    }
+    return 0;
+}
+
+static int system_owned_policy_rule_count(
+    struct asteriskd_system_supervisor *system,
+    const struct asteriskd_owned_policy_rule *rule,
+    size_t *count) {
+    char priority[16U];
+    const char *arguments[] = {"rule", "show", "priority", priority};
+    int exit_status = -1;
+
+    if (count == NULL ||
+        snprintf(priority, sizeof(priority), "%" PRIu32, rule->priority) <= 0 ||
+        system_ip_command(system, rule->family, arguments,
+            sizeof(arguments) / sizeof(arguments[0]), true, &exit_status) != 0 ||
+        exit_status != 0 || system->action_stdout_overflow) return -1;
+    return asteriskd_owned_policy_rule_output_count(
+        system->action_stdout, system->action_stdout_length, rule, count);
+}
+
+static int system_reconcile_policy_rule(
+    struct asteriskd_system_supervisor *system,
+    const struct asteriskd_owned_policy_rule *rule,
+    bool remove) {
+    char table[16U];
+    char priority[16U];
+    char mark[32U];
+    const char *normal[] = {
+        "rule", "del", "priority", priority,
+        "fwmark", mark, "table", table,
+    };
+    const char *inverted[] = {
+        "rule", "del", "priority", priority,
+        "not", "from", "all", "fwmark", mark, "table", table,
+    };
+    const char *const *arguments = rule->invert_from_all ? inverted : normal;
+    size_t argument_count = rule->invert_from_all
+        ? sizeof(inverted) / sizeof(inverted[0])
+        : sizeof(normal) / sizeof(normal[0]);
+    size_t attempt;
+
+    if (snprintf(table, sizeof(table), "%" PRIu32, rule->table) <= 0 ||
+        snprintf(priority, sizeof(priority), "%" PRIu32, rule->priority) <= 0 ||
+        snprintf(mark, sizeof(mark), "0x%08" PRIx32 "/0x%08" PRIx32,
+            rule->mark, rule->mark_mask) <= 0) return -1;
+
+    for (attempt = 0U; attempt < 64U; ++attempt) {
+        size_t count = 0U;
+        int exit_status = -1;
+
+        if (system_owned_policy_rule_count(system, rule, &count) != 0) return -1;
+        if (count == 0U) return 0;
+        if (!remove ||
+            system_ip_command(system, rule->family, arguments,
+                argument_count, false, &exit_status) != 0 ||
+            exit_status != 0) return -1;
+    }
+    return -1;
+}
+
+struct system_owned_route_table {
+    enum asteriskd_ip_family family;
+    uint32_t table;
+};
+
+static const struct system_owned_route_table system_owned_route_tables[] = {
+    {ASTERISKD_IP_FAMILY_IPV4, ASTERISKD_TPROXY_TABLE},
+    {ASTERISKD_IP_FAMILY_IPV6, ASTERISKD_TPROXY_TABLE},
+    {ASTERISKD_IP_FAMILY_IPV6, ASTERISKD_TPROXY_DUMMY_TABLE},
+    {ASTERISKD_IP_FAMILY_IPV4, ASTERISKD_TUN_TABLE},
+    {ASTERISKD_IP_FAMILY_IPV6, ASTERISKD_TUN_TABLE},
+};
+
+static int system_reconcile_route_table(
+    struct asteriskd_system_supervisor *system,
+    const struct system_owned_route_table *owned,
+    bool remove) {
+    char table[16U];
+    const char *show[] = {"route", "show", "table", table};
+    const char *flush[] = {"route", "flush", "table", table};
+    int exit_status = -1;
+
+    if (snprintf(table, sizeof(table), "%" PRIu32, owned->table) <= 0 ||
+        system_ip_command(system, owned->family, show,
+            sizeof(show) / sizeof(show[0]), true, &exit_status) != 0 ||
+        exit_status != 0 || system->action_stdout_overflow) return -1;
+    if (system->action_stdout_length == 0U) return 0;
+    if (!remove ||
+        system_ip_command(system, owned->family, flush,
+            sizeof(flush) / sizeof(flush[0]), false, &exit_status) != 0 ||
+        exit_status != 0) return -1;
+    return 0;
+}
+
+static void system_owned_token_effect(struct asteriskd_route_effect *effect) {
+    const struct asteriskd_owned_token_route *token =
+        &asteriskd_owned_resource_catalog()->token_route;
+
+    memset(effect, 0, sizeof(*effect));
+    effect->kind = ASTERISKD_ROUTE_EFFECT_ROUTE;
+    effect->family = token->family;
+    effect->table = token->table;
+    effect->local_route = true;
+    effect->route_id = ASTERISKD_ROUTE_TOKEN;
+    (void)snprintf(effect->destination, sizeof(effect->destination),
+        "%s", token->destination);
+    (void)snprintf(effect->interface_name, sizeof(effect->interface_name),
+        "%s", token->interface_name);
+}
+
+static int system_reconcile_token_route(
+    struct asteriskd_system_supervisor *system, bool remove) {
+    struct asteriskd_route_effect effect;
+    enum asteriskd_rules_slot_state state = ASTERISKD_RULES_SLOT_ABSENT;
+    size_t attempt;
+
+    system_owned_token_effect(&effect);
+    for (attempt = 0U; attempt < 64U; ++attempt) {
+        if (system_classify_route_effect(system, &effect, &state) != 0 ||
+            state == ASTERISKD_RULES_SLOT_FOREIGN) return -1;
+        if (state == ASTERISKD_RULES_SLOT_ABSENT) return 0;
+        if (!remove || system_remove_route_effect(system, &effect) != 0) return -1;
+    }
+    return -1;
+}
+
+static int system_reconcile_policy_routing(
+    struct asteriskd_system_supervisor *system, bool remove) {
+    const struct asteriskd_owned_resource_catalog *catalog =
+        asteriskd_owned_resource_catalog();
+    size_t index;
+
+    for (index = 0U; index < catalog->policy_rule_count; ++index) {
+        if (system_reconcile_policy_rule(
+                system, &catalog->policy_rules[index], remove) != 0) return -1;
+    }
+    for (index = 0U;
+         index < sizeof(system_owned_route_tables) /
+             sizeof(system_owned_route_tables[0]);
+         ++index) {
+        if (system_reconcile_route_table(
+                system, &system_owned_route_tables[index], remove) != 0) return -1;
+    }
+    return system_reconcile_token_route(system, remove);
+}
+
+static int system_owned_dummy_probe(
+    struct asteriskd_system_supervisor *system,
+    bool *present,
+    bool *owned) {
+    const char *name = asteriskd_owned_resource_catalog()->dummy_interface_name;
+    const char *arguments[] = {
+        "-d", "-j", "link", "show", "dev", name,
+    };
+    int exit_status = -1;
+
+    if (present == NULL || owned == NULL) return -1;
+    *present = if_nametoindex(name) != 0U;
+    *owned = false;
+    if (!*present) return 0;
+    if (system_ip_unscoped_command(system,
+            arguments, sizeof(arguments) / sizeof(arguments[0]),
+            true, &exit_status) != 0 || exit_status != 0 ||
+        system->action_stdout_overflow) return -1;
+    return asteriskd_ip_link_output_is_dummy(
+        system->action_stdout, system->action_stdout_length, owned);
+}
+
+static int system_reconcile_dummy_interface(
+    struct asteriskd_system_supervisor *system, bool remove) {
+    const char *name = asteriskd_owned_resource_catalog()->dummy_interface_name;
+    const char *arguments[] = {"link", "del", "dev", name, "type", "dummy"};
+    bool present = false;
+    bool owned = false;
+    int exit_status = -1;
+
+    if (system_owned_dummy_probe(system, &present, &owned) != 0) return -1;
+    if (!present || !owned) return 0;
+    if (!remove ||
+        system_ip_unscoped_command(system,
+            arguments, sizeof(arguments) / sizeof(arguments[0]),
+            false, &exit_status) != 0 || exit_status != 0) return -1;
+    return if_nametoindex(name) == 0U ? 0 : -1;
+}
+
+static int system_remove_owned_bpf_tree(const char *path) {
+    struct stat status;
+
+    if (lstat(path, &status) != 0) return errno == ENOENT ? 0 : -1;
+    if (!S_ISDIR(status.st_mode)) {
+        return unlink(path) == 0 || errno == ENOENT ? 0 : -1;
+    }
+
+    {
+        DIR *directory = opendir(path);
+        struct dirent *entry;
+        int result = 0;
+
+        if (directory == NULL) return -1;
+        while ((entry = readdir(directory)) != NULL) {
+            char child[ASTERISKD_MAX_PATH];
+            int written;
+
+            if (strcmp(entry->d_name, ".") == 0 ||
+                strcmp(entry->d_name, "..") == 0) continue;
+            written = snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+            if (written <= 0 || (size_t)written >= sizeof(child) ||
+                system_remove_owned_bpf_tree(child) != 0) {
+                result = -1;
+                break;
+            }
         }
-        if (duplicate) continue;
-        uint32_t interface_index = if_nametoindex(entry->ifa_name);
-        if (handled_count >= ASTERISKD_MAX_ADDRESSES || interface_index == 0U ||
-            snprintf(handled[handled_count], sizeof(handled[handled_count]),
-                "%s", entry->ifa_name) <= 0 ||
-            system_cleanup_stopped_bpf2_tc_interface(
-                system, entry->ifa_name, interface_index) != 0) {
+        if (closedir(directory) != 0) result = -1;
+        if (result != 0) return -1;
+    }
+    return rmdir(path) == 0 || errno == ENOENT ? 0 : -1;
+}
+
+static int system_reconcile_bpf_pins(
+    struct asteriskd_system_supervisor *system, bool remove) {
+    const char *root = asteriskd_owned_resource_catalog()->bpf_root;
+    struct stat status;
+
+    (void)system;
+    if (lstat(root, &status) != 0) return errno == ENOENT ? 0 : -1;
+    if (!remove) return -1;
+    return system_remove_owned_bpf_tree(root);
+}
+
+static int system_prepare_owned_tc_identity(
+    struct asteriskd_system_supervisor *system) {
+    struct asteriskd_config config;
+    char error[256U];
+
+    memset(&config, 0, sizeof(config));
+    config.mode = ASTERISKD_MODE_BPF2SOCKS;
+    config.helper.type = ASTERISKD_HELPER_BPF2SOCKS;
+    config.enable_ipv6 = true;
+    memset(&system->bpf2_pin_plan, 0, sizeof(system->bpf2_pin_plan));
+    memset(&system->bpf2_verification, 0, sizeof(system->bpf2_verification));
+    if (asteriskd_bpf2_pin_plan_build(
+            &config, &system->bpf2_pin_plan) != 0 ||
+        asteriskd_bpf2_verify_residue(
+            &config, &system->bpf2_pin_plan,
+            asteriskd_system_bpf_program_backend(),
+            asteriskd_system_bpf_pin_ownership_backend(),
+            &system->bpf2_verification, error, sizeof(error)) != 0) return -1;
+    system->bpf2_plan_ready = true;
+    system->bpf2_verified = true;
+    return 0;
+}
+
+static int system_reconcile_tc_filter(
+    struct asteriskd_system_supervisor *system,
+    const char *interface_name,
+    uint32_t interface_index,
+    enum asteriskd_tc_direction direction,
+    enum asteriskd_program_id program_id,
+    bool remove) {
+    struct asteriskd_tc_filter_resource filter;
+    enum asteriskd_rules_slot_state state = ASTERISKD_RULES_SLOT_FOREIGN;
+    const char *direction_name;
+    const char *arguments[10U];
+    int exit_status = -1;
+
+    memset(&filter, 0, sizeof(filter));
+    filter.interface_index = interface_index;
+    filter.direction = direction;
+    filter.program_id = program_id;
+    filter.filter_id = direction == ASTERISKD_TC_DIRECTION_INGRESS
+        ? ASTERISKD_FILTER_HOTSPOT_INGRESS
+        : ASTERISKD_FILTER_HOTSPOT_EGRESS;
+    if (snprintf(filter.interface_name, sizeof(filter.interface_name),
+            "%s", interface_name) <= 0 ||
+        system_expected_tc_netlink_probe(system, &filter, &state) != 0) return -1;
+    if (state == ASTERISKD_RULES_SLOT_ABSENT ||
+        state == ASTERISKD_RULES_SLOT_FOREIGN) return 0;
+    if (!remove) return -1;
+
+    direction_name = system_tc_direction(direction);
+    if (direction_name == NULL) return -1;
+    arguments[0] = "filter";
+    arguments[1] = "del";
+    arguments[2] = "dev";
+    arguments[3] = interface_name;
+    arguments[4] = direction_name;
+    arguments[5] = "pref";
+    arguments[6] = "1";
+    arguments[7] = "handle";
+    arguments[8] = "1";
+    arguments[9] = "bpf";
+    if (system_tc_command(system, arguments,
+            sizeof(arguments) / sizeof(arguments[0]),
+            false, &exit_status) != 0 || exit_status != 0 ||
+        system_expected_tc_netlink_probe(system, &filter, &state) != 0 ||
+        state != ASTERISKD_RULES_SLOT_ABSENT) return -1;
+    return 0;
+}
+
+static int system_reconcile_tc_filters(
+    struct asteriskd_system_supervisor *system, bool remove) {
+    DIR *directory = opendir("/sys/class/net");
+    struct dirent *entry;
+    int result = 0;
+
+    if (directory == NULL) return -1;
+    while ((entry = readdir(directory)) != NULL) {
+        uint32_t interface_index;
+        size_t length = strnlen(
+            entry->d_name, ASTERISKD_MAX_INTERFACE_NAME);
+
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0) continue;
+        if (length == 0U || length >= ASTERISKD_MAX_INTERFACE_NAME) {
             result = -1;
             break;
         }
-        ++handled_count;
+        interface_index = if_nametoindex(entry->d_name);
+        if (interface_index == 0U ||
+            system_reconcile_tc_filter(system, entry->d_name, interface_index,
+                ASTERISKD_TC_DIRECTION_INGRESS,
+                ASTERISKD_PROGRAM_BPF2SOCKS_INGRESS, remove) != 0 ||
+            system_reconcile_tc_filter(system, entry->d_name, interface_index,
+                ASTERISKD_TC_DIRECTION_EGRESS,
+                ASTERISKD_PROGRAM_BPF2SOCKS_EGRESS, remove) != 0) {
+            result = -1;
+            break;
+        }
     }
-    freeifaddrs(addresses);
+    if (closedir(directory) != 0) result = -1;
     return result;
 }
 
-static int system_cleanup_stopped_bpf_residue(
-    struct asteriskd_system_supervisor *system) {
-    const struct asteriskd_bpf_program_backend *program_backend =
-        asteriskd_system_bpf_program_backend();
-    const struct asteriskd_bpf_pin_ownership_backend *ownership_backend =
-        asteriskd_system_bpf_pin_ownership_backend();
-    char error[256U];
-    bool removed = false;
-    if (system->loaded_config.config.matcher.enabled) {
-        if (asteriskd_matcher_pin_plan_build(
-                &system->loaded_config.config, &system->matcher_pin_plan) != 0) return -1;
-        system->matcher_plan_ready = true;
-        struct asteriskd_matcher_verification verification;
-        if (asteriskd_matcher_verify_residue(
-                &system->loaded_config.config, &system->matcher_pin_plan,
-                program_backend, ownership_backend, &verification,
-                error, sizeof(error)) != 0) return -1;
-        for (size_t index = 0U; index < verification.pin_count; ++index) {
-            const char *path = system_pin_path(system, verification.pins[index].pin_id);
-            if (path == NULL || asteriskd_bpf_pin_cleanup_owned(
-                    path, verification.pins[index].object_id,
-                    ownership_backend, error, sizeof(error)) != 0) return -1;
-            removed = true;
-        }
+static int system_reconcile_remove_phase(
+    void *opaque,
+    enum asteriskd_reconcile_phase phase,
+    char *error,
+    size_t error_size) {
+    struct asteriskd_system_supervisor *system = opaque;
+    int result = -1;
+
+    if (system == NULL) return -1;
+    switch (phase) {
+        case ASTERISKD_RECONCILE_QUIESCE:
+            result = system_reconcile_hooks(system, true);
+            if (result == 0) result = system_prepare_owned_tc_identity(system);
+            if (result == 0) result = system_reconcile_tc_filters(system, true);
+            break;
+        case ASTERISKD_RECONCILE_PRIVATE_CHAINS:
+            result = system_reconcile_private_chains(system, true);
+            break;
+        case ASTERISKD_RECONCILE_POLICY_ROUTING:
+            result = system_reconcile_policy_routing(system, true);
+            break;
+        case ASTERISKD_RECONCILE_DUMMY_INTERFACE:
+            result = system_reconcile_dummy_interface(system, true);
+            break;
+        case ASTERISKD_RECONCILE_BPF_PINS:
+            result = system_reconcile_bpf_pins(system, true);
+            break;
+        case ASTERISKD_RECONCILE_PHASE_COUNT:
+            result = -1;
+            break;
     }
-    if (system->loaded_config.config.mode == ASTERISKD_MODE_BPF2SOCKS) {
-        if (asteriskd_bpf2_pin_plan_build(
-                &system->loaded_config.config, &system->bpf2_pin_plan) != 0) return -1;
-        system->bpf2_plan_ready = true;
-        if (asteriskd_bpf2_verify_residue(
-                &system->loaded_config.config, &system->bpf2_pin_plan,
-                program_backend, ownership_backend, &system->bpf2_verification,
-                error, sizeof(error)) != 0) return -1;
-        system->bpf2_verified = true;
-        if (system->bpf2_verification.pin_count != 0U &&
-            system_cleanup_stopped_bpf2_tc(system) != 0) return -1;
-        for (size_t index = 0U;
-                index < system->bpf2_verification.pin_count; ++index) {
-            const struct asteriskd_bpf2_verified_pin *pin =
-                &system->bpf2_verification.pins[index];
-            const char *path = system_pin_path(system, pin->pin_id);
-            if (path == NULL || asteriskd_bpf_pin_cleanup_owned(
-                    path, pin->object_id, ownership_backend,
-                    error, sizeof(error)) != 0) return -1;
-            removed = true;
-        }
-        memset(&system->bpf2_verification, 0, sizeof(system->bpf2_verification));
-        system->bpf2_verified = false;
+    if (result != 0) {
+        static const char *const names[] = {
+            "quiesce", "private-chains", "policy-routing",
+            "dummy-interface", "bpf-pins",
+        };
+        char message[128U];
+        int written = snprintf(message, sizeof(message),
+            "owned resource reconcile failed: phase=%s",
+            phase >= ASTERISKD_RECONCILE_QUIESCE &&
+                    phase < ASTERISKD_RECONCILE_PHASE_COUNT
+                ? names[phase] : "invalid");
+        system_reconcile_error(error, error_size,
+            written > 0 && (size_t)written < sizeof(message)
+                ? message : "owned resource reconcile failed");
     }
-    if (removed) {
-        (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_INFO,
-            ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC,
-            "removed verified asteriskd BPF residue from stopped state");
+    return result;
+}
+
+static int system_reconcile_verify_absent(
+    void *opaque, char *error, size_t error_size) {
+    struct asteriskd_system_supervisor *system = opaque;
+
+    if (system == NULL ||
+        system_reconcile_hooks(system, false) != 0 ||
+        system_reconcile_tc_filters(system, false) != 0 ||
+        system_reconcile_private_chains(system, false) != 0 ||
+        system_reconcile_policy_routing(system, false) != 0 ||
+        system_reconcile_dummy_interface(system, false) != 0 ||
+        system_reconcile_bpf_pins(system, false) != 0) {
+        system_reconcile_error(
+            error, error_size, "owned resource verification failed");
+        return -1;
     }
     return 0;
 }
 
-static bool system_obsolete_hotspot_pin_name(const char *name, const char *prefix) {
-    size_t prefix_length = strlen(prefix);
-    if (strncmp(name, prefix, prefix_length) != 0 || name[prefix_length] == '\0') return false;
-    for (const char *cursor = name + prefix_length; *cursor != '\0'; ++cursor) {
-        if (*cursor < '0' || *cursor > '9') return false;
-    }
-    return true;
-}
-
-static void system_cleanup_obsolete_hotspot_pins(
+static struct asteriskd_reconcile_backend system_reconcile_backend(
     struct asteriskd_system_supervisor *system) {
-    const char *owner = system->loaded_config.config.owner == ASTERISKD_OWNER_NG
-        ? "asteriskng" : system->loaded_config.config.owner == ASTERISKD_OWNER_BOX
-            ? "asteriskbox" : system->loaded_config.config.owner == ASTERISKD_OWNER_META
-                ? "asteriskmeta" : NULL;
-    char prefix[64U];
-    if (owner == NULL || snprintf(prefix, sizeof(prefix),
-            "%s_hotspot_recovery_", owner) <= 0) return;
-    DIR *directory = opendir("/sys/fs/bpf");
-    if (directory == NULL) return;
-    bool removed = false;
-    bool failed = false;
-    struct dirent *entry;
-    while ((entry = readdir(directory)) != NULL) {
-        if (!system_obsolete_hotspot_pin_name(entry->d_name, prefix)) continue;
-        char path[ASTERISKD_MAX_PATH];
-        int written = snprintf(path, sizeof(path), "/sys/fs/bpf/%s", entry->d_name);
-        if (written <= 0 || (size_t)written >= sizeof(path)) {
-            failed = true;
-        } else if (unlink(path) == 0 || errno == ENOENT) {
-            removed = true;
-        } else {
-            failed = true;
-        }
-    }
-    if (closedir(directory) != 0) failed = true;
-    if (removed) {
-        (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_INFO,
-            ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC,
-            "removed obsolete hotspot recovery BPF pin residue");
-    }
-    if (failed) {
-        (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_WARNING,
-            ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC,
-            "obsolete hotspot recovery BPF pin cleanup was incomplete");
-    }
+    const struct asteriskd_reconcile_backend backend = {
+        .context = system,
+        .remove_phase = system_reconcile_remove_phase,
+        .verify_absent = system_reconcile_verify_absent,
+    };
+    return backend;
 }
 
-static int system_cleanup_start_state(struct asteriskd_system_supervisor *system) {
-    system_cleanup_obsolete_hotspot_pins(system);
-    if (asteriskd_state_is_canonical_stopped(&system->state)) {
-        return system_cleanup_stopped_iptables_residue(system) == 0
-            ? system_cleanup_stopped_bpf_residue(system) : -1;
-    }
-    system->cleanup_in_progress = true;
-    if (asteriskd_state_set_phase(
-            &system->state, ASTERISKD_PHASE_RECOVERING) != ASTERISKD_STATE_OK ||
-        system_effect_save(system, &system->state) != 0) return -1;
-    system_rules_backend_init(system);
-    bool recovery_has_global_ipv6 = !system_recovery_used_dummy_ipv6(&system->state);
-    if (asteriskd_rule_transaction_plan_build(&system->loaded_config.config,
-            recovery_has_global_ipv6, &system->rules_runtime.plan) != 0 ||
-        asteriskd_rules_recover(system->state.recovery.records,
-            system->state.recovery.record_count, &system->rules_backend) != 0 ||
-        system_recovery_stop_children(system) != 0) return -1;
-    char error[256U];
-    if (asteriskd_wal_recover(&system->store, &system->state,
-            &system_wal_backend, system, error, sizeof(error)) != ASTERISKD_STATE_OK ||
-        asteriskd_state_set_matcher(&system->state,
-            system->loaded_config.config.matcher.enabled, false) != ASTERISKD_STATE_OK ||
-        asteriskd_state_set_rules(&system->state, false, 0U, 0U) != ASTERISKD_STATE_OK) return -1;
-    system->state.recovery.core_owned_ebpf_boundary = false;
-    if (asteriskd_state_mark_stopped(
-            &system->state, error, sizeof(error)) != ASTERISKD_STATE_OK ||
-        system_effect_save(system, &system->state) != 0) return -1;
-    return 0;
+static int system_reconcile_owned_resources_after_listener(
+    struct asteriskd_system_supervisor *system,
+    enum asteriskd_control_listener_result listener_result,
+    char *error,
+    size_t error_size) {
+    struct asteriskd_reconcile_backend backend =
+        system_reconcile_backend(system);
+    struct asteriskd_reconcile_report report;
+
+    system_rule_batch_destroy(&system->rule_commands);
+    system_rule_snapshot_destroy(&system->rule_snapshot);
+    return asteriskd_reconcile_after_listener(
+        listener_result, &backend, &report, error, error_size);
+}
+
+static int system_reconcile_owned_resources(
+    struct asteriskd_system_supervisor *system,
+    char *error,
+    size_t error_size) {
+    return system_reconcile_owned_resources_after_listener(
+        system, ASTERISKD_CONTROL_LISTENER_OK, error, error_size);
 }
 
 static int system_effect_rules(void *opaque, bool *active,
@@ -6371,8 +6034,6 @@ static int system_effect_reconcile(void *opaque, bool *active,
     const char *failed_stage = NULL;
     if (system_capture_local_address_snapshot(system) != 0) {
         failed_stage = "local-address-snapshot";
-    } else if (system_recover_retired_interface_records(system) != 0) {
-        failed_stage = "retired-interface-recovery";
     } else if (system_reconcile_iptables_local_bypass(system) != 0) {
         failed_stage = "iptables-local-bypass";
     } else if (system_rule_snapshot_capture(
@@ -6563,11 +6224,11 @@ static int system_effect_remove_rules(void *opaque) {
     if (system->loaded_config.config.mode == ASTERISKD_MODE_EBPF) return 0;
     if (!system->rules_initialized || asteriskd_rules_remove(
             &system->rules_runtime, &system->rules_backend) != 0) return -1;
-    if (asteriskd_runtime_recover_before_helper_stop(
+    if (asteriskd_runtime_remove_tc_before_helper_stop(
             system->loaded_config.config.mode)) {
         char error[128U];
-        if (asteriskd_wal_recover(&system->store, &system->state,
-                &system_wal_backend, system, error, sizeof(error)) != ASTERISKD_STATE_OK) {
+        if (system_reconcile_remove_phase(system,
+                ASTERISKD_RECONCILE_QUIESCE, error, sizeof(error)) != 0) {
             return -1;
         }
     }
@@ -6587,12 +6248,16 @@ static int system_effect_close_network(void *opaque) {
     return result;
 }
 
-static int system_effect_restore(void *opaque) {
+static int system_effect_restore_best_effort(void *opaque) {
     struct asteriskd_system_supervisor *system = opaque;
     system->cleanup_in_progress = true;
     char error[128U];
-    return asteriskd_wal_recover(&system->store, &system->state,
-        &system_wal_backend, system, error, sizeof(error));
+    struct asteriskd_effect_backend backend = system_effect_backend(system);
+    int restored = asteriskd_effect_journal_rollback(
+        &system->volatile_effects, &backend, error, sizeof(error));
+    int reconciled = system_reconcile_owned_resources(
+        system, error, sizeof(error));
+    return restored == 0 && reconciled == 0 ? 0 : -1;
 }
 
 static struct asteriskd_runtime_effect_backend system_runtime_effects(
@@ -6601,7 +6266,7 @@ static struct asteriskd_runtime_effect_backend system_runtime_effects(
         .context = system,
         .save_state = system_effect_save,
         .publish_event = system_effect_event,
-        .recover = system_effect_recover,
+        .reconcile_owned_resources = system_effect_reconcile_owned_resources,
         .start_core = system_effect_start_core,
         .wait_core = system_effect_wait_core,
         .ensure_platform_capability = system_effect_capability,
@@ -6619,7 +6284,7 @@ static struct asteriskd_runtime_effect_backend system_runtime_effects(
         .stop_matcher = system_effect_noop,
         .stop_helper = system_effect_stop_helper,
         .stop_core = system_effect_stop_core,
-        .restore = system_effect_restore,
+        .restore_best_effort = system_effect_restore_best_effort,
         .release = system_effect_noop,
     };
     return effects;
@@ -6702,6 +6367,28 @@ static void system_runtime_reset_cycle(struct asteriskd_system_supervisor *syste
     system_child_process_defaults(&system->action_process);
 }
 
+static int system_reset_telemetry_state(
+    struct asteriskd_system_supervisor *system,
+    char *error, size_t error_size) {
+    struct asteriskd_state_document replacement;
+    int result = asteriskd_state_document_init(&replacement,
+        system->loaded_config.config.owner,
+        system->loaded_config.config.core_type,
+        system->loaded_config.config.mode);
+    if (result != ASTERISKD_STATE_OK) return result;
+    result = asteriskd_state_store_save(
+        &system->store, &replacement, error, error_size);
+    if (result != ASTERISKD_STATE_OK) {
+        asteriskd_state_document_destroy(&replacement);
+        return result;
+    }
+    if (system->state.initialized) {
+        asteriskd_state_document_destroy(&system->state);
+    }
+    system->state = replacement;
+    return ASTERISKD_STATE_OK;
+}
+
 static void system_runtime_cleanup(struct asteriskd_system_supervisor *system) {
     system_runtime_cleanup_cycle(system);
     if (system->control != NULL) {
@@ -6733,7 +6420,7 @@ static void system_runtime_finish_control_stop(
     struct asteriskd_control_result result;
     memset(&result, 0, sizeof(result));
     if (asteriskd_control_snapshot_from_state(&system->state, &system->live, &snapshot) == 0) {
-        result.code = asteriskd_state_is_canonical_stopped(&system->state)
+        result.code = asteriskd_state_is_stopped(&system->state)
             ? ASTERISKD_CONTROL_RESULT_OK : ASTERISKD_CONTROL_RESULT_STOP_FAILED;
         result.has_snapshot = true;
         (void)asteriskd_control_snapshot_copy(&result.snapshot, &snapshot);
@@ -6840,29 +6527,13 @@ static int system_runtime_run(const char *config_path, bool initial_start,
         return 1;
     }
 
-    int state_result = asteriskd_state_store_load(
-        &system.store, &system.state, error, sizeof(error));
-    if (state_result == ASTERISKD_STATE_NOT_FOUND) {
-        state_result = asteriskd_state_document_init(&system.state,
-            system.loaded_config.config.owner, system.loaded_config.config.core_type,
-            system.loaded_config.config.mode);
-    }
-    if (state_result == ASTERISKD_STATE_OK) {
-        state_result = asteriskd_runtime_prepare_start_state(
-            &system.store, &system.state, &system.loaded_config.config,
-            error, sizeof(error));
-    }
-    if (state_result == ASTERISKD_STATE_OK && !initial_start &&
-        !asteriskd_state_is_canonical_stopped(&system.state)) {
-        state_result = ASTERISKD_STATE_INCOMPATIBLE;
-    }
+    int state_result = system_reset_telemetry_state(
+        &system, error, sizeof(error));
     if (state_result != ASTERISKD_STATE_OK) {
         (void)close(listener);
         *has_early_result = true;
         (void)system_start_result(early_result, ASTERISKD_CONTROL_RESULT_START_FAILED,
-            state_result == ASTERISKD_STATE_INCOMPATIBLE
-                ? "existing state belongs to another application"
-                : "start state preparation failed", NULL);
+            "telemetry state initialization failed", NULL);
         system_runtime_cleanup(&system);
         (void)sigprocmask(SIG_SETMASK, &previous, NULL);
         return 1;
@@ -6940,18 +6611,25 @@ static int system_runtime_run(const char *config_path, bool initial_start,
         (void)sigprocmask(SIG_SETMASK, &previous, NULL);
         return 1;
     }
+    if (!admission_reconcile_ready(
+            listened == ASTERISKD_CONTROL_LISTENER_OK, system.runtime != NULL) ||
+        system_reconcile_owned_resources(&system, error, sizeof(error)) != 0) {
+        *has_early_result = true;
+        (void)system_start_result(early_result, ASTERISKD_CONTROL_RESULT_START_FAILED,
+            error[0] != '\0' ? error : "owned resource reconciliation failed", NULL);
+        system_runtime_cleanup(&system);
+        (void)sigprocmask(SIG_SETMASK, &previous, NULL);
+        return 1;
+    }
     asteriskd_control_server_enable_accepting(system.control, true);
     struct asteriskd_runtime_effect_backend effects = system_runtime_effects(&system);
     int status = 0;
     bool should_start = initial_start;
     while (!system.shutdown_requested) {
         if (should_start || system.service_start_requested) {
-            bool automatic_start = !should_start;
             if (!should_start) {
-                system_runtime_reset_cycle(&system);
-                if (asteriskd_runtime_prepare_start_state(
-                        &system.store, &system.state, &system.loaded_config.config,
-                        error, sizeof(error)) != ASTERISKD_STATE_OK) {
+                if (system_reset_telemetry_state(
+                        &system, error, sizeof(error)) != ASTERISKD_STATE_OK) {
                     status = 1;
                     system.shutdown_requested = true;
                     break;
@@ -6968,8 +6646,8 @@ static int system_runtime_run(const char *config_path, bool initial_start,
             asteriskd_service_control_set_service_running(&system.service_control, false);
             system_runtime_finish_control_stop(&system);
             if (cycle_status != 0) {
-                status = cycle_status;
-                if (!automatic_start || !asteriskd_state_is_canonical_stopped(&system.state)) {
+                if (cycle_failure_requires_shutdown(service->enabled)) {
+                    status = cycle_status;
                     system.shutdown_requested = true;
                 }
             }

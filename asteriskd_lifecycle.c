@@ -147,13 +147,15 @@ int asteriskd_lifecycle_stop(struct asteriskd_lifecycle *lifecycle) {
     try_inverse(lifecycle, &lifecycle->matcher, backend->stop_matcher);
     try_inverse(lifecycle, &lifecycle->helper, backend->stop_helper);
     try_inverse(lifecycle, &lifecycle->core, backend->stop_core);
-    try_inverse(lifecycle, &lifecycle->recover, backend->restore);
+    if (backend->restore_best_effort != NULL) {
+        (void)backend->restore_best_effort(context);
+    }
     try_inverse(lifecycle, &lifecycle->acquire, backend->release);
     lifecycle->starting = false;
     bool remains = lifecycle->traffic_may_be_active || lifecycle->rules.cleanup_required ||
         lifecycle->network.cleanup_required || lifecycle->matcher.cleanup_required ||
         lifecycle->helper.cleanup_required || lifecycle->core.cleanup_required ||
-        lifecycle->recover.cleanup_required || lifecycle->acquire.cleanup_required;
+        lifecycle->acquire.cleanup_required;
     lifecycle->stopped = !remains;
     return remains ? ASTERISKD_LIFECYCLE_STOP_FAILED : 0;
 }
@@ -161,12 +163,12 @@ int asteriskd_lifecycle_stop(struct asteriskd_lifecycle *lifecycle) {
 static bool backend_is_complete(
     const struct asteriskd_lifecycle_backend *backend,
     const struct asteriskd_lifecycle_options *options) {
-    if (backend->acquire == NULL || backend->recover == NULL ||
+    if (backend->acquire == NULL || backend->reconcile == NULL ||
         backend->start_core == NULL || backend->wait_core == NULL ||
         backend->open_network == NULL || backend->apply_rules == NULL || backend->verify == NULL ||
         backend->quiesce_traffic == NULL || backend->remove_rules == NULL ||
         backend->close_network == NULL || backend->stop_core == NULL ||
-        backend->restore == NULL || backend->release == NULL) return false;
+        backend->restore_best_effort == NULL || backend->release == NULL) return false;
     if (options->requires_platform_capability && backend->ensure_platform_capability == NULL) return false;
     if (options->has_helper &&
         (backend->start_helper == NULL || backend->wait_helper == NULL || backend->stop_helper == NULL)) return false;
@@ -188,7 +190,8 @@ int asteriskd_lifecycle_start(
     lifecycle->options = *options;
     lifecycle->starting = true;
     int result = call_effect(lifecycle, &lifecycle->acquire, "acquire", backend->acquire);
-    if (result == 0) result = call_effect(lifecycle, &lifecycle->recover, "recover", backend->recover);
+    if (result == 0) result = call_observer(
+        lifecycle, "reconcile", backend->reconcile);
     if (result == 0 && options->standalone_ebpf) lifecycle->traffic_may_be_active = true;
     if (result == 0) result = call_effect(lifecycle, &lifecycle->core, "start_core", backend->start_core);
     if (result == 0) result = call_observer(lifecycle, "wait_core", backend->wait_core);

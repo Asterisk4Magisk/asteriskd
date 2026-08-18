@@ -24,11 +24,10 @@ static struct asteriskd_private_chain_group *add_private_group(
     group->family = family;
     group->table = table;
     group->chain_id = chain_id;
-    group->recovery.status = ASTERISKD_RECOVERY_INTENT;
-    group->recovery.kind = ASTERISKD_RECOVERY_IPTABLES_CHAIN;
-    group->recovery.resource.iptables_chain.family = family;
-    group->recovery.resource.iptables_chain.table = table;
-    group->recovery.resource.iptables_chain.chain_id = chain_id;
+    group->operation.kind = ASTERISKD_RESOURCE_OPERATION_IPTABLES_CHAIN;
+    group->operation.resource.iptables_chain.family = family;
+    group->operation.resource.iptables_chain.table = table;
+    group->operation.resource.iptables_chain.chain_id = chain_id;
     return group;
 }
 
@@ -52,12 +51,11 @@ static struct asteriskd_traffic_hook_group *add_hook_group(
     group->table = table;
     group->chain_id = chain_id;
     group->rule_id = rule_id;
-    group->recovery.status = ASTERISKD_RECOVERY_INTENT;
-    group->recovery.kind = ASTERISKD_RECOVERY_IPTABLES_RULE;
-    group->recovery.resource.iptables_rule.family = family;
-    group->recovery.resource.iptables_rule.table = table;
-    group->recovery.resource.iptables_rule.chain_id = chain_id;
-    group->recovery.resource.iptables_rule.rule_id = rule_id;
+    group->operation.kind = ASTERISKD_RESOURCE_OPERATION_IPTABLES_RULE;
+    group->operation.resource.iptables_rule.family = family;
+    group->operation.resource.iptables_rule.table = table;
+    group->operation.resource.iptables_rule.chain_id = chain_id;
+    group->operation.resource.iptables_rule.rule_id = rule_id;
     return group;
 }
 
