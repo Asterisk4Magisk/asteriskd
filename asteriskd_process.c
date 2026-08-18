@@ -645,13 +645,7 @@ int asteriskd_readiness_poll(
             return ASTERISKD_READINESS_IO;
         }
     } else if (tracker->role == ASTERISKD_CHILD_CORE && config->mode == ASTERISKD_MODE_EBPF) {
-        if (!tracker->stability_started) {
-            tracker->stability_started = true;
-            tracker->stability_start_milliseconds = now_milliseconds;
-        }
-        if (now_milliseconds < tracker->stability_start_milliseconds) return ASTERISKD_READINESS_IO;
-        ready = now_milliseconds - tracker->stability_start_milliseconds >=
-            ASTERISKD_PROCESS_EBPF_STABILITY_MILLIS;
+        ready = true;
     } else if (tracker->role == ASTERISKD_CHILD_HELPER && config->mode == ASTERISKD_MODE_TUN2SOCKS) {
         if (backend->interface_exists(
                 backend->context, config->helper.value.hev.tunnel_name, &ready) != 0) {

@@ -64,7 +64,6 @@ struct asteriskd_resource_operation;
 #define ASTERISKD_PROCESS_MAX_INHERITED_FDS 8U
 #define ASTERISKD_PROCESS_TERM_GRACE_MILLIS 3000U
 #define ASTERISKD_PROCESS_KILL_REAP_MILLIS 1000U
-#define ASTERISKD_PROCESS_EBPF_STABILITY_MILLIS 1000U
 #define ASTERISKD_READINESS_POLL_INTERVAL_MILLIS 100U
 #define ASTERISKD_ANONYMOUS_CREATE_CLOEXEC UINT32_C(0x1)
 #define ASTERISKD_ANONYMOUS_CREATE_ALLOW_SEALING UINT32_C(0x2)
@@ -508,7 +507,6 @@ int asteriskd_packet_model_decide(
 
 struct asteriskd_lifecycle_backend {
     int (*acquire)(void *);
-    int (*reconcile)(void *);
     int (*start_core)(void *);
     int (*wait_core)(void *);
     int (*ensure_platform_capability)(void *);
@@ -947,8 +945,6 @@ struct asteriskd_readiness_tracker {
     enum asteriskd_child_role role;
     enum asteriskd_mode mode;
     uint64_t deadline_milliseconds;
-    bool stability_started;
-    uint64_t stability_start_milliseconds;
     bool initialized;
 };
 
@@ -1971,7 +1967,6 @@ struct asteriskd_runtime_effect_backend {
     int (*save_state)(void *, const struct asteriskd_state_document *);
     int (*publish_event)(void *, enum asteriskd_control_event_type,
         const struct asteriskd_control_snapshot *, const struct asteriskd_control_error *, bool);
-    int (*reconcile_owned_resources)(void *);
     int (*start_core)(void *, struct asteriskd_child_identity *);
     int (*wait_core)(void *);
     int (*ensure_platform_capability)(void *);
@@ -1993,6 +1988,18 @@ struct asteriskd_runtime_effect_backend {
     int (*release)(void *);
 };
 
+int asteriskd_rule_batch_document_render(
+    const unsigned char *, size_t,
+    const unsigned char *, size_t,
+    const unsigned char *, size_t,
+    const unsigned char *, size_t,
+    unsigned char **, size_t *);
+
+#if defined(ASTERISKD_TESTING)
+int asteriskd_test_rule_batch_document(
+    const char *, const char *, const char *, const char *, char **, size_t *);
+#endif
+
 enum asteriskd_runtime_effect_result {
     ASTERISKD_RUNTIME_EFFECT_READINESS_TIMEOUT = -100,
 };
@@ -2007,7 +2014,7 @@ int asteriskd_runtime_start_system(
 int asteriskd_runtime_monitor_system(
     const char *, bool *, struct asteriskd_control_result *);
 #if defined(ASTERISKD_TESTING)
-bool asteriskd_test_cycle_failure_requires_shutdown(bool);
+bool asteriskd_test_cycle_failure_requires_shutdown(bool, bool);
 #endif
 
 enum asteriskd_control_backend_result {
@@ -2156,6 +2163,8 @@ int asteriskd_control_server_create(
     const struct asteriskd_control_callbacks *);
 void asteriskd_control_server_enable_accepting(
     struct asteriskd_control_server *, bool);
+void asteriskd_control_server_close_listener(
+    struct asteriskd_control_server *);
 int asteriskd_control_server_listener_fd(
     const struct asteriskd_control_server *);
 size_t asteriskd_control_server_interests(

@@ -2340,6 +2340,18 @@ void asteriskd_control_server_enable_accepting(
     if (server != NULL) server->accepting = accepting;
 }
 
+void asteriskd_control_server_close_listener(
+    struct asteriskd_control_server *server) {
+    if (server == NULL) return;
+    server->accepting = false;
+    int listener = server->listener_fd;
+    server->listener_fd = -1;
+    if (listener >= 0) {
+        (void)server->transport->close_fd(
+            server->transport_context, listener);
+    }
+}
+
 int asteriskd_control_server_listener_fd(
     const struct asteriskd_control_server *server) {
     return server == NULL ? -1 : server->listener_fd;
@@ -2559,3 +2571,41 @@ void asteriskd_control_server_destroy(
     }
     free(server);
 }
+
+#ifdef ASTERISKD_TESTING
+struct control_listener_close_test_context {
+    int listener_closes;
+    int client_closes;
+};
+
+static int control_listener_close_test_fd(void *opaque, int fd) {
+    struct control_listener_close_test_context *context = opaque;
+    if (fd == 10) ++context->listener_closes;
+    if (fd == 11) ++context->client_closes;
+    return 0;
+}
+
+bool asteriskd_test_listener_closes_before_client_drain(void) {
+    static const struct asteriskd_control_transport_backend transport = {
+        .close_fd = control_listener_close_test_fd,
+    };
+    struct control_listener_close_test_context context;
+    memset(&context, 0, sizeof(context));
+    struct asteriskd_control_server *server = calloc(1U, sizeof(*server));
+    if (server == NULL) return false;
+    server->listener_fd = 10;
+    server->accepting = true;
+    server->transport = &transport;
+    server->transport_context = &context;
+    server->clients[0].active = true;
+    server->clients[0].fd = 11;
+
+    asteriskd_control_server_close_listener(server);
+    bool released_before_drain = server->listener_fd == -1 &&
+        !server->accepting && context.listener_closes == 1 &&
+        context.client_closes == 0 && !asteriskd_control_server_drained(server);
+    asteriskd_control_server_destroy(server);
+    return released_before_drain && context.listener_closes == 1 &&
+        context.client_closes == 1;
+}
+#endif

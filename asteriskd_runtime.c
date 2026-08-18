@@ -288,7 +288,6 @@ int asteriskd_runtime_pump_until(struct asteriskd_runtime *runtime,
 static bool runtime_effects_valid(const struct asteriskd_runtime_effect_backend *effects,
     const struct asteriskd_config *config) {
     if (effects == NULL || effects->save_state == NULL || effects->publish_event == NULL ||
-        effects->reconcile_owned_resources == NULL ||
         effects->start_core == NULL || effects->wait_core == NULL ||
         effects->open_network == NULL || effects->apply_rules == NULL || effects->verify == NULL ||
         effects->network_immediate == NULL || effects->reconcile == NULL ||
@@ -343,16 +342,7 @@ static int runtime_save_child(
 }
 
 static int runtime_lifecycle_acquire(void *opaque) {
-    (void)opaque;
-    return 0;
-}
-
-static int runtime_lifecycle_reconcile(void *opaque) {
     struct asteriskd_runtime *runtime = opaque;
-    if (runtime->effects->reconcile_owned_resources(
-            runtime->effects->context) != 0) {
-        return ASTERISKD_CONFIG_IO;
-    }
     asteriskd_state_clear_failure(runtime->state);
     return asteriskd_state_set_matcher(
         runtime->state, runtime->config->matcher.enabled, false);
@@ -513,7 +503,6 @@ static int runtime_lifecycle_release(void *opaque) {
 
 static const struct asteriskd_lifecycle_backend runtime_lifecycle_backend = {
     .acquire = runtime_lifecycle_acquire,
-    .reconcile = runtime_lifecycle_reconcile,
     .start_core = runtime_lifecycle_start_core,
     .wait_core = runtime_lifecycle_wait_core,
     .ensure_platform_capability = runtime_lifecycle_capability,
@@ -959,8 +948,9 @@ static bool action_should_cancel(
     return !cleanup_in_progress && stop_requested;
 }
 
-static bool cycle_failure_requires_shutdown(bool service_control_enabled) {
-    return !service_control_enabled;
+static bool cycle_failure_requires_shutdown(
+    bool service_control_enabled, bool cleanup_complete) {
+    return !service_control_enabled || !cleanup_complete;
 }
 
 static bool admission_reconcile_ready(
@@ -979,8 +969,9 @@ bool asteriskd_test_action_should_cancel(
 }
 
 bool asteriskd_test_cycle_failure_requires_shutdown(
-    bool service_control_enabled) {
-    return cycle_failure_requires_shutdown(service_control_enabled);
+    bool service_control_enabled, bool cleanup_complete) {
+    return cycle_failure_requires_shutdown(
+        service_control_enabled, cleanup_complete);
 }
 
 bool asteriskd_test_admission_reconcile_ready(
@@ -1004,8 +995,10 @@ struct system_text_batch {
 };
 
 struct system_rule_command_batch {
-    struct system_text_batch xtables;
+    struct system_text_batch xtables_before_ip;
+    struct system_text_batch xtables_after_ip;
     struct system_text_batch ip[ASTERISKD_IP_FAMILY_COUNT];
+    bool ip_started;
     bool active;
 };
 
@@ -1740,15 +1733,6 @@ static int system_reconcile_owned_resources(
     struct asteriskd_system_supervisor *, char *, size_t);
 static void system_reconcile_error(char *, size_t, const char *);
 static int system_effect_stop_core(void *opaque);
-static void system_runtime_reset_cycle(struct asteriskd_system_supervisor *system);
-
-static int system_effect_reconcile_owned_resources(void *opaque) {
-    struct asteriskd_system_supervisor *system = opaque;
-    char error[256U];
-    if (system_reconcile_owned_resources(system, error, sizeof(error)) != 0) return -1;
-    system_runtime_reset_cycle(system);
-    return 0;
-}
 
 static bool system_core_setup_done(void *opaque) {
     struct asteriskd_system_supervisor *system = opaque;
@@ -2371,22 +2355,20 @@ static int system_rule_batch_append_ip_command(
 
 static void system_rule_batch_destroy(struct system_rule_command_batch *batch) {
     if (batch == NULL) return;
-    system_text_batch_destroy(&batch->xtables);
+    system_text_batch_destroy(&batch->xtables_before_ip);
+    system_text_batch_destroy(&batch->xtables_after_ip);
     for (size_t index = 0U; index < ASTERISKD_IP_FAMILY_COUNT; ++index) {
         system_text_batch_destroy(&batch->ip[index]);
     }
+    batch->ip_started = false;
     batch->active = false;
 }
 
 static int system_rule_batch_begin(struct system_rule_command_batch *batch) {
-    static const char header[] = "set -eu\n";
     if (batch == NULL || batch->active) return -1;
     system_rule_batch_destroy(batch);
     batch->active = true;
-    if (system_text_batch_append(
-            &batch->xtables, header, sizeof(header) - 1U) == 0) return 0;
-    system_rule_batch_destroy(batch);
-    return -1;
+    return 0;
 }
 
 static int system_action_run_document(
@@ -2422,49 +2404,30 @@ static int system_action_run_document(
     return result;
 }
 
-static int system_rule_batch_reset_xtables(
-    struct system_rule_command_batch *batch) {
-    static const char header[] = "set -eu\n";
-    system_text_batch_destroy(&batch->xtables);
-    return system_text_batch_append(
-        &batch->xtables, header, sizeof(header) - 1U);
-}
-
-static int system_rule_batch_flush_xtables(
-    struct asteriskd_system_supervisor *system) {
-    struct system_rule_command_batch *batch = &system->rule_commands;
-    static const size_t header_length = sizeof("set -eu\n") - 1U;
-    if (!batch->active || batch->xtables.length < header_length) return -1;
-    if (batch->xtables.length == header_length) return 0;
-    const char *argv[] = {"/system/bin/sh", "/proc/self/fd/3", NULL};
-    int exit_status = -1;
-    int result = system_action_run_document(
-        system, argv, &batch->xtables, &exit_status);
-    if (result != 0 || exit_status != 0) return -1;
-    return system_rule_batch_reset_xtables(batch);
-}
-
-static int system_rule_batch_flush_ip(
+static int system_rule_batch_flush(
     struct asteriskd_system_supervisor *system) {
     struct system_rule_command_batch *batch = &system->rule_commands;
     if (!batch->active) return -1;
-    for (size_t index = 0U; index < ASTERISKD_IP_FAMILY_COUNT; ++index) {
-        struct system_text_batch *commands = &batch->ip[index];
-        if (commands->length == 0U) continue;
-        const char *argv[] = {
-            "/system/bin/ip",
-            index == ASTERISKD_IP_FAMILY_IPV4 ? "-4" : "-6",
-            "-batch",
-            "/proc/self/fd/3",
-            NULL,
-        };
-        int exit_status = -1;
-        if (system_action_run_document(
-                system, argv, commands, &exit_status) != 0 ||
-            exit_status != 0) return -1;
-        system_text_batch_destroy(commands);
-    }
-    return 0;
+    size_t command_length = batch->xtables_before_ip.length +
+        batch->ip[ASTERISKD_IP_FAMILY_IPV4].length +
+        batch->ip[ASTERISKD_IP_FAMILY_IPV6].length +
+        batch->xtables_after_ip.length;
+    if (command_length == 0U) return 0;
+    struct system_text_batch document = {0};
+    if (asteriskd_rule_batch_document_render(
+            batch->xtables_before_ip.bytes, batch->xtables_before_ip.length,
+            batch->ip[ASTERISKD_IP_FAMILY_IPV4].bytes,
+            batch->ip[ASTERISKD_IP_FAMILY_IPV4].length,
+            batch->ip[ASTERISKD_IP_FAMILY_IPV6].bytes,
+            batch->ip[ASTERISKD_IP_FAMILY_IPV6].length,
+            batch->xtables_after_ip.bytes, batch->xtables_after_ip.length,
+            &document.bytes, &document.length) != 0) return -1;
+    const char *argv[] = {"/system/bin/sh", "/proc/self/fd/3", NULL};
+    int exit_status = -1;
+    int result = system_action_run_document(
+        system, argv, &document, &exit_status);
+    system_text_batch_destroy(&document);
+    return result == 0 && exit_status == 0 ? 0 : -1;
 }
 
 static int system_capability_find(
@@ -2654,8 +2617,10 @@ static int system_xtables_zero(struct asteriskd_system_supervisor *system,
             argv[count++] = arguments[index];
         }
         argv[count] = NULL;
-        return system_rule_batch_append_shell_command(
-            &system->rule_commands.xtables, argv);
+        struct system_text_batch *commands = system->rule_commands.ip_started
+            ? &system->rule_commands.xtables_after_ip
+            : &system->rule_commands.xtables_before_ip;
+        return system_rule_batch_append_shell_command(commands, argv);
     }
     int exit_status = -1;
     int run_result = system_xtables(system, family, table, effective_operation, chain,
@@ -3471,6 +3436,7 @@ static int system_ip_zero(struct asteriskd_system_supervisor *system,
     if (system->rule_commands.active) {
         if (family < ASTERISKD_IP_FAMILY_IPV4 ||
             family >= ASTERISKD_IP_FAMILY_COUNT) return -1;
+        system->rule_commands.ip_started = true;
         return system_rule_batch_append_ip_command(
             &system->rule_commands.ip[family], arguments, argument_count);
     }
@@ -4457,20 +4423,9 @@ static int system_apply_operations(void *opaque, const struct asteriskd_resource
             kind == ASTERISKD_RESOURCE_OPERATION_DUMMY_INTERFACE;
     }
     if (rule_batch) {
-        enum asteriskd_resource_operation_kind previous_kind = ASTERISKD_RESOURCE_OPERATION_KIND_COUNT;
         if (system_rule_batch_begin(&system->rule_commands) != 0) return -1;
         for (size_t index = 0U; index < count; ++index) {
             const struct asteriskd_resource_operation *record = &records[index];
-            bool route = record->kind == ASTERISKD_RESOURCE_OPERATION_IP_RULE ||
-                record->kind == ASTERISKD_RESOURCE_OPERATION_ROUTE ||
-                record->kind == ASTERISKD_RESOURCE_OPERATION_DUMMY_INTERFACE;
-            bool previous_route = previous_kind == ASTERISKD_RESOURCE_OPERATION_IP_RULE ||
-                previous_kind == ASTERISKD_RESOURCE_OPERATION_ROUTE ||
-                previous_kind == ASTERISKD_RESOURCE_OPERATION_DUMMY_INTERFACE;
-            if (route && !previous_route &&
-                system_rule_batch_flush_xtables(system) != 0) goto rule_batch_failed;
-            if (record->kind == ASTERISKD_RESOURCE_OPERATION_IPTABLES_RULE && previous_route &&
-                system_rule_batch_flush_ip(system) != 0) goto rule_batch_failed;
             int result = -1;
             if (record->kind == ASTERISKD_RESOURCE_OPERATION_IPTABLES_CHAIN) {
                 const struct asteriskd_private_chain_group *group =
@@ -4494,15 +4449,8 @@ static int system_apply_operations(void *opaque, const struct asteriskd_resource
                 }
                 goto rule_batch_failed;
             }
-            previous_kind = record->kind;
         }
-        if (previous_kind == ASTERISKD_RESOURCE_OPERATION_IP_RULE ||
-            previous_kind == ASTERISKD_RESOURCE_OPERATION_ROUTE ||
-            previous_kind == ASTERISKD_RESOURCE_OPERATION_DUMMY_INTERFACE) {
-            if (system_rule_batch_flush_ip(system) != 0) goto rule_batch_failed;
-        } else if (system_rule_batch_flush_xtables(system) != 0) {
-            goto rule_batch_failed;
-        }
+        if (system_rule_batch_flush(system) != 0) goto rule_batch_failed;
         system_rule_batch_destroy(&system->rule_commands);
         system_rule_snapshot_destroy(&system->rule_snapshot);
         system->rule_snapshot.phase = SYSTEM_RULE_SNAPSHOT_NEEDS_VERIFY;
@@ -6195,7 +6143,7 @@ static int system_effect_quiesce(void *opaque) {
                     &system->rules_runtime.plan.hook_groups[index]) != 0) goto failed;
         }
     }
-    if (system_rule_batch_flush_xtables(system) != 0) goto failed;
+    if (system_rule_batch_flush(system) != 0) goto failed;
     system_rule_batch_destroy(&system->rule_commands);
     if (system_rule_snapshot_capture(system, &snapshot_plan,
             SYSTEM_RULE_SNAPSHOT_AFTER_APPLY) != 0) goto failed;
@@ -6253,11 +6201,8 @@ static int system_effect_restore_best_effort(void *opaque) {
     system->cleanup_in_progress = true;
     char error[128U];
     struct asteriskd_effect_backend backend = system_effect_backend(system);
-    int restored = asteriskd_effect_journal_rollback(
+    return asteriskd_effect_journal_rollback(
         &system->volatile_effects, &backend, error, sizeof(error));
-    int reconciled = system_reconcile_owned_resources(
-        system, error, sizeof(error));
-    return restored == 0 && reconciled == 0 ? 0 : -1;
 }
 
 static struct asteriskd_runtime_effect_backend system_runtime_effects(
@@ -6266,7 +6211,6 @@ static struct asteriskd_runtime_effect_backend system_runtime_effects(
         .context = system,
         .save_state = system_effect_save,
         .publish_event = system_effect_event,
-        .reconcile_owned_resources = system_effect_reconcile_owned_resources,
         .start_core = system_effect_start_core,
         .wait_core = system_effect_wait_core,
         .ensure_platform_capability = system_effect_capability,
@@ -6637,6 +6581,7 @@ static int system_runtime_run(const char *config_path, bool initial_start,
             }
             should_start = false;
             system.service_start_requested = false;
+            system_runtime_reset_cycle(&system);
             system.service_running = true;
             asteriskd_service_control_set_service_running(&system.service_control, true);
             int cycle_status = asteriskd_runtime_supervise(
@@ -6646,7 +6591,8 @@ static int system_runtime_run(const char *config_path, bool initial_start,
             asteriskd_service_control_set_service_running(&system.service_control, false);
             system_runtime_finish_control_stop(&system);
             if (cycle_status != 0) {
-                if (cycle_failure_requires_shutdown(service->enabled)) {
+                if (cycle_failure_requires_shutdown(
+                        service->enabled, system.runtime->lifecycle.stopped)) {
                     status = cycle_status;
                     system.shutdown_requested = true;
                 }
@@ -6674,7 +6620,7 @@ static int system_runtime_run(const char *config_path, bool initial_start,
         }
     }
     system_runtime_finish_control_stop(&system);
-    asteriskd_control_server_enable_accepting(system.control, false);
+    asteriskd_control_server_close_listener(system.control);
     if (!asteriskd_control_server_drained(system.control)) {
         int64_t now = 0;
         if (system_runtime_clock(&system, &now) == 0) {

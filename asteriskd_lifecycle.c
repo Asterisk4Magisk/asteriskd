@@ -163,8 +163,8 @@ int asteriskd_lifecycle_stop(struct asteriskd_lifecycle *lifecycle) {
 static bool backend_is_complete(
     const struct asteriskd_lifecycle_backend *backend,
     const struct asteriskd_lifecycle_options *options) {
-    if (backend->acquire == NULL || backend->reconcile == NULL ||
-        backend->start_core == NULL || backend->wait_core == NULL ||
+    if (backend->acquire == NULL || backend->start_core == NULL ||
+        backend->wait_core == NULL ||
         backend->open_network == NULL || backend->apply_rules == NULL || backend->verify == NULL ||
         backend->quiesce_traffic == NULL || backend->remove_rules == NULL ||
         backend->close_network == NULL || backend->stop_core == NULL ||
@@ -190,8 +190,6 @@ int asteriskd_lifecycle_start(
     lifecycle->options = *options;
     lifecycle->starting = true;
     int result = call_effect(lifecycle, &lifecycle->acquire, "acquire", backend->acquire);
-    if (result == 0) result = call_observer(
-        lifecycle, "reconcile", backend->reconcile);
     if (result == 0 && options->standalone_ebpf) lifecycle->traffic_may_be_active = true;
     if (result == 0) result = call_effect(lifecycle, &lifecycle->core, "start_core", backend->start_core);
     if (result == 0) result = call_observer(lifecycle, "wait_core", backend->wait_core);
