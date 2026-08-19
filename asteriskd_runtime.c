@@ -2448,7 +2448,7 @@ static int system_capability_find(
             directory[length] = '\0';
             int written = snprintf(path, capacity, "%s/%s", directory, name);
             struct stat status;
-            if (written > 0 && (size_t)written < capacity && lstat(path, &status) == 0 &&
+            if (written > 0 && (size_t)written < capacity && stat(path, &status) == 0 &&
                 S_ISREG(status.st_mode) && asteriskd_mode_is_executable((uint32_t)status.st_mode)) {
                 return system_capability_path_search_result(true, true);
             }
@@ -2464,7 +2464,7 @@ static int system_capability_inspect(
     (void)opaque;
     if (path == NULL || regular == NULL || executable == NULL) return -1;
     struct stat status;
-    if (lstat(path, &status) != 0) {
+    if (stat(path, &status) != 0) {
         *regular = false;
         *executable = false;
         return system_capability_inspect_error(errno);
