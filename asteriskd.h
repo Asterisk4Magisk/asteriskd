@@ -77,10 +77,8 @@ struct asteriskd_resource_operation;
 #define ASTERISKD_IPTABLES_WAIT_SECONDS 100U
 #define ASTERISKD_ROUTE_RULE_PRIORITY 14599U
 #define ASTERISKD_PRIMARY_MARK UINT32_C(0x20000000)
-#define ASTERISKD_AUXILIARY_MARK UINT32_C(0x40000000)
 #define ASTERISKD_MARK_MASK UINT32_C(0x60000000)
 #define ASTERISKD_TPROXY_TABLE 160U
-#define ASTERISKD_TPROXY_DUMMY_TABLE 164U
 #define ASTERISKD_TUN_TABLE 168U
 #define ASTERISKD_RULE_PLAN_MAX_OPERATIONS 32U
 #define ASTERISKD_RULE_TRANSACTION_MAX_GROUPS 12U
@@ -413,7 +411,6 @@ enum asteriskd_rule_plan_operation_kind {
     ASTERISKD_RULE_PLAN_PREPARE_LOCAL_BYPASS,
     ASTERISKD_RULE_PLAN_PREPARE_MATCHER,
     ASTERISKD_RULE_PLAN_PREPARE_ROUTE,
-    ASTERISKD_RULE_PLAN_PREPARE_DUMMY,
     ASTERISKD_RULE_PLAN_PREPARE_HELPER_TC,
     ASTERISKD_RULE_PLAN_POPULATE_POLICY,
     ASTERISKD_RULE_PLAN_POPULATE_DNS,
@@ -436,13 +433,10 @@ struct asteriskd_rule_plan {
     bool no_op;
     bool enable_ipv6;
     bool uses_matcher;
-    bool uses_dummy_ipv6;
-    bool dummy_output_policy_compatibility;
     bool uses_helper_tc;
     uint32_t iptables_wait_seconds;
     uint32_t route_rule_priority;
     uint32_t primary_mark;
-    uint32_t auxiliary_mark;
     uint32_t mark_mask;
     uint32_t routing_table;
     char tunnel_name[ASTERISKD_MAX_TUNNEL_NAME];
@@ -476,7 +470,6 @@ enum asteriskd_packet_action {
     ASTERISKD_PACKET_RETURN,
     ASTERISKD_PACKET_MARK_PRIMARY,
     ASTERISKD_PACKET_TPROXY,
-    ASTERISKD_PACKET_MARK_AUXILIARY,
     ASTERISKD_PACKET_DROP,
     ASTERISKD_PACKET_REJECT,
     ASTERISKD_PACKET_FAKE_DNS_REDIRECT,
@@ -1092,7 +1085,6 @@ enum asteriskd_resource_operation_kind {
     ASTERISKD_RESOURCE_OPERATION_IPTABLES_RULE,
     ASTERISKD_RESOURCE_OPERATION_IP_RULE,
     ASTERISKD_RESOURCE_OPERATION_ROUTE,
-    ASTERISKD_RESOURCE_OPERATION_DUMMY_INTERFACE,
     ASTERISKD_RESOURCE_OPERATION_BPF_PIN,
     ASTERISKD_RESOURCE_OPERATION_TC_QDISC,
     ASTERISKD_RESOURCE_OPERATION_TC_FILTER,
@@ -1146,11 +1138,6 @@ enum asteriskd_route_id {
     ASTERISKD_ROUTE_TUNNEL,
     ASTERISKD_ROUTE_TOKEN,
     ASTERISKD_ROUTE_COUNT,
-};
-
-enum asteriskd_interface_id {
-    ASTERISKD_INTERFACE_IPV6_DUMMY,
-    ASTERISKD_INTERFACE_COUNT,
 };
 
 enum asteriskd_pin_id {
@@ -1207,7 +1194,6 @@ struct asteriskd_owned_resource_catalog {
     const struct asteriskd_owned_policy_rule *policy_rules;
     size_t policy_rule_count;
     struct asteriskd_owned_token_route token_route;
-    const char *dummy_interface_name;
 };
 
 const struct asteriskd_owned_resource_catalog *asteriskd_owned_resource_catalog(void);
@@ -1217,7 +1203,6 @@ enum asteriskd_reconcile_phase {
     ASTERISKD_RECONCILE_QUIESCE,
     ASTERISKD_RECONCILE_PRIVATE_CHAINS,
     ASTERISKD_RECONCILE_POLICY_ROUTING,
-    ASTERISKD_RECONCILE_DUMMY_INTERFACE,
     ASTERISKD_RECONCILE_BPF_PINS,
     ASTERISKD_RECONCILE_PHASE_COUNT,
 };
@@ -1240,7 +1225,6 @@ int asteriskd_reconcile_owned_resources(
     struct asteriskd_reconcile_report *, char *, size_t);
 int asteriskd_owned_policy_rule_output_count(
     const char *, size_t, const struct asteriskd_owned_policy_rule *, size_t *);
-int asteriskd_ip_link_output_is_dummy(const char *, size_t, bool *);
 
 struct asteriskd_matcher_pin_expectation {
     enum asteriskd_pin_id pin_id;
@@ -1321,13 +1305,6 @@ struct asteriskd_route_resource {
     enum asteriskd_ip_family family;
     enum asteriskd_route_id route_id;
     char interface_name[ASTERISKD_MAX_INTERFACE_NAME];
-    uint32_t interface_index;
-    bool original_presence;
-};
-
-struct asteriskd_dummy_interface_resource {
-    enum asteriskd_interface_id interface_id;
-    bool has_interface_index;
     uint32_t interface_index;
     bool original_presence;
 };
@@ -1420,7 +1397,6 @@ struct asteriskd_resource_operation {
         struct asteriskd_iptables_rule_resource iptables_rule;
         struct asteriskd_ip_rule_resource ip_rule;
         struct asteriskd_route_resource route;
-        struct asteriskd_dummy_interface_resource dummy_interface;
         struct asteriskd_bpf_pin_resource bpf_pin;
         struct asteriskd_tc_qdisc_resource tc_qdisc;
         struct asteriskd_tc_filter_resource tc_filter;
@@ -1474,7 +1450,6 @@ struct asteriskd_traffic_hook_group {
 enum asteriskd_route_effect_kind {
     ASTERISKD_ROUTE_EFFECT_IP_RULE,
     ASTERISKD_ROUTE_EFFECT_ROUTE,
-    ASTERISKD_ROUTE_EFFECT_DUMMY_INTERFACE,
 };
 
 struct asteriskd_route_effect {
@@ -1488,10 +1463,8 @@ struct asteriskd_route_effect {
     bool local_route;
     enum asteriskd_ip_rule_id ip_rule_id;
     enum asteriskd_route_id route_id;
-    enum asteriskd_interface_id interface_id;
     char destination[ASTERISKD_MAX_CIDR];
     char interface_name[ASTERISKD_MAX_INTERFACE_NAME];
-    char interface_address[ASTERISKD_MAX_CIDR];
 };
 
 struct asteriskd_rule_transaction_plan {

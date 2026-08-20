@@ -67,62 +67,6 @@ static bool reconcile_token_equals(
         memcmp(token->bytes, expected, expected_length) == 0;
 }
 
-static bool json_token_equals(
-    const struct asteriskd_json_document *document,
-    const struct asteriskd_json_token *token,
-    const char *expected) {
-    size_t expected_length;
-
-    if (document == NULL || token == NULL || expected == NULL ||
-        token->type != ASTERISKD_JSON_STRING || token->end < token->start ||
-        token->end > document->source_length) return false;
-    expected_length = strlen(expected);
-    return token->end - token->start == expected_length &&
-        memcmp(document->source + token->start,
-            expected, expected_length) == 0;
-}
-
-int asteriskd_ip_link_output_is_dummy(
-    const char *bytes, size_t length, bool *owned) {
-    struct asteriskd_json_document document;
-    bool found = false;
-    char error[128U];
-    int result;
-
-    if (owned != NULL) *owned = false;
-    if (bytes == NULL || length == 0U || owned == NULL) {
-        return ASTERISKD_CONFIG_INVALID;
-    }
-    result = asteriskd_json_parse(
-        bytes, length, &document, error, sizeof(error));
-    if (result != 0) return ASTERISKD_CONFIG_INVALID;
-    if (document.token_count < 2U ||
-        document.tokens[0].type != ASTERISKD_JSON_ARRAY ||
-        document.tokens[0].child_count != 1U ||
-        document.tokens[1].type != ASTERISKD_JSON_OBJECT ||
-        document.tokens[1].parent != 0U) {
-        result = ASTERISKD_CONFIG_INVALID;
-        goto done;
-    }
-    for (size_t index = 2U; index + 1U < document.token_count; ++index) {
-        const struct asteriskd_json_token *key = &document.tokens[index];
-        const struct asteriskd_json_token *value = &document.tokens[index + 1U];
-
-        if (!json_token_equals(&document, key, "info_kind")) continue;
-        if (found || key->parent == SIZE_MAX || value->parent != key->parent ||
-            value->type != ASTERISKD_JSON_STRING) {
-            result = ASTERISKD_CONFIG_INVALID;
-            goto done;
-        }
-        found = true;
-        *owned = json_token_equals(&document, value, "dummy");
-    }
-    result = found && *owned ? 0 : ASTERISKD_CONFIG_INVALID;
-done:
-    asteriskd_json_document_destroy(&document);
-    return result;
-}
-
 static int reconcile_line_tokens(
     const char *line,
     size_t length,

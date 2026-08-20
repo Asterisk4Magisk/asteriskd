@@ -228,13 +228,13 @@ int asteriskd_rule_plan_build(
     const struct asteriskd_config *config,
     bool has_global_ipv6_address,
     struct asteriskd_rule_plan *plan) {
+    (void)has_global_ipv6_address;
     if (plan != NULL) memset(plan, 0, sizeof(*plan));
     if (config == NULL || plan == NULL) return ASTERISKD_CONFIG_INVALID;
     plan->enable_ipv6 = config->enable_ipv6;
     plan->iptables_wait_seconds = ASTERISKD_IPTABLES_WAIT_SECONDS;
     plan->route_rule_priority = ASTERISKD_ROUTE_RULE_PRIORITY;
     plan->primary_mark = ASTERISKD_PRIMARY_MARK;
-    plan->auxiliary_mark = ASTERISKD_AUXILIARY_MARK;
     plan->mark_mask = ASTERISKD_MARK_MASK;
     if (config->mode == ASTERISKD_MODE_EBPF) {
         if (config->owner != ASTERISKD_OWNER_BOX || config->core_type != ASTERISKD_CORE_SING_BOX) {
@@ -247,8 +247,6 @@ int asteriskd_rule_plan_build(
     plan->uses_helper_tc = config->mode == ASTERISKD_MODE_BPF2SOCKS;
     if (config->mode == ASTERISKD_MODE_TPROXY) {
         plan->routing_table = ASTERISKD_TPROXY_TABLE;
-        plan->uses_dummy_ipv6 = config->enable_ipv6 && !has_global_ipv6_address;
-        plan->dummy_output_policy_compatibility = plan->uses_dummy_ipv6;
     } else if (config->mode == ASTERISKD_MODE_TUN || config->mode == ASTERISKD_MODE_TUN2SOCKS) {
         plan->routing_table = ASTERISKD_TUN_TABLE;
         const char *tunnel = config->mode == ASTERISKD_MODE_TUN ?
@@ -288,8 +286,6 @@ int asteriskd_rule_plan_build(
     if (plan->uses_matcher &&
         rule_plan_append(plan, ASTERISKD_RULE_PLAN_PREPARE_MATCHER, false) != 0) return ASTERISKD_CONFIG_INVALID;
     if (rule_plan_append(plan, ASTERISKD_RULE_PLAN_PREPARE_ROUTE, false) != 0) return ASTERISKD_CONFIG_INVALID;
-    if (plan->uses_dummy_ipv6 &&
-        rule_plan_append(plan, ASTERISKD_RULE_PLAN_PREPARE_DUMMY, false) != 0) return ASTERISKD_CONFIG_INVALID;
     if (plan->uses_helper_tc &&
         rule_plan_append(plan, ASTERISKD_RULE_PLAN_PREPARE_HELPER_TC, false) != 0) return ASTERISKD_CONFIG_INVALID;
     if (rule_plan_append(plan, ASTERISKD_RULE_PLAN_POPULATE_POLICY, false) != 0) return ASTERISKD_CONFIG_INVALID;
@@ -400,9 +396,6 @@ int asteriskd_packet_model_decide(
             normal = ASTERISKD_PACKET_RETURN;
         } else if (packet_is_selected(config, plan, input)) {
             normal = selected_packet_action(config, input->direction);
-        }
-        if (plan->dummy_output_policy_compatibility && !input->output_virtual_interface) {
-            normal = ASTERISKD_PACKET_MARK_AUXILIARY;
         }
     } else {
         if (config->enable_local_dns && input->protocol == ASTERISKD_PACKET_UDP &&

@@ -108,7 +108,7 @@ aborts startup; there is no silent fallback to non-matcher rules.
 
 The abstract control listener is acquired before any ROOT resource operation.
 Each service cycle then reconciles the fixed Asterisk-owned catalog: hooks,
-private chains, policy rules/routes, `xdummy`, TC filters, and the shared
+private chains, policy rules/routes, TC filters, and the shared
 `/sys/fs/bpf/asterisk` namespace are removed in dependency order and the final
 absence is verified. Admission fails closed when a fixed name is occupied by a
 foreign object or absence cannot be proved. The catalog is independent of the

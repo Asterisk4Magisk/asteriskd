@@ -1119,7 +1119,6 @@ struct asteriskd_system_supervisor {
     bool local_address_snapshot_active;
     struct asteriskd_address_set local_ipv4_snapshot;
     struct asteriskd_address_set local_ipv6_snapshot;
-    bool has_global_ipv6_address;
     bool cleanup_in_progress;
 };
 
@@ -2964,7 +2963,7 @@ static int system_populate_tproxy_prerouting(
 
 static int system_populate_tproxy_output(
     struct asteriskd_system_supervisor *system, enum asteriskd_ip_family family,
-    const char *chain, const char *local_begin, const char *local_end, bool dummy) {
+    const char *chain, const char *local_begin, const char *local_end) {
     const struct asteriskd_config *config = &system->loaded_config.config;
     if (system_populate_common_output_prefix(
             system, family, chain, local_begin, local_end) != 0) return -1;
@@ -2973,9 +2972,6 @@ static int system_populate_tproxy_output(
             if (system_append_uid_return(system, family, chain,
                     config->uids[remaining - 1U]) != 0) return -1;
         }
-    }
-    if (dummy && system_append_return_interface(system, family, chain, false, "xdummy") != 0) {
-        return -1;
     }
     for (size_t index = 0U; index < config->ignored_interface_count; ++index) {
         if (system_append_return_interface(system, family, chain, false,
@@ -3042,61 +3038,25 @@ static int system_populate_tun_output(
     return system_append_policy_output(system, family, chain);
 }
 
-static int system_populate_dummy_chain(struct asteriskd_system_supervisor *system,
-    const char *chain) {
-    if (strcmp(chain, "ASTERISK_TPROXY6_DUMMY_PRE") == 0) {
-        char port[8U];
-        if (snprintf(port, sizeof(port), "%u",
-                (unsigned)system->loaded_config.config.transparent_port) <= 0) return -1;
-        const char *tcp[] = {"-i", "xdummy", "-p", "tcp", "-j", "TPROXY",
-            "--on-ip", "::", "--on-port", port, "--tproxy-mark",
-            "0x40000000/0x60000000"};
-        const char *udp[] = {"-i", "xdummy", "-p", "udp", "-j", "TPROXY",
-            "--on-ip", "::", "--on-port", port, "--tproxy-mark",
-            "0x40000000/0x60000000"};
-        return system_xtables_zero(system, ASTERISKD_IP_FAMILY_IPV6,
-            ASTERISKD_IP_TABLE_MANGLE, "-A", chain, tcp,
-            sizeof(tcp) / sizeof(tcp[0])) == 0 &&
-            system_xtables_zero(system, ASTERISKD_IP_FAMILY_IPV6,
-                ASTERISKD_IP_TABLE_MANGLE, "-A", chain, udp,
-                sizeof(udp) / sizeof(udp[0])) == 0 ? 0 : -1;
-    }
-    if (strcmp(chain, "ASTERISK_TPROXY6_DUMMY") == 0) {
-        const char *tcp[] = {"-p", "tcp", "-j", "MARK", "--set-xmark",
-            "0x40000000/0x60000000"};
-        const char *udp[] = {"-p", "udp", "-j", "MARK", "--set-xmark",
-            "0x40000000/0x60000000"};
-        return system_xtables_zero(system, ASTERISKD_IP_FAMILY_IPV6,
-            ASTERISKD_IP_TABLE_MANGLE, "-A", chain, tcp,
-            sizeof(tcp) / sizeof(tcp[0])) == 0 &&
-            system_xtables_zero(system, ASTERISKD_IP_FAMILY_IPV6,
-                ASTERISKD_IP_TABLE_MANGLE, "-A", chain, udp,
-                sizeof(udp) / sizeof(udp[0])) == 0 ? 0 : -1;
-    }
-    return -1;
-}
-
 static int system_populate_private_chain(
     struct asteriskd_system_supervisor *system,
     const struct asteriskd_private_chain_group *group, const char *chain) {
     enum asteriskd_ip_family family = group->family;
     const char *local_begin = family == ASTERISKD_IP_FAMILY_IPV4
-        ? "ASTERISKD_LOCAL4_BEGIN" : "ASTERISKD_LOCAL6_BEGIN";
+        ? "ASTERISK_LOCAL4_BEGIN" : "ASTERISK_LOCAL6_BEGIN";
     const char *local_end = family == ASTERISKD_IP_FAMILY_IPV4
-        ? "ASTERISKD_LOCAL4_END" : "ASTERISKD_LOCAL6_END";
+        ? "ASTERISK_LOCAL4_END" : "ASTERISK_LOCAL6_END";
     if (group->chain_id == ASTERISKD_CHAIN_LOCAL_BYPASS) {
         return 0;
     }
     if (group->chain_id == ASTERISKD_CHAIN_TPROXY) {
-        if (strstr(chain, "DUMMY") != NULL) return system_populate_dummy_chain(system, chain);
         if (strstr(chain, "PREROUTING") != NULL) {
             return system_populate_tproxy_prerouting(
                 system, family, chain, local_begin, local_end);
         }
         if (strstr(chain, "OUTPUT") != NULL) {
             return system_populate_tproxy_output(system, family, chain,
-                local_begin, local_end, !system->has_global_ipv6_address &&
-                    family == ASTERISKD_IP_FAMILY_IPV6);
+                local_begin, local_end);
         }
         return -1;
     }
@@ -3402,27 +3362,6 @@ static int system_ip_command(struct asteriskd_system_supervisor *system,
     size_t count = 0U;
     argv[count++] = "/system/bin/ip";
     argv[count++] = family == ASTERISKD_IP_FAMILY_IPV4 ? "-4" : "-6";
-    for (size_t index = 0U; index < argument_count; ++index) {
-        if (arguments[index] == NULL || arguments[index][0] == '\0') return -1;
-        argv[count++] = arguments[index];
-    }
-    argv[count] = NULL;
-    return system_action_run_argv(system, argv, capture, exit_status);
-}
-
-static int system_ip_unscoped_command(
-    struct asteriskd_system_supervisor *system,
-    const char *const *arguments,
-    size_t argument_count,
-    bool capture,
-    int *exit_status) {
-    const char *argv[24U];
-    size_t count = 0U;
-
-    if (argument_count > 22U ||
-        (argument_count != 0U && arguments == NULL) ||
-        exit_status == NULL) return -1;
-    argv[count++] = "/system/bin/ip";
     for (size_t index = 0U; index < argument_count; ++index) {
         if (arguments[index] == NULL || arguments[index][0] == '\0') return -1;
         argv[count++] = arguments[index];
@@ -3928,48 +3867,7 @@ static int system_apply_route_effect(struct asteriskd_system_supervisor *system,
             effect->local_route ? sizeof(local) / sizeof(local[0]) :
                 sizeof(normal) / sizeof(normal[0]));
     }
-    if (effect->kind == ASTERISKD_ROUTE_EFFECT_DUMMY_INTERFACE) {
-        const char *link[] = {"link", "add", effect->interface_name, "type", "dummy"};
-        const char *address[] = {"addr", "add", effect->interface_address,
-            "dev", effect->interface_name};
-        const char *up[] = {"link", "set", effect->interface_name, "up"};
-        return system_ip_zero(system, effect->family, link, 5U) == 0 &&
-            system_ip_zero(system, effect->family, address, 5U) == 0 &&
-            system_ip_zero(system, effect->family, up, 4U) == 0 ? 0 : -1;
-    }
     return -1;
-}
-
-static bool system_dummy_effect_matches(
-    const struct asteriskd_route_effect *effect, uint32_t expected_index) {
-    if (effect == NULL || effect->kind != ASTERISKD_ROUTE_EFFECT_DUMMY_INTERFACE ||
-        effect->family != ASTERISKD_IP_FAMILY_IPV6 || expected_index == 0U ||
-        if_nametoindex(effect->interface_name) != expected_index) return false;
-    const char *slash = strchr(effect->interface_address, '/');
-    if (slash == NULL || strcmp(slash, "/128") != 0 ||
-        (size_t)(slash - effect->interface_address) >= INET6_ADDRSTRLEN) return false;
-    char address[INET6_ADDRSTRLEN];
-    size_t address_length = (size_t)(slash - effect->interface_address);
-    memcpy(address, effect->interface_address, address_length);
-    address[address_length] = '\0';
-    struct in6_addr expected;
-    if (inet_pton(AF_INET6, address, &expected) != 1) return false;
-    struct ifaddrs *interfaces = NULL;
-    if (getifaddrs(&interfaces) != 0) return false;
-    bool up = false;
-    bool found = false;
-    for (const struct ifaddrs *entry = interfaces; entry != NULL; entry = entry->ifa_next) {
-        if (entry->ifa_name == NULL || strcmp(entry->ifa_name, effect->interface_name) != 0) {
-            continue;
-        }
-        if ((entry->ifa_flags & IFF_UP) != 0U) up = true;
-        if (entry->ifa_addr != NULL && entry->ifa_addr->sa_family == AF_INET6) {
-            const struct sockaddr_in6 *ipv6 = (const struct sockaddr_in6 *)entry->ifa_addr;
-            if (memcmp(&ipv6->sin6_addr, &expected, sizeof(expected)) == 0) found = true;
-        }
-    }
-    freeifaddrs(interfaces);
-    return up && found;
 }
 
 static int system_probe_route_effect(struct asteriskd_system_supervisor *system,
@@ -4010,13 +3908,6 @@ static int system_remove_route_effect(struct asteriskd_system_supervisor *system
             effect->local_route ? sizeof(local) / sizeof(local[0]) :
                 sizeof(normal) / sizeof(normal[0]));
     }
-    if (effect->kind == ASTERISKD_ROUTE_EFFECT_DUMMY_INTERFACE) {
-        uint32_t interface_index = if_nametoindex(effect->interface_name);
-        if (interface_index == 0U ||
-            !system_dummy_effect_matches(effect, interface_index)) return -1;
-        const char *arguments[] = {"link", "del", effect->interface_name, "type", "dummy"};
-        return system_ip_zero(system, effect->family, arguments, 5U);
-    }
     return -1;
 }
 
@@ -4034,13 +3925,6 @@ static int system_classify_route_effect(struct asteriskd_system_supervisor *syst
     enum asteriskd_rules_slot_state *state) {
     if (system == NULL || effect == NULL || state == NULL) return -1;
     *state = ASTERISKD_RULES_SLOT_ABSENT;
-    if (effect->kind == ASTERISKD_ROUTE_EFFECT_DUMMY_INTERFACE) {
-        uint32_t interface_index = if_nametoindex(effect->interface_name);
-        *state = interface_index == 0U ? ASTERISKD_RULES_SLOT_ABSENT :
-            system_dummy_effect_matches(effect, interface_index)
-                ? ASTERISKD_RULES_SLOT_OWNED : ASTERISKD_RULES_SLOT_FOREIGN;
-        return 0;
-    }
     if (system->rule_snapshot.phase == SYSTEM_RULE_SNAPSHOT_BEFORE_APPLY ||
         system->rule_snapshot.phase == SYSTEM_RULE_SNAPSHOT_AFTER_APPLY) {
         const struct system_rule_view *view =
@@ -4091,9 +3975,6 @@ static const struct asteriskd_route_effect *system_find_route_effect(
             effect->kind == ASTERISKD_ROUTE_EFFECT_ROUTE &&
             effect->family == record->resource.route.family &&
             effect->route_id == record->resource.route.route_id) return effect;
-        if (record->kind == ASTERISKD_RESOURCE_OPERATION_DUMMY_INTERFACE &&
-            effect->kind == ASTERISKD_ROUTE_EFFECT_DUMMY_INTERFACE &&
-            effect->interface_id == record->resource.dummy_interface.interface_id) return effect;
     }
     return NULL;
 }
@@ -4115,9 +3996,6 @@ static int system_route_record(struct asteriskd_system_supervisor *system,
                 effect->interface_name) <= 0) return -1;
         record->resource.route.interface_index = if_nametoindex(effect->interface_name);
         if (record->resource.route.interface_index == 0U) return -1;
-    } else if (effect->kind == ASTERISKD_ROUTE_EFFECT_DUMMY_INTERFACE) {
-        record->kind = ASTERISKD_RESOURCE_OPERATION_DUMMY_INTERFACE;
-        record->resource.dummy_interface.interface_id = effect->interface_id;
     } else {
         return -1;
     }
@@ -4395,8 +4273,7 @@ static bool system_rule_operation_kind(enum asteriskd_resource_operation_kind ki
     return kind == ASTERISKD_RESOURCE_OPERATION_IPTABLES_CHAIN ||
         kind == ASTERISKD_RESOURCE_OPERATION_IPTABLES_RULE ||
         kind == ASTERISKD_RESOURCE_OPERATION_IP_RULE ||
-        kind == ASTERISKD_RESOURCE_OPERATION_ROUTE ||
-        kind == ASTERISKD_RESOURCE_OPERATION_DUMMY_INTERFACE;
+        kind == ASTERISKD_RESOURCE_OPERATION_ROUTE;
 }
 
 static int system_apply_operations(void *opaque, const struct asteriskd_resource_operation *records,
@@ -4419,8 +4296,7 @@ static int system_apply_operations(void *opaque, const struct asteriskd_resource
         rule_batch = kind == ASTERISKD_RESOURCE_OPERATION_IPTABLES_CHAIN ||
             kind == ASTERISKD_RESOURCE_OPERATION_IPTABLES_RULE ||
             kind == ASTERISKD_RESOURCE_OPERATION_IP_RULE ||
-            kind == ASTERISKD_RESOURCE_OPERATION_ROUTE ||
-            kind == ASTERISKD_RESOURCE_OPERATION_DUMMY_INTERFACE;
+            kind == ASTERISKD_RESOURCE_OPERATION_ROUTE;
     }
     if (rule_batch) {
         if (system_rule_batch_begin(&system->rule_commands) != 0) return -1;
@@ -4436,8 +4312,7 @@ static int system_apply_operations(void *opaque, const struct asteriskd_resource
                     system_find_hook_group(system, &record->resource.iptables_rule);
                 result = group == NULL ? -1 : system_apply_hook_group(system, group);
             } else if (record->kind == ASTERISKD_RESOURCE_OPERATION_IP_RULE ||
-                record->kind == ASTERISKD_RESOURCE_OPERATION_ROUTE ||
-                record->kind == ASTERISKD_RESOURCE_OPERATION_DUMMY_INTERFACE) {
+                record->kind == ASTERISKD_RESOURCE_OPERATION_ROUTE) {
                 const struct asteriskd_route_effect *effect =
                     system_find_route_effect(system, record);
                 result = effect == NULL ? -1 : system_apply_route_effect(system, effect);
@@ -4485,8 +4360,7 @@ rule_batch_failed:
         return -1;
     }
     if (count == 1U && (records[0].kind == ASTERISKD_RESOURCE_OPERATION_IP_RULE ||
-            records[0].kind == ASTERISKD_RESOURCE_OPERATION_ROUTE ||
-            records[0].kind == ASTERISKD_RESOURCE_OPERATION_DUMMY_INTERFACE)) {
+            records[0].kind == ASTERISKD_RESOURCE_OPERATION_ROUTE)) {
         const struct asteriskd_route_effect *effect = system_find_route_effect(system, &records[0]);
         return effect == NULL ? -1 : system_apply_route_effect(system, effect);
     }
@@ -4585,15 +4459,11 @@ static int system_verify_operation(void *opaque,
         return -1;
     }
     if (record->kind == ASTERISKD_RESOURCE_OPERATION_IP_RULE ||
-        record->kind == ASTERISKD_RESOURCE_OPERATION_ROUTE ||
-        record->kind == ASTERISKD_RESOURCE_OPERATION_DUMMY_INTERFACE) {
+        record->kind == ASTERISKD_RESOURCE_OPERATION_ROUTE) {
         const struct asteriskd_route_effect *effect = system_find_route_effect(system, record);
         bool present = false;
         if (effect == NULL || system_probe_route_effect(system, effect, &present) != 0 ||
             !present) return -1;
-        if (record->kind == ASTERISKD_RESOURCE_OPERATION_DUMMY_INTERFACE) {
-            if (if_nametoindex(effect->interface_name) == 0U) return -1;
-        }
         return 0;
     }
     return -1;
@@ -4723,13 +4593,6 @@ static int system_rules_probe_route(void *opaque,
     struct asteriskd_system_supervisor *system = opaque;
     if (state == NULL ||
         system_classify_route_effect(system, effect, state) != 0) return -1;
-    if (*state == ASTERISKD_RULES_SLOT_OWNED) {
-        if (effect->kind == ASTERISKD_ROUTE_EFFECT_DUMMY_INTERFACE &&
-            !system_dummy_effect_matches(
-                effect, if_nametoindex(effect->interface_name))) {
-            *state = ASTERISKD_RULES_SLOT_FOREIGN;
-        }
-    }
     return 0;
 }
 
@@ -4912,25 +4775,6 @@ static int system_effect_open_network(void *opaque) {
     if (asteriskd_network_set_effect_sink(
             &system->network, &system->network_effect_sink) != 0) return -1;
     return system_apply_initial_ipv6_guard(system);
-}
-
-static int system_detect_global_ipv6(bool *present) {
-    if (present == NULL) return -1;
-    *present = false;
-    struct ifaddrs *addresses = NULL;
-    if (getifaddrs(&addresses) != 0) return -1;
-    for (const struct ifaddrs *entry = addresses; entry != NULL; entry = entry->ifa_next) {
-        if (entry->ifa_addr == NULL || entry->ifa_addr->sa_family != AF_INET6) continue;
-        const struct in6_addr *address =
-            &((const struct sockaddr_in6 *)entry->ifa_addr)->sin6_addr;
-        if (!IN6_IS_ADDR_UNSPECIFIED(address) && !IN6_IS_ADDR_LOOPBACK(address) &&
-            !IN6_IS_ADDR_LINKLOCAL(address) && !IN6_IS_ADDR_MULTICAST(address)) {
-            *present = true;
-            break;
-        }
-    }
-    freeifaddrs(addresses);
-    return 0;
 }
 
 static int system_collect_local_address_set(
@@ -5552,7 +5396,6 @@ struct system_owned_route_table {
 static const struct system_owned_route_table system_owned_route_tables[] = {
     {ASTERISKD_IP_FAMILY_IPV4, ASTERISKD_TPROXY_TABLE},
     {ASTERISKD_IP_FAMILY_IPV6, ASTERISKD_TPROXY_TABLE},
-    {ASTERISKD_IP_FAMILY_IPV6, ASTERISKD_TPROXY_DUMMY_TABLE},
     {ASTERISKD_IP_FAMILY_IPV4, ASTERISKD_TUN_TABLE},
     {ASTERISKD_IP_FAMILY_IPV6, ASTERISKD_TUN_TABLE},
 };
@@ -5628,45 +5471,6 @@ static int system_reconcile_policy_routing(
                 system, &system_owned_route_tables[index], remove) != 0) return -1;
     }
     return system_reconcile_token_route(system, remove);
-}
-
-static int system_owned_dummy_probe(
-    struct asteriskd_system_supervisor *system,
-    bool *present,
-    bool *owned) {
-    const char *name = asteriskd_owned_resource_catalog()->dummy_interface_name;
-    const char *arguments[] = {
-        "-d", "-j", "link", "show", "dev", name,
-    };
-    int exit_status = -1;
-
-    if (present == NULL || owned == NULL) return -1;
-    *present = if_nametoindex(name) != 0U;
-    *owned = false;
-    if (!*present) return 0;
-    if (system_ip_unscoped_command(system,
-            arguments, sizeof(arguments) / sizeof(arguments[0]),
-            true, &exit_status) != 0 || exit_status != 0 ||
-        system->action_stdout_overflow) return -1;
-    return asteriskd_ip_link_output_is_dummy(
-        system->action_stdout, system->action_stdout_length, owned);
-}
-
-static int system_reconcile_dummy_interface(
-    struct asteriskd_system_supervisor *system, bool remove) {
-    const char *name = asteriskd_owned_resource_catalog()->dummy_interface_name;
-    const char *arguments[] = {"link", "del", "dev", name, "type", "dummy"};
-    bool present = false;
-    bool owned = false;
-    int exit_status = -1;
-
-    if (system_owned_dummy_probe(system, &present, &owned) != 0) return -1;
-    if (!present || !owned) return 0;
-    if (!remove ||
-        system_ip_unscoped_command(system,
-            arguments, sizeof(arguments) / sizeof(arguments[0]),
-            false, &exit_status) != 0 || exit_status != 0) return -1;
-    return if_nametoindex(name) == 0U ? 0 : -1;
 }
 
 static int system_remove_owned_bpf_tree(const char *path) {
@@ -5838,9 +5642,6 @@ static int system_reconcile_remove_phase(
         case ASTERISKD_RECONCILE_POLICY_ROUTING:
             result = system_reconcile_policy_routing(system, true);
             break;
-        case ASTERISKD_RECONCILE_DUMMY_INTERFACE:
-            result = system_reconcile_dummy_interface(system, true);
-            break;
         case ASTERISKD_RECONCILE_BPF_PINS:
             result = system_reconcile_bpf_pins(system, true);
             break;
@@ -5850,8 +5651,7 @@ static int system_reconcile_remove_phase(
     }
     if (result != 0) {
         static const char *const names[] = {
-            "quiesce", "private-chains", "policy-routing",
-            "dummy-interface", "bpf-pins",
+            "quiesce", "private-chains", "policy-routing", "bpf-pins",
         };
         char message[128U];
         int written = snprintf(message, sizeof(message),
@@ -5875,7 +5675,6 @@ static int system_reconcile_verify_absent(
         system_reconcile_tc_filters(system, false) != 0 ||
         system_reconcile_private_chains(system, false) != 0 ||
         system_reconcile_policy_routing(system, false) != 0 ||
-        system_reconcile_dummy_interface(system, false) != 0 ||
         system_reconcile_bpf_pins(system, false) != 0) {
         system_reconcile_error(
             error, error_size, "owned resource verification failed");
@@ -5923,7 +5722,6 @@ static int system_effect_rules(void *opaque, bool *active,
     if (active == NULL || generation == NULL || categories == NULL) return -1;
     system->rules_verified = false;
     if (!system->rules_initialized) system_rules_backend_init(system);
-    if (system_detect_global_ipv6(&system->has_global_ipv6_address) != 0) return -1;
     if (system->network_opened && !system->network.no_op) {
         int64_t now = 0;
         char error[128U];
@@ -5931,14 +5729,13 @@ static int system_effect_rules(void *opaque, bool *active,
             asteriskd_network_handle(
                 &system->network, (uint64_t)now, error, sizeof(error)) != 0 ||
             asteriskd_network_apply_immediate(
-                &system->network, error, sizeof(error)) != 0 ||
-            system_detect_global_ipv6(&system->has_global_ipv6_address) != 0) return -1;
+                &system->network, error, sizeof(error)) != 0) return -1;
     }
     const char *failed_stage = NULL;
     if (system_capture_local_address_snapshot(system) != 0) {
         failed_stage = "local-address-snapshot";
     } else if (asteriskd_rules_install(&system->rules_runtime,
-            &system->loaded_config.config, system->has_global_ipv6_address,
+            &system->loaded_config.config, false,
             &system->rules_backend) != 0) {
         failed_stage = "install";
     } else if (system_reconcile_bpf2_local_maps(system) != 0) {

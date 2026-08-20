@@ -112,6 +112,7 @@ int asteriskd_tproxy_rule_transaction_plan_build(
     const struct asteriskd_config *config,
     bool has_global_ipv6_address,
     struct asteriskd_rule_transaction_plan *plan) {
+    (void)has_global_ipv6_address;
     if (config == NULL || plan == NULL || config->mode != ASTERISKD_MODE_TPROXY) {
         return ASTERISKD_CONFIG_INVALID;
     }
@@ -121,8 +122,8 @@ int asteriskd_tproxy_rule_transaction_plan_build(
         ASTERISKD_IP_FAMILY_IPV4, ASTERISKD_IP_TABLE_MANGLE, ASTERISKD_CHAIN_TPROXY);
     if (add_private_name(main4, "ASTERISK_TPROXY_PREROUTING") != 0 ||
         add_private_name(main4, "ASTERISK_TPROXY_OUTPUT") != 0 ||
-        add_private_name(local4, "ASTERISKD_LOCAL4_BEGIN") != 0 ||
-        add_private_name(local4, "ASTERISKD_LOCAL4_END") != 0 ||
+        add_private_name(local4, "ASTERISK_LOCAL4_BEGIN") != 0 ||
+        add_private_name(local4, "ASTERISK_LOCAL4_END") != 0 ||
         add_normal_route(plan, ASTERISKD_IP_FAMILY_IPV4) != 0) {
         return ASTERISKD_CONFIG_INVALID;
     }
@@ -141,8 +142,8 @@ int asteriskd_tproxy_rule_transaction_plan_build(
         ASTERISKD_IP_FAMILY_IPV6, ASTERISKD_IP_TABLE_MANGLE, ASTERISKD_CHAIN_TPROXY);
     if (add_private_name(main6, "ASTERISK_TPROXY6_PREROUTING") != 0 ||
         add_private_name(main6, "ASTERISK_TPROXY6_OUTPUT") != 0 ||
-        add_private_name(local6, "ASTERISKD_LOCAL6_BEGIN") != 0 ||
-        add_private_name(local6, "ASTERISKD_LOCAL6_END") != 0) return ASTERISKD_CONFIG_INVALID;
+        add_private_name(local6, "ASTERISK_LOCAL6_BEGIN") != 0 ||
+        add_private_name(local6, "ASTERISK_LOCAL6_END") != 0) return ASTERISKD_CONFIG_INVALID;
     struct asteriskd_traffic_hook_group *hooks6 = add_hook_group(plan,
         ASTERISKD_IP_FAMILY_IPV6, ASTERISKD_IP_TABLE_MANGLE,
         ASTERISKD_CHAIN_TPROXY, ASTERISKD_RULE_TPROXY_ENTRY);
@@ -150,37 +151,5 @@ int asteriskd_tproxy_rule_transaction_plan_build(
             "ASTERISK_TPROXY6_PREROUTING") != 0 ||
         add_jump(hooks6, ASTERISKD_BUILTIN_OUTPUT, false,
             "ASTERISK_TPROXY6_OUTPUT") != 0) return ASTERISKD_CONFIG_INVALID;
-    if (has_global_ipv6_address) return add_normal_route(plan, ASTERISKD_IP_FAMILY_IPV6);
-
-    if (add_private_name(main6, "ASTERISK_TPROXY6_DUMMY_PRE") != 0 ||
-        add_private_name(main6, "ASTERISK_TPROXY6_DUMMY") != 0 ||
-        add_jump(hooks6, ASTERISKD_BUILTIN_PREROUTING, false,
-            "ASTERISK_TPROXY6_DUMMY_PRE") != 0 ||
-        add_jump(hooks6, ASTERISKD_BUILTIN_OUTPUT, false,
-            "ASTERISK_TPROXY6_DUMMY") != 0) return ASTERISKD_CONFIG_INVALID;
-    struct asteriskd_route_effect *dummy = add_route(plan,
-        ASTERISKD_ROUTE_EFFECT_DUMMY_INTERFACE, ASTERISKD_IP_FAMILY_IPV6);
-    struct asteriskd_route_effect *rule = add_route(plan,
-        ASTERISKD_ROUTE_EFFECT_IP_RULE, ASTERISKD_IP_FAMILY_IPV6);
-    struct asteriskd_route_effect *route = add_route(plan,
-        ASTERISKD_ROUTE_EFFECT_ROUTE, ASTERISKD_IP_FAMILY_IPV6);
-    if (dummy == NULL || rule == NULL || route == NULL ||
-        copy_text(dummy->interface_name, sizeof(dummy->interface_name), "xdummy") != 0 ||
-        copy_text(dummy->interface_address, sizeof(dummy->interface_address),
-            "fd01:5ca1:ab1e:8d97:497f:8b48:b9aa:85cd/128") != 0 ||
-        copy_text(route->destination, sizeof(route->destination), "default") != 0 ||
-        copy_text(route->interface_name, sizeof(route->interface_name), "xdummy") != 0) {
-        return ASTERISKD_CONFIG_INVALID;
-    }
-    rule->table = ASTERISKD_TPROXY_DUMMY_TABLE;
-    rule->priority = ASTERISKD_ROUTE_RULE_PRIORITY;
-    rule->mark = ASTERISKD_AUXILIARY_MARK;
-    rule->mark_mask = ASTERISKD_MARK_MASK;
-    rule->invert_from_all = true;
-    rule->ip_rule_id = ASTERISKD_IP_RULE_TPROXY;
-    route->table = ASTERISKD_TPROXY_DUMMY_TABLE;
-    route->local_route = true;
-    route->route_id = ASTERISKD_ROUTE_TPROXY;
-    dummy->interface_id = ASTERISKD_INTERFACE_IPV6_DUMMY;
-    return 0;
+    return add_normal_route(plan, ASTERISKD_IP_FAMILY_IPV6);
 }

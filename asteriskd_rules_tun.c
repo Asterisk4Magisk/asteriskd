@@ -134,12 +134,12 @@ int asteriskd_tun_rule_transaction_plan_build(
         config->helper.value.hev.tunnel_name;
     if (add_family(plan, ASTERISKD_IP_FAMILY_IPV4,
             "ASTERISK_TUN_PREROUTING", "ASTERISK_TUN_OUTPUT", "ASTERISK_TUN_FORWARD",
-            "ASTERISKD_LOCAL4_BEGIN", "ASTERISKD_LOCAL4_END", tunnel) != 0) {
+            "ASTERISK_LOCAL4_BEGIN", "ASTERISK_LOCAL4_END", tunnel) != 0) {
         return ASTERISKD_CONFIG_INVALID;
     }
     if (config->enable_ipv6 && add_family(plan, ASTERISKD_IP_FAMILY_IPV6,
             "ASTERISK_TUN6_PREROUTING", "ASTERISK_TUN6_OUTPUT", "ASTERISK_TUN6_FORWARD",
-            "ASTERISKD_LOCAL6_BEGIN", "ASTERISKD_LOCAL6_END", tunnel) != 0) {
+            "ASTERISK_LOCAL6_BEGIN", "ASTERISK_LOCAL6_END", tunnel) != 0) {
         return ASTERISKD_CONFIG_INVALID;
     }
     return 0;
