@@ -569,6 +569,14 @@ static bool readiness_role_valid(
              config->mode == ASTERISKD_MODE_BPF2SOCKS));
 }
 
+static int readiness_listener_owned(
+    const struct asteriskd_readiness_backend *backend,
+    const struct asteriskd_child_identity *identity,
+    uint16_t port,
+    bool *owned) {
+    return backend->listener_owned(backend->context, identity, "*", port, owned);
+}
+
 int asteriskd_readiness_preflight(
     const struct asteriskd_config *config,
     enum asteriskd_child_role role,
@@ -623,8 +631,8 @@ int asteriskd_readiness_poll(
     if (!identity_valid) return ASTERISKD_READINESS_CHILD_LOST;
     bool ready = false;
     if (tracker->role == ASTERISKD_CHILD_CORE && config->mode == ASTERISKD_MODE_TPROXY) {
-        if (backend->listener_owned(
-                backend->context, identity, "*", config->transparent_port, &ready) != 0) {
+        if (readiness_listener_owned(
+                backend, identity, config->transparent_port, &ready) != 0) {
             return ASTERISKD_READINESS_IO;
         }
     } else if (tracker->role == ASTERISKD_CHILD_CORE && config->mode == ASTERISKD_MODE_TUN) {
@@ -632,14 +640,12 @@ int asteriskd_readiness_poll(
                 backend->context, config->tunnel_name, &ready) != 0) return ASTERISKD_READINESS_IO;
     } else if (tracker->role == ASTERISKD_CHILD_CORE && config->mode == ASTERISKD_MODE_TUN2SOCKS) {
         const struct asteriskd_hev_helper_config *hev = &config->helper.value.hev;
-        if (backend->listener_owned(
-                backend->context, identity, hev->socks_host, hev->socks_port, &ready) != 0) {
+        if (readiness_listener_owned(backend, identity, hev->socks_port, &ready) != 0) {
             return ASTERISKD_READINESS_IO;
         }
     } else if (tracker->role == ASTERISKD_CHILD_CORE && config->mode == ASTERISKD_MODE_BPF2SOCKS) {
         const struct asteriskd_bpf_helper_config *bpf = &config->helper.value.bpf;
-        if (backend->listener_owned(
-                backend->context, identity, bpf->socks_host, bpf->socks_port, &ready) != 0) {
+        if (readiness_listener_owned(backend, identity, bpf->socks_port, &ready) != 0) {
             return ASTERISKD_READINESS_IO;
         }
     } else if (tracker->role == ASTERISKD_CHILD_CORE && config->mode == ASTERISKD_MODE_EBPF) {
@@ -651,9 +657,9 @@ int asteriskd_readiness_poll(
         }
     } else if (tracker->role == ASTERISKD_CHILD_HELPER && config->mode == ASTERISKD_MODE_BPF2SOCKS) {
         const struct asteriskd_bpf_helper_config *bpf = &config->helper.value.bpf;
-        if (backend->listener_owned(
-                backend->context, identity, bpf->bridge_listen_address, bpf->bridge_port,
-                &ready) != 0) return ASTERISKD_READINESS_IO;
+        if (readiness_listener_owned(backend, identity, bpf->bridge_port, &ready) != 0) {
+            return ASTERISKD_READINESS_IO;
+        }
     } else {
         return ASTERISKD_CONFIG_INVALID;
     }
