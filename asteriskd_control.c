@@ -1842,9 +1842,18 @@ static int control_cli_run_control(
         .until_running = until_running,
     };
     struct asteriskd_control_response response;
-    memset(&response, 0, sizeof(response));
-    enum asteriskd_control_client_result result = backend->control_client(
-        context, method, request_id, control_cli_line_sink, &sink, &response);
+    enum asteriskd_control_client_result result;
+    do {
+        memset(&response, 0, sizeof(response));
+        result = backend->control_client(
+            context, method, request_id, control_cli_line_sink, &sink, &response);
+        if (result == ASTERISKD_CONTROL_CLIENT_TIMEOUT &&
+            method == ASTERISKD_CONTROL_METHOD_WATCH && until_running && sink.lines == 0U) {
+            asteriskd_control_response_destroy(&response);
+        } else {
+            break;
+        }
+    } while (true);
     if (result == ASTERISKD_CONTROL_CLIENT_OK) {
         int exit_code = asteriskd_control_result_exit_code(response.result.code);
         asteriskd_control_response_destroy(&response);
