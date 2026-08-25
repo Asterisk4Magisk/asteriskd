@@ -322,7 +322,8 @@ int asteriskd_child_setup_run(
     if (error != NULL && error_size != 0U) error[0] = '\0';
     if (spec == NULL || captured_parent_pid <= 0 || backend == NULL ||
         backend->restore_signals == NULL || backend->create_session == NULL ||
-        backend->set_nofile_limit == NULL || backend->clear_supplementary_groups == NULL ||
+        backend->set_nofile_limit == NULL || backend->set_memlock_unlimited == NULL ||
+        backend->clear_supplementary_groups == NULL ||
         backend->set_gid == NULL || backend->set_uid == NULL ||
         backend->set_parent_death_signal == NULL || backend->get_parent_pid == NULL ||
         backend->prepare_descriptors == NULL || backend->exec_process == NULL) {
@@ -333,6 +334,8 @@ int asteriskd_child_setup_run(
     if (backend->create_session(backend->context) != 0) goto failed;
     if (backend->set_nofile_limit(backend->context, UINT64_C(1000000)) != 0 &&
         rlimit_warning != NULL) *rlimit_warning = true;
+    if (spec->unlimited_locked_memory &&
+        backend->set_memlock_unlimited(backend->context) != 0) goto failed;
     if (backend->clear_supplementary_groups(backend->context) != 0) goto failed;
     if (backend->set_gid(backend->context, spec->gid) != 0) goto failed;
     if (backend->set_uid(backend->context, spec->uid) != 0) goto failed;
@@ -971,6 +974,16 @@ static int system_child_set_nofile(void *opaque, uint64_t value) {
     return 0;
 }
 
+static int system_child_set_memlock_unlimited(void *opaque) {
+    struct system_child_setup_context *context = opaque;
+    const struct rlimit limit = {RLIM_INFINITY, RLIM_INFINITY};
+    if (setrlimit(RLIMIT_MEMLOCK, &limit) != 0) {
+        context->last_errno = errno;
+        return -1;
+    }
+    return 0;
+}
+
 static int system_child_clear_groups(void *opaque) {
     struct system_child_setup_context *context = opaque;
     if (setgroups(0U, NULL) != 0) {
@@ -1181,6 +1194,7 @@ int asteriskd_process_spawn_system(
             .restore_signals = system_child_restore_signals,
             .create_session = system_child_create_session,
             .set_nofile_limit = system_child_set_nofile,
+            .set_memlock_unlimited = system_child_set_memlock_unlimited,
             .clear_supplementary_groups = system_child_clear_groups,
             .set_gid = system_child_set_gid,
             .set_uid = system_child_set_uid,

@@ -677,6 +677,7 @@ struct asteriskd_process_spec {
     int inherited_fd_targets[ASTERISKD_PROCESS_MAX_INHERITED_FDS];
     size_t inherited_fd_count;
     enum asteriskd_process_output_mode output_mode;
+    bool unlimited_locked_memory;
 };
 
 struct asteriskd_anonymous_document {
@@ -809,6 +810,7 @@ struct asteriskd_child_setup_backend {
     int (*restore_signals)(void *);
     int (*create_session)(void *);
     int (*set_nofile_limit)(void *, uint64_t);
+    int (*set_memlock_unlimited)(void *);
     int (*clear_supplementary_groups)(void *);
     int (*set_gid)(void *, uint32_t);
     int (*set_uid)(void *, uint32_t);

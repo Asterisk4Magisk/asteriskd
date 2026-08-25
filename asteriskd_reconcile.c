@@ -74,6 +74,7 @@ static int reconcile_line_tokens(
     size_t capacity,
     size_t *count) {
     size_t offset = 0U;
+    bool overflow = false;
 
     *count = 0U;
     while (offset < length) {
@@ -88,11 +89,15 @@ static int reconcile_line_tokens(
             if (byte < 0x21U || byte >= 0x7fU) return -1;
             ++offset;
         }
-        if (*count >= capacity) return -1;
-        tokens[*count].bytes = line + start;
-        tokens[*count].length = offset - start;
-        ++*count;
+        if (*count < capacity) {
+            tokens[*count].bytes = line + start;
+            tokens[*count].length = offset - start;
+            ++*count;
+        } else {
+            overflow = true;
+        }
     }
+    if (overflow) *count = capacity + 1U;
     return *count == 0U ? -1 : 0;
 }
 

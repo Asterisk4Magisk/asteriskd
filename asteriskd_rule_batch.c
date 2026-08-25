@@ -44,26 +44,6 @@ static int builder_append(
     return 0;
 }
 
-static int builder_append_literal(
-    struct rule_batch_builder *builder, const char *literal) {
-    return literal == NULL ? -1 : builder_append(builder, literal, strlen(literal));
-}
-
-static int builder_append_ip_batch(
-    struct rule_batch_builder *builder,
-    const char *prefix,
-    const unsigned char *commands,
-    size_t command_length,
-    const char *terminator) {
-    if (command_length == 0U) return 0;
-    if (commands == NULL || prefix == NULL || terminator == NULL ||
-        builder_append_literal(builder, prefix) != 0 ||
-        builder_append(builder, commands, command_length) != 0) return -1;
-    if (commands[command_length - 1U] != '\n' &&
-        builder_append_literal(builder, "\n") != 0) return -1;
-    return builder_append_literal(builder, terminator);
-}
-
 int asteriskd_rule_batch_document_render(
     const unsigned char *private_commands, size_t private_length,
     const unsigned char *ipv4_commands, size_t ipv4_length,
@@ -71,12 +51,6 @@ int asteriskd_rule_batch_document_render(
     const unsigned char *hook_commands, size_t hook_length,
     unsigned char **document, size_t *document_length) {
     static const char header[] = "set -eu\n";
-    static const char ipv4_prefix[] =
-        "/system/bin/ip -4 -batch - <<'__ASTERISKD_IP4_BATCH__'\n";
-    static const char ipv4_terminator[] = "__ASTERISKD_IP4_BATCH__\n";
-    static const char ipv6_prefix[] =
-        "/system/bin/ip -6 -batch - <<'__ASTERISKD_IP6_BATCH__'\n";
-    static const char ipv6_terminator[] = "__ASTERISKD_IP6_BATCH__\n";
     if (document != NULL) *document = NULL;
     if (document_length != NULL) *document_length = 0U;
     if (document == NULL || document_length == NULL ||
@@ -88,10 +62,8 @@ int asteriskd_rule_batch_document_render(
     struct rule_batch_builder builder = {0};
     if (builder_append(&builder, header, sizeof(header) - 1U) != 0 ||
         builder_append(&builder, private_commands, private_length) != 0 ||
-        builder_append_ip_batch(&builder, ipv4_prefix, ipv4_commands,
-            ipv4_length, ipv4_terminator) != 0 ||
-        builder_append_ip_batch(&builder, ipv6_prefix, ipv6_commands,
-            ipv6_length, ipv6_terminator) != 0 ||
+        builder_append(&builder, ipv4_commands, ipv4_length) != 0 ||
+        builder_append(&builder, ipv6_commands, ipv6_length) != 0 ||
         builder_append(&builder, hook_commands, hook_length) != 0 ||
         builder_append(&builder, "", 1U) != 0) {
         builder_destroy(&builder);

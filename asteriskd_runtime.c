@@ -1,4 +1,5 @@
 #include "asteriskd.h"
+#include "asteriskd_compat.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -1063,6 +1064,7 @@ struct asteriskd_system_supervisor {
     struct asteriskd_child_exit_status helper_exit;
     struct asteriskd_readiness_tracker helper_readiness;
     int helper_readiness_result;
+    struct asteriskd_tun_compat_state tun_compatibility;
     struct asteriskd_matcher_launch matcher_launch;
     struct asteriskd_matcher_pin_plan matcher_pin_plan;
     struct asteriskd_matcher_verification matcher_verification;
@@ -1876,6 +1878,44 @@ static int system_effect_wait_core(void *opaque) {
 
 static bool system_helper_setup_done(void *opaque);
 
+static const struct asteriskd_tun_compat_paths system_tun_compatibility_paths = {
+    .tun_device = "/dev/tun",
+    .network_directory = "/dev/net",
+    .compatibility_path = "/dev/net/tun",
+};
+
+static int system_tun_compatibility_log(
+    struct asteriskd_system_supervisor *system, const char *operation, const char *detail) {
+    char message[384U];
+    int written = snprintf(message, sizeof(message),
+        "TUN compatibility path %s failed: %s", operation,
+        detail != NULL && detail[0] != '\0' ? detail : "unknown error");
+    if (written > 0 && (size_t)written < sizeof(message)) {
+        (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
+            ASTERISKD_COMPONENT_HELPER, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+    }
+    return -1;
+}
+
+static int system_tun_compatibility_prepare(struct asteriskd_system_supervisor *system) {
+    char error[256U];
+    if (asteriskd_tun_compat_prepare(&system_tun_compatibility_paths,
+            &system->tun_compatibility, error, sizeof(error)) == 0) return 0;
+    (void)system_tun_compatibility_log(system, "prepare", error);
+    if (asteriskd_tun_compat_cleanup(&system_tun_compatibility_paths,
+            &system->tun_compatibility, error, sizeof(error)) != 0) {
+        (void)system_tun_compatibility_log(system, "prepare rollback", error);
+    }
+    return -1;
+}
+
+static int system_tun_compatibility_cleanup(struct asteriskd_system_supervisor *system) {
+    char error[256U];
+    if (asteriskd_tun_compat_cleanup(&system_tun_compatibility_paths,
+            &system->tun_compatibility, error, sizeof(error)) == 0) return 0;
+    return system_tun_compatibility_log(system, "cleanup", error);
+}
+
 static int system_start_helper_process(
     struct asteriskd_system_supervisor *system, struct asteriskd_child_identity *identity) {
     char error[256U];
@@ -1945,22 +1985,32 @@ static bool system_helper_readiness_done(void *opaque) {
 
 static int system_effect_wait_helper(void *opaque) {
     struct asteriskd_system_supervisor *system = opaque;
+    int result = -1;
     int64_t now = 0;
     if (system_runtime_clock(system, &now) != 0 ||
         asteriskd_system_process_backends_init(&system->process_context,
             &system->core_spec, &system->helper_launch.process,
             &system->readiness_backend, &system->stop_backend) != 0 ||
         asteriskd_readiness_init(&system->loaded_config.config, ASTERISKD_CHILD_HELPER,
-            (uint64_t)now, &system->readiness_backend, &system->helper_readiness) != 0) return -1;
-    struct asteriskd_deadline deadline = {
-        .armed = true,
-        .monotonic_milliseconds = (int64_t)system->helper_readiness.deadline_milliseconds,
-    };
-    int pumped = system_pump_condition_periodic(system, &deadline,
-        ASTERISKD_READINESS_POLL_INTERVAL_MILLIS, system_helper_readiness_done);
-    if (pumped == 0 && system->helper_readiness_result == ASTERISKD_READINESS_READY) return 0;
-    return system->helper_readiness_result == ASTERISKD_READINESS_TIMEOUT
-        ? ASTERISKD_RUNTIME_EFFECT_READINESS_TIMEOUT : -1;
+            (uint64_t)now, &system->readiness_backend, &system->helper_readiness) != 0) goto done;
+    {
+        struct asteriskd_deadline deadline = {
+            .armed = true,
+            .monotonic_milliseconds = (int64_t)system->helper_readiness.deadline_milliseconds,
+        };
+        int pumped = system_pump_condition_periodic(system, &deadline,
+            ASTERISKD_READINESS_POLL_INTERVAL_MILLIS, system_helper_readiness_done);
+        if (pumped == 0 && system->helper_readiness_result == ASTERISKD_READINESS_READY) {
+            result = 0;
+        } else if (system->helper_readiness_result == ASTERISKD_READINESS_TIMEOUT) {
+            result = ASTERISKD_RUNTIME_EFFECT_READINESS_TIMEOUT;
+        }
+    }
+
+done:
+    if (system->loaded_config.config.helper.type == ASTERISKD_HELPER_HEV_SOCKS5_TUNNEL &&
+        system_tun_compatibility_cleanup(system) != 0) result = -1;
+    return result;
 }
 
 static bool system_action_setup_done(void *opaque) {
@@ -2331,23 +2381,6 @@ static int system_rule_batch_append_shell_command(
     for (size_t index = 0U; argv[index] != NULL; ++index) {
         if (index != 0U && system_text_batch_append_byte(batch, ' ') != 0) return -1;
         if (system_rule_batch_append_shell_argument(batch, argv[index]) != 0) return -1;
-    }
-    return system_text_batch_append_byte(batch, '\n');
-}
-
-static int system_rule_batch_append_ip_command(
-    struct system_text_batch *batch,
-    const char *const *arguments, size_t argument_count) {
-    if (batch == NULL || arguments == NULL || argument_count == 0U) return -1;
-    for (size_t index = 0U; index < argument_count; ++index) {
-        const char *argument = arguments[index];
-        if (argument == NULL || argument[0] == '\0') return -1;
-        if (index != 0U && system_text_batch_append_byte(batch, ' ') != 0) return -1;
-        for (size_t byte_index = 0U; argument[byte_index] != '\0'; ++byte_index) {
-            unsigned char byte = (unsigned char)argument[byte_index];
-            if (byte <= 0x20U || byte >= 0x7fU ||
-                system_text_batch_append_byte(batch, byte) != 0) return -1;
-        }
     }
     return system_text_batch_append_byte(batch, '\n');
 }
@@ -3374,10 +3407,20 @@ static int system_ip_zero(struct asteriskd_system_supervisor *system,
     enum asteriskd_ip_family family, const char *const *arguments, size_t argument_count) {
     if (system->rule_commands.active) {
         if (family < ASTERISKD_IP_FAMILY_IPV4 ||
-            family >= ASTERISKD_IP_FAMILY_COUNT) return -1;
+            family >= ASTERISKD_IP_FAMILY_COUNT || argument_count > 20U ||
+            (argument_count != 0U && arguments == NULL)) return -1;
+        const char *argv[24U];
+        size_t count = 0U;
+        argv[count++] = "/system/bin/ip";
+        argv[count++] = family == ASTERISKD_IP_FAMILY_IPV4 ? "-4" : "-6";
+        for (size_t index = 0U; index < argument_count; ++index) {
+            if (arguments[index] == NULL || arguments[index][0] == '\0') return -1;
+            argv[count++] = arguments[index];
+        }
+        argv[count] = NULL;
         system->rule_commands.ip_started = true;
-        return system_rule_batch_append_ip_command(
-            &system->rule_commands.ip[family], arguments, argument_count);
+        return system_rule_batch_append_shell_command(
+            &system->rule_commands.ip[family], argv);
     }
     int exit_status = -1;
     return system_ip_command(system, family, arguments, argument_count,
@@ -3938,20 +3981,18 @@ static int system_classify_route_effect(struct asteriskd_system_supervisor *syst
             : asteriskd_ip_route_output_classify(
                 view->bytes, view->length, effect, state);
     }
-    char table[16U];
-    char priority[16U];
-    if (snprintf(table, sizeof(table), "%" PRIu32, effect->table) <= 0 ||
-        snprintf(priority, sizeof(priority), "%" PRIu32, effect->priority) <= 0) return -1;
     int exit_status = -1;
     if (effect->kind == ASTERISKD_ROUTE_EFFECT_IP_RULE) {
-        const char *arguments[] = {"rule", "show", "priority", priority};
-        if (system_ip_command(system, effect->family, arguments, 4U,
+        const char *arguments[] = {"rule", "show"};
+        if (system_ip_command(system, effect->family, arguments, 2U,
                 true, &exit_status) != 0 || exit_status != 0 ||
             system->action_stdout_overflow) return -1;
         return asteriskd_ip_rule_output_classify(
             system->action_stdout, system->action_stdout_length, effect, state);
     }
     if (effect->kind == ASTERISKD_ROUTE_EFFECT_ROUTE) {
+        char table[16U];
+        if (snprintf(table, sizeof(table), "%" PRIu32, effect->table) <= 0) return -1;
         const char *arguments[] = {"route", "show", "table", table, effect->destination};
         if (system_ip_command(system, effect->family, arguments, 5U,
                 true, &exit_status) != 0 || exit_status != 0 ||
@@ -4736,8 +4777,14 @@ static int system_effect_start_helper(
     void *opaque, struct asteriskd_child_identity *identity) {
     struct asteriskd_system_supervisor *system = opaque;
     if (identity == NULL) return -1;
+    if (system->loaded_config.config.helper.type == ASTERISKD_HELPER_HEV_SOCKS5_TUNNEL) {
+        if (system_tun_compatibility_prepare(system) != 0) return -1;
+        int result = system_start_helper_process(system, identity);
+        if (result != 0 && system_tun_compatibility_cleanup(system) != 0) return -1;
+        return result;
+    }
     if (system->loaded_config.config.helper.type != ASTERISKD_HELPER_BPF2SOCKS) {
-        return system_start_helper_process(system, identity);
+        return -1;
     }
     const struct asteriskd_bpf_pin_ownership_backend *pin_backend =
         asteriskd_system_bpf_pin_ownership_backend();
@@ -5335,12 +5382,10 @@ static int system_owned_policy_rule_count(
     struct asteriskd_system_supervisor *system,
     const struct asteriskd_owned_policy_rule *rule,
     size_t *count) {
-    char priority[16U];
-    const char *arguments[] = {"rule", "show", "priority", priority};
+    const char *arguments[] = {"rule", "show"};
     int exit_status = -1;
 
     if (count == NULL ||
-        snprintf(priority, sizeof(priority), "%" PRIu32, rule->priority) <= 0 ||
         system_ip_command(system, rule->family, arguments,
             sizeof(arguments) / sizeof(arguments[0]), true, &exit_status) != 0 ||
         exit_status != 0 || system->action_stdout_overflow) return -1;
@@ -5902,7 +5947,23 @@ static int system_effect_stop_children(
 }
 
 static int system_effect_stop_helper(void *opaque) {
-    return system_effect_stop_children(opaque, true);
+    struct asteriskd_system_supervisor *system = opaque;
+    int stopped = system_effect_stop_children(opaque, true);
+    int cleaned = system_tun_compatibility_cleanup(system);
+    char error[128U];
+    int pins_cleaned = system->loaded_config.config.helper.type == ASTERISKD_HELPER_BPF2SOCKS
+        ? system_reconcile_remove_phase(
+            system, ASTERISKD_RECONCILE_BPF_PINS, error, sizeof(error))
+        : 0;
+    return stopped == 0 && cleaned == 0 && pins_cleaned == 0 ? 0 : -1;
+}
+
+static int system_effect_stop_matcher(void *opaque) {
+    struct asteriskd_system_supervisor *system = opaque;
+    char error[128U];
+    if (!system->loaded_config.config.matcher.enabled) return 0;
+    return system_reconcile_remove_phase(
+        system, ASTERISKD_RECONCILE_BPF_PINS, error, sizeof(error));
 }
 
 static int system_effect_stop_core(void *opaque) {
@@ -6022,7 +6083,7 @@ static struct asteriskd_runtime_effect_backend system_runtime_effects(
         .quiesce_traffic = system_effect_quiesce,
         .remove_rules = system_effect_remove_rules,
         .close_network = system_effect_close_network,
-        .stop_matcher = system_effect_noop,
+        .stop_matcher = system_effect_stop_matcher,
         .stop_helper = system_effect_stop_helper,
         .stop_core = system_effect_stop_core,
         .restore_best_effort = system_effect_restore_best_effort,
@@ -6091,6 +6152,7 @@ static void system_runtime_cleanup_cycle(struct asteriskd_system_supervisor *sys
             asteriskd_system_anonymous_file_backend(), &system->helper_launch);
     }
     system->helper_launch_ready = false;
+    (void)system_tun_compatibility_cleanup(system);
     if (system->matcher_launch_ready) {
         (void)asteriskd_matcher_launch_destroy(
             asteriskd_system_anonymous_file_backend(), &system->matcher_launch);
@@ -6102,6 +6164,7 @@ static void system_runtime_reset_cycle(struct asteriskd_system_supervisor *syste
     system_runtime_cleanup_cycle(system);
     size_t offset = offsetof(struct asteriskd_system_supervisor, stop_requested);
     memset((unsigned char *)system + offset, 0, sizeof(*system) - offset);
+    asteriskd_tun_compat_state_init(&system->tun_compatibility);
     system->tc_netlink_fd = -1;
     system_child_process_defaults(&system->core_process);
     system_child_process_defaults(&system->helper_process);

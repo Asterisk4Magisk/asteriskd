@@ -261,6 +261,7 @@ int asteriskd_matcher_process_spec(
     spec->uid = 0U;
     spec->gid = 0U;
     spec->output_mode = ASTERISKD_PROCESS_OUTPUT_DISCARD;
+    spec->unlimited_locked_memory = true;
     if (config->direct_cidrs != NULL &&
         (process_add_fd(spec, direct_ipv4_fd, 4) != 0 ||
          process_add_fd(spec, direct_ipv6_fd, 5) != 0)) goto invalid;

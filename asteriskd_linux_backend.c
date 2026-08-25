@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0
 
 #include "asteriskd.h"
+#include "asteriskd_compat.h"
 
 #ifdef __linux__
 
@@ -15,6 +16,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -179,6 +181,47 @@ static int system_close(void *context, int fd) {
     return close(fd);
 }
 
+static int system_bpf_pin_inspect_path(void *context, const char *path, bool *exists) {
+    (void)context;
+    if (path == NULL || exists == NULL) return -1;
+    struct stat info;
+    if (lstat(path, &info) == 0) {
+        *exists = true;
+        return 0;
+    }
+    if (errno == ENOENT) {
+        *exists = false;
+        return 0;
+    }
+    return -1;
+}
+
+static int system_bpf_pin_read_object_id(void *context, int fd, uint64_t *object_id) {
+    (void)context;
+    if (fd < 0 || object_id == NULL) return -1;
+    struct {
+        uint32_t type;
+        uint32_t id;
+    } raw;
+    memset(&raw, 0, sizeof(raw));
+    union bpf_attr attributes;
+    memset(&attributes, 0, sizeof(attributes));
+    attributes.info.bpf_fd = (uint32_t)fd;
+    attributes.info.info_len = sizeof(raw);
+    attributes.info.info = (uint64_t)(uintptr_t)&raw;
+    if (system_bpf(BPF_OBJ_GET_INFO_BY_FD, &attributes) != 0 || raw.id == 0U) return -1;
+    *object_id = raw.id;
+    return 0;
+}
+
+static const struct asteriskd_bpf_pin_probe_backend bpf_pin_probe_backend = {
+    .context = NULL,
+    .inspect_path = system_bpf_pin_inspect_path,
+    .open_pinned = system_bpf_open_path,
+    .read_object_id = system_bpf_pin_read_object_id,
+    .close_fd = system_close,
+};
+
 static const struct asteriskd_bpf_map_backend bpf_map_backend = {
     .context = NULL,
     .open_pinned = system_bpf_open_path,
@@ -205,34 +248,8 @@ static const struct asteriskd_bpf_program_backend bpf_program_backend = {
 static int system_bpf_pin_probe(
     void *context, const char *path, bool *exists, uint64_t *object_id) {
     (void)context;
-    if (path == NULL || exists == NULL || object_id == NULL) return -1;
-    int fd = -1;
-    if (system_bpf_open_path(NULL, path, &fd) != 0) {
-        if (errno != ENOENT) return -1;
-        *exists = false;
-        *object_id = 0U;
-        return 0;
-    }
-    struct {
-        uint32_t type;
-        uint32_t id;
-    } raw;
-    memset(&raw, 0, sizeof(raw));
-    union bpf_attr attributes;
-    memset(&attributes, 0, sizeof(attributes));
-    attributes.info.bpf_fd = (uint32_t)fd;
-    attributes.info.info_len = sizeof(raw);
-    attributes.info.info = (uint64_t)(uintptr_t)&raw;
-    int result = system_bpf(BPF_OBJ_GET_INFO_BY_FD, &attributes);
-    int saved = errno;
-    (void)close(fd);
-    if (result != 0 || raw.id == 0U) {
-        errno = saved;
-        return -1;
-    }
-    *exists = true;
-    *object_id = raw.id;
-    return 0;
+    return asteriskd_bpf_pin_probe_with_backend(
+        &bpf_pin_probe_backend, path, exists, object_id);
 }
 
 static int system_bpf_pin_unlink(void *context, const char *path) {
