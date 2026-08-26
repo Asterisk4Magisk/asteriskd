@@ -2572,6 +2572,8 @@ const struct asteriskd_network_backend *asteriskd_system_network_backend(void);
 #define ASTERISKD_ETH_PROTOCOL_ALL UINT32_C(0x0003)
 
 bool asteriskd_hotspot_tc_output_has_android_offload(const void *, size_t);
+bool asteriskd_hotspot_should_clear_android_ipv6_offload(
+    const struct asteriskd_config *);
 
 enum asteriskd_tc_slot_state {
     ASTERISKD_TC_SLOT_ABSENT,

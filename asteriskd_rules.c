@@ -87,25 +87,6 @@ static int transaction_add_hook(struct asteriskd_traffic_hook_group *group,
     return target == NULL ? 0 : ASTERISKD_CONFIG_INVALID;
 }
 
-static int transaction_add_dns_hooks(struct asteriskd_rule_transaction_plan *plan) {
-    struct asteriskd_traffic_hook_group *mangle = transaction_add_hook_group(plan,
-        ASTERISKD_IP_FAMILY_IPV6, ASTERISKD_IP_TABLE_MANGLE,
-        ASTERISKD_CHAIN_DNS, ASTERISKD_RULE_DNS_ENTRY);
-    struct asteriskd_traffic_hook_group *filter = transaction_add_hook_group(plan,
-        ASTERISKD_IP_FAMILY_IPV6, ASTERISKD_IP_TABLE_FILTER,
-        ASTERISKD_CHAIN_DNS, ASTERISKD_RULE_DNS_ENTRY);
-    if (transaction_add_hook(mangle, ASTERISKD_BUILTIN_PREROUTING, true,
-            ASTERISKD_HOOK_DROP, true, NULL) != 0) return ASTERISKD_CONFIG_INVALID;
-    static const enum asteriskd_builtin_chain filter_chains[] = {
-        ASTERISKD_BUILTIN_INPUT, ASTERISKD_BUILTIN_FORWARD, ASTERISKD_BUILTIN_OUTPUT,
-    };
-    for (size_t index = 0U; index < sizeof(filter_chains) / sizeof(filter_chains[0]); ++index) {
-        if (transaction_add_hook(filter, filter_chains[index], true,
-                ASTERISKD_HOOK_REJECT, true, NULL) != 0) return ASTERISKD_CONFIG_INVALID;
-    }
-    return 0;
-}
-
 static int transaction_add_fake_dns(
     struct asteriskd_rule_transaction_plan *plan) {
     const struct asteriskd_owned_resource_catalog *catalog =
@@ -170,8 +151,6 @@ int asteriskd_rule_transaction_plan_build(
             return ASTERISKD_CONFIG_INVALID;
         }
     }
-    if (config->enable_local_dns && config->mode != ASTERISKD_MODE_BPF2SOCKS &&
-        transaction_add_dns_hooks(plan) != 0) return ASTERISKD_CONFIG_INVALID;
     if (config->enable_fake_dns && transaction_add_fake_dns(plan) != 0) {
         return ASTERISKD_CONFIG_INVALID;
     }
@@ -366,13 +345,10 @@ int asteriskd_packet_model_decide(
         *action = ASTERISKD_PACKET_FAKE_DNS_REDIRECT;
         return 0;
     }
-    if (config->enable_local_dns && input->ipv6 && input->protocol == ASTERISKD_PACKET_UDP &&
-        input->destination_port_53) {
-        *action = input->direction == ASTERISKD_PACKET_PREROUTING ?
-            ASTERISKD_PACKET_DROP : ASTERISKD_PACKET_REJECT;
-        return 0;
-    }
     if (input->protocol != ASTERISKD_PACKET_TCP && input->protocol != ASTERISKD_PACKET_UDP) return 0;
+    bool forced_ipv6_dns = config->enable_local_dns && !config->disable_system_ipv6 &&
+        input->ipv6 && input->protocol == ASTERISKD_PACKET_UDP && input->destination_port_53;
+    if (input->ipv6 && !config->enable_ipv6 && !forced_ipv6_dns) return 0;
 
     enum asteriskd_packet_action normal = ASTERISKD_PACKET_NONE;
     if (input->direction == ASTERISKD_PACKET_OUTPUT) {

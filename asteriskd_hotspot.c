@@ -1,8 +1,18 @@
 // Copyright 2026, Asterisk4Magisk contributors
 // SPDX-License-Identifier: GPL-3.0
 
-#include <stdbool.h>
-#include <stddef.h>
+#include "asteriskd.h"
+
+bool asteriskd_hotspot_should_clear_android_ipv6_offload(
+    const struct asteriskd_config *config) {
+    if (config == NULL || config->hotspot_interface_prefix_count == 0U ||
+        config->mode == ASTERISKD_MODE_EBPF) return false;
+    if (config->enable_ipv6) return true;
+    if (config->mode != ASTERISKD_MODE_TPROXY &&
+        config->mode != ASTERISKD_MODE_TUN &&
+        config->mode != ASTERISKD_MODE_TUN2SOCKS) return false;
+    return config->enable_local_dns && !config->disable_system_ipv6;
+}
 
 bool asteriskd_hotspot_tc_output_has_android_offload(
     const void *output, size_t output_length) {

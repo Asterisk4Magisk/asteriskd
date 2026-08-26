@@ -58,13 +58,16 @@ static struct asteriskd_traffic_hook_group *add_hook_group(
 }
 
 static int add_jump(struct asteriskd_traffic_hook_group *group,
-    enum asteriskd_builtin_chain builtin, bool insert_at_head, const char *target) {
+    enum asteriskd_builtin_chain builtin, bool insert_at_head, bool udp53,
+    const char *target) {
     if (group == NULL || group->hook_count >= ASTERISKD_RULE_TRANSACTION_MAX_HOOKS) {
         return ASTERISKD_CONFIG_INVALID;
     }
     struct asteriskd_traffic_hook *hook = &group->hooks[group->hook_count++];
+    memset(hook, 0, sizeof(*hook));
     hook->builtin_chain = builtin;
     hook->insert_at_head = insert_at_head;
+    hook->udp_destination_port_53 = udp53;
     hook->verdict = ASTERISKD_HOOK_JUMP;
     return copy_text(hook->jump_target, sizeof(hook->jump_target), target);
 }
@@ -77,7 +80,8 @@ static int add_family(
     const char *forward,
     const char *local_begin,
     const char *local_end,
-    const char *tunnel) {
+    const char *tunnel,
+    bool dns_only) {
     struct asteriskd_private_chain_group *local = add_group(plan, family,
         ASTERISKD_IP_TABLE_MANGLE, ASTERISKD_CHAIN_LOCAL_BYPASS);
     struct asteriskd_private_chain_group *mangle = add_group(plan, family,
@@ -92,9 +96,9 @@ static int add_family(
         ASTERISKD_IP_TABLE_MANGLE);
     struct asteriskd_traffic_hook_group *filter_hooks = add_hook_group(plan, family,
         ASTERISKD_IP_TABLE_FILTER);
-    if (add_jump(mangle_hooks, ASTERISKD_BUILTIN_PREROUTING, true, prerouting) != 0 ||
-        add_jump(mangle_hooks, ASTERISKD_BUILTIN_OUTPUT, false, output) != 0 ||
-        add_jump(filter_hooks, ASTERISKD_BUILTIN_FORWARD, true, forward) != 0) {
+    if (add_jump(mangle_hooks, ASTERISKD_BUILTIN_PREROUTING, true, dns_only, prerouting) != 0 ||
+        add_jump(mangle_hooks, ASTERISKD_BUILTIN_OUTPUT, false, dns_only, output) != 0 ||
+        add_jump(filter_hooks, ASTERISKD_BUILTIN_FORWARD, true, false, forward) != 0) {
         return ASTERISKD_CONFIG_INVALID;
     }
 
@@ -134,12 +138,14 @@ int asteriskd_tun_rule_transaction_plan_build(
         config->helper.value.hev.tunnel_name;
     if (add_family(plan, ASTERISKD_IP_FAMILY_IPV4,
             "ASTERISK_TUN_PREROUTING", "ASTERISK_TUN_OUTPUT", "ASTERISK_TUN_FORWARD",
-            "ASTERISK_LOCAL4_BEGIN", "ASTERISK_LOCAL4_END", tunnel) != 0) {
+            "ASTERISK_LOCAL4_BEGIN", "ASTERISK_LOCAL4_END", tunnel, false) != 0) {
         return ASTERISKD_CONFIG_INVALID;
     }
-    if (config->enable_ipv6 && add_family(plan, ASTERISKD_IP_FAMILY_IPV6,
+    bool dns_only = !config->enable_ipv6;
+    if ((!dns_only || (config->enable_local_dns && !config->disable_system_ipv6)) &&
+        add_family(plan, ASTERISKD_IP_FAMILY_IPV6,
             "ASTERISK_TUN6_PREROUTING", "ASTERISK_TUN6_OUTPUT", "ASTERISK_TUN6_FORWARD",
-            "ASTERISK_LOCAL6_BEGIN", "ASTERISK_LOCAL6_END", tunnel) != 0) {
+            "ASTERISK_LOCAL6_BEGIN", "ASTERISK_LOCAL6_END", tunnel, dns_only) != 0) {
         return ASTERISKD_CONFIG_INVALID;
     }
     return 0;

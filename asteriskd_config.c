@@ -947,7 +947,9 @@ static int validate_cross_fields(struct asteriskd_config *config) {
     if (config->has_direct_cidr_paths && !direct_consumer) return -1;
     if (config->helper.type == ASTERISKD_HELPER_HEV_SOCKS5_TUNNEL) {
         struct asteriskd_hev_helper_config *hev = &config->helper.value.hev;
-        if (config->enable_ipv6 != hev->has_ipv6_address || (config->enable_ipv6 && hev->mtu < 1280U)) return -1;
+        bool helper_ipv6 = config->enable_ipv6 ||
+            (config->enable_local_dns && !config->disable_system_ipv6);
+        if (helper_ipv6 != hev->has_ipv6_address || (helper_ipv6 && hev->mtu < 1280U)) return -1;
     }
     if (config->mode == ASTERISKD_MODE_EBPF &&
         (config->enable_local_dns || config->enable_fake_dns || config->has_fake_dns_ipv4_pool ||

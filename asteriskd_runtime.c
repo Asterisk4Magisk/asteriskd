@@ -2948,6 +2948,7 @@ static int system_populate_tproxy_prerouting(
     const char *chain, const char *local_begin, const char *local_end) {
     const struct asteriskd_config *config = &system->loaded_config.config;
     if (config->enable_local_dns && system_append_dns_tproxy(system, family, chain) != 0) return -1;
+    if (family == ASTERISKD_IP_FAMILY_IPV6 && !config->enable_ipv6) return 0;
     if (system_append_local_bypass_interval(
             system, family, chain, local_begin, local_end) != 0) return -1;
     for (size_t prefix_remaining = config->hotspot_interface_prefix_count;
@@ -2998,6 +2999,9 @@ static int system_populate_tproxy_output(
     struct asteriskd_system_supervisor *system, enum asteriskd_ip_family family,
     const char *chain, const char *local_begin, const char *local_end) {
     const struct asteriskd_config *config = &system->loaded_config.config;
+    if (family == ASTERISKD_IP_FAMILY_IPV6 && !config->enable_ipv6) {
+        return config->enable_local_dns ? system_append_dns_mark(system, family, chain, true) : 0;
+    }
     if (system_populate_common_output_prefix(
             system, family, chain, local_begin, local_end) != 0) return -1;
     if (!config->matcher.enabled && config->app_policy_mode == ASTERISKD_APP_POLICY_BLACKLIST) {
@@ -3020,6 +3024,7 @@ static int system_populate_tun_prerouting(
     if (config->enable_local_dns && system_append_dns_mark(system, family, chain, false) != 0) {
         return -1;
     }
+    if (family == ASTERISKD_IP_FAMILY_IPV6 && !config->enable_ipv6) return 0;
     if (system_append_local_bypass_interval(
             system, family, chain, local_begin, local_end) != 0) return -1;
     for (size_t remaining = config->proxy_private_cidr_count; remaining > 0U; --remaining) {
@@ -3055,6 +3060,9 @@ static int system_populate_tun_output(
     const struct asteriskd_config *config = &system->loaded_config.config;
     const char *tunnel = config->mode == ASTERISKD_MODE_TUN
         ? config->tunnel_name : config->helper.value.hev.tunnel_name;
+    if (family == ASTERISKD_IP_FAMILY_IPV6 && !config->enable_ipv6) {
+        return config->enable_local_dns ? system_append_dns_mark(system, family, chain, true) : 0;
+    }
     if (system_populate_common_output_prefix(
             system, family, chain, local_begin, local_end) != 0) return -1;
     if (!config->matcher.enabled && config->app_policy_mode == ASTERISKD_APP_POLICY_BLACKLIST) {
@@ -3105,12 +3113,19 @@ static int system_populate_private_chain(
             const struct asteriskd_config *config = &system->loaded_config.config;
             const char *tunnel = config->mode == ASTERISKD_MODE_TUN
                 ? config->tunnel_name : config->helper.value.hev.tunnel_name;
+            bool dns_only = family == ASTERISKD_IP_FAMILY_IPV6 && !config->enable_ipv6;
             const char *input[] = {"-i", tunnel, "-j", "ACCEPT"};
             const char *output[] = {"-o", tunnel, "-j", "ACCEPT"};
+            const char *dns_input[] = {
+                "-i", tunnel, "-p", "udp", "-m", "udp", "--sport", "53", "-j", "ACCEPT",
+            };
+            const char *dns_output[] = {
+                "-o", tunnel, "-p", "udp", "-m", "udp", "--dport", "53", "-j", "ACCEPT",
+            };
             return system_xtables_zero(system, family, ASTERISKD_IP_TABLE_FILTER,
-                "-A", chain, input, 4U) == 0 &&
+                "-A", chain, dns_only ? dns_input : input, dns_only ? 10U : 4U) == 0 &&
                 system_xtables_zero(system, family, ASTERISKD_IP_TABLE_FILTER,
-                    "-A", chain, output, 4U) == 0 ? 0 : -1;
+                    "-A", chain, dns_only ? dns_output : output, dns_only ? 10U : 4U) == 0 ? 0 : -1;
         }
         return -1;
     }
@@ -5156,9 +5171,9 @@ static int system_reconcile_hotspot_tc_interface(
 
 static int system_reconcile_hotspot_tc(struct asteriskd_system_supervisor *system) {
     bool bpf2socks = system->loaded_config.config.mode == ASTERISKD_MODE_BPF2SOCKS;
-    bool android_ipv6_offload = system->loaded_config.config.enable_ipv6 &&
-        system->loaded_config.config.mode != ASTERISKD_MODE_EBPF &&
-        system->loaded_config.config.hotspot_interface_prefix_count != 0U;
+    bool android_ipv6_offload =
+        asteriskd_hotspot_should_clear_android_ipv6_offload(
+            &system->loaded_config.config);
     if (android_ipv6_offload && system_clear_android_hotspot_offload(system) != 0) return -1;
     if (!bpf2socks) return 0;
     struct ifaddrs *addresses = NULL;
