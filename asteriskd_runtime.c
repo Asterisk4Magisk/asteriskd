@@ -2741,6 +2741,16 @@ static int system_append_gid_return(struct asteriskd_system_supervisor *system,
         "-A", chain, arguments, 6U);
 }
 
+static int system_append_ipsec_udp_bypass(struct asteriskd_system_supervisor *system,
+    enum asteriskd_ip_family family, const char *chain) {
+    const char *ike_arguments[] = {"-p", "udp", "-m", "udp", "--dport", "500", "-j", "RETURN"};
+    const char *nat_t_arguments[] = {"-p", "udp", "-m", "udp", "--dport", "4500", "-j", "RETURN"};
+    return system_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE,
+            "-A", chain, ike_arguments, 8U) == 0 &&
+        system_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE,
+            "-A", chain, nat_t_arguments, 8U) == 0 ? 0 : -1;
+}
+
 static int system_append_mark(struct asteriskd_system_supervisor *system,
     enum asteriskd_ip_family family, const char *chain, const char *protocol,
     const char *uid, const char *input_interface, const char *destination,
@@ -2920,6 +2930,7 @@ static int system_populate_common_output_prefix(
     struct asteriskd_system_supervisor *system, enum asteriskd_ip_family family,
     const char *chain, const char *local_begin, const char *local_end) {
     const struct asteriskd_config *config = &system->loaded_config.config;
+    if (system_append_ipsec_udp_bypass(system, family, chain) != 0) return -1;
     for (size_t remaining = config->bypass_uid_count; remaining > 0U; --remaining) {
         if (system_append_uid_return(system, family, chain,
                 config->bypass_uids[remaining - 1U]) != 0) return -1;
@@ -2949,6 +2960,7 @@ static int system_populate_tproxy_prerouting(
     const struct asteriskd_config *config = &system->loaded_config.config;
     if (config->enable_local_dns && system_append_dns_tproxy(system, family, chain) != 0) return -1;
     if (family == ASTERISKD_IP_FAMILY_IPV6 && !config->enable_ipv6) return 0;
+    if (system_append_ipsec_udp_bypass(system, family, chain) != 0) return -1;
     if (system_append_local_bypass_interval(
             system, family, chain, local_begin, local_end) != 0) return -1;
     for (size_t prefix_remaining = config->hotspot_interface_prefix_count;
@@ -3025,6 +3037,7 @@ static int system_populate_tun_prerouting(
         return -1;
     }
     if (family == ASTERISKD_IP_FAMILY_IPV6 && !config->enable_ipv6) return 0;
+    if (system_append_ipsec_udp_bypass(system, family, chain) != 0) return -1;
     if (system_append_local_bypass_interval(
             system, family, chain, local_begin, local_end) != 0) return -1;
     for (size_t remaining = config->proxy_private_cidr_count; remaining > 0U; --remaining) {
