@@ -4749,7 +4749,6 @@ static int system_apply_ipv6_guard(
 
 static int system_apply_initial_ipv6_guard(struct asteriskd_system_supervisor *system) {
     if (!system->loaded_config.config.disable_system_ipv6) return 0;
-    if (system_apply_ipv6_guard(system, "default", 0U) != 0) return -1;
     DIR *directory = opendir("/proc/sys/net/ipv6/conf");
     if (directory == NULL) return -1;
     int result = 0;
@@ -4757,7 +4756,8 @@ static int system_apply_initial_ipv6_guard(struct asteriskd_system_supervisor *s
     while ((entry = readdir(directory)) != NULL) {
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0 ||
             strcmp(entry->d_name, "all") == 0 || strcmp(entry->d_name, "default") == 0 ||
-            strcmp(entry->d_name, "lo") == 0) continue;
+            strcmp(entry->d_name, "lo") == 0 ||
+            asteriskd_interface_matches_selector(entry->d_name, "ipsec+")) continue;
         unsigned index = if_nametoindex(entry->d_name);
         if (index == 0U || system_apply_ipv6_guard(system, entry->d_name, index) != 0) {
             result = -1;

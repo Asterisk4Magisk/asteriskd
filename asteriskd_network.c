@@ -203,7 +203,9 @@ static bool tracked_interface(const struct asteriskd_config *config, const char 
 }
 
 static bool security_interface(const char *name) {
-    return strcmp(name, "all") != 0 && strcmp(name, "default") != 0 && strcmp(name, "lo") != 0;
+    return strcmp(name, "all") != 0 && strcmp(name, "default") != 0 &&
+        strcmp(name, "lo") != 0 &&
+        !asteriskd_interface_matches_selector(name, "ipsec+");
 }
 
 static bool immediate_request_same(
@@ -377,10 +379,8 @@ static int record_link_message(
     if (!interface_name_valid(interface_name)) return -1;
     if (message_type == ASTERISKD_RTM_NEWLINK && runtime->config->disable_system_ipv6 &&
         security_interface(interface_name)) {
-        int security = enforce_ipv6_security(runtime, "default", 0U);
-        if (security == 0) {
-            security = enforce_ipv6_security(runtime, interface_name, (uint32_t)signed_index);
-        }
+        int security = enforce_ipv6_security(
+            runtime, interface_name, (uint32_t)signed_index);
         if (security != 0) return ASTERISKD_CONFIG_IO;
     }
     if (!runtime->config->disable_system_ipv6 &&
