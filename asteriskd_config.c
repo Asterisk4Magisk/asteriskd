@@ -1265,7 +1265,7 @@ static int open_parent_walk(const char *path, int *parent_fd, char *leaf) {
         char name[ASTERISKD_MAX_PATH];
         memcpy(name, component, length);
         name[length] = '\0';
-        int next = openat(current, name, O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        int next = openat(current, name, O_PATH | O_DIRECTORY | O_CLOEXEC);
         if (next < 0) {
             result = path_open_error(errno, ASTERISKD_CONFIG_INVALID);
             break;
@@ -1300,7 +1300,7 @@ static int open_verified_absolute(
     }
     int probe_fd = -1;
     if (result == 0) {
-        probe_fd = openat(parent_fd, leaf, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+        probe_fd = openat(parent_fd, leaf, O_PATH | O_CLOEXEC);
         if (probe_fd < 0) {
             int saved = errno;
             if (allow_missing && saved == ENOENT) {
@@ -1317,7 +1317,7 @@ static int open_verified_absolute(
     }
     int access_fd = -1;
     if (result == 0) {
-        int flags = access_flags | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC;
+        int flags = access_flags | O_NONBLOCK | O_CLOEXEC;
         if (expected == ASTERISKD_FILE_DIRECTORY) flags |= O_DIRECTORY;
         access_fd = openat(parent_fd, leaf, flags);
         if (access_fd < 0) result = path_open_error(errno, missing_result);
@@ -1350,13 +1350,13 @@ static int open_verified_child(
     int missing_result,
     int *out,
     struct stat *out_status) {
-    int probe_fd = openat(directory_fd, name, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    int probe_fd = openat(directory_fd, name, O_PATH | O_CLOEXEC);
     if (probe_fd < 0) return path_open_error(errno, missing_result);
     struct stat probed;
     int result = checked_stat(probe_fd, expected, readable, writable, executable, &probed);
     int access_fd = -1;
     if (result == 0) {
-        access_fd = openat(directory_fd, name, access_flags | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+        access_fd = openat(directory_fd, name, access_flags | O_NONBLOCK | O_CLOEXEC);
         if (access_fd < 0) result = path_open_error(errno, missing_result);
     }
     struct stat accessed;

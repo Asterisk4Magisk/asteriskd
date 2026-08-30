@@ -23,8 +23,6 @@
 #include <unistd.h>
 #endif
 
-#define STATE_TEMP_ATTEMPTS 32U
-
 static const char *const phase_names[] = {
     "validating", "acquiring", "starting", "applying-rules",
     "running", "stopping", "stopped", "failed",
@@ -558,6 +556,7 @@ static int system_openat(
     if ((flags & ASTERISKD_STATE_OPEN_NOFOLLOW) != 0U) system_flags |= O_NOFOLLOW;
     if ((flags & ASTERISKD_STATE_OPEN_CLOEXEC) != 0U) system_flags |= O_CLOEXEC;
     if ((flags & ASTERISKD_STATE_OPEN_NONBLOCK) != 0U) system_flags |= O_NONBLOCK;
+    if ((flags & ASTERISKD_STATE_OPEN_TRUNCATE) != 0U) system_flags |= O_TRUNC;
     *out = openat(directory_fd, name, system_flags, (mode_t)mode);
     return *out >= 0 ? 0 : -1;
 }
@@ -572,29 +571,9 @@ static ptrdiff_t system_write(void *context, int fd, const void *bytes, size_t l
     return (ptrdiff_t)write(fd, bytes, length);
 }
 
-static int system_fsync(void *context, int fd) {
-    (void)context;
-    return fsync(fd);
-}
-
 static int system_close(void *context, int fd) {
     (void)context;
     return close(fd);
-}
-
-static int system_renameat(
-    void *context,
-    int old_directory_fd,
-    const char *old_name,
-    int new_directory_fd,
-    const char *new_name) {
-    (void)context;
-    return renameat(old_directory_fd, old_name, new_directory_fd, new_name);
-}
-
-static int system_unlinkat(void *context, int directory_fd, const char *name) {
-    (void)context;
-    return unlinkat(directory_fd, name, 0);
 }
 
 static const struct asteriskd_state_file_backend system_state_backend = {
@@ -603,18 +582,14 @@ static const struct asteriskd_state_file_backend system_state_backend = {
     .openat_fd = system_openat,
     .read_fd = system_read,
     .write_fd = system_write,
-    .fsync_fd = system_fsync,
     .close_fd = system_close,
-    .renameat_fd = system_renameat,
-    .unlinkat_fd = system_unlinkat,
 };
 #endif
 
 static bool file_backend_complete(const struct asteriskd_state_file_backend *backend) {
     return backend != NULL && backend->fstat_fd != NULL && backend->dup_cloexec != NULL &&
         backend->openat_fd != NULL && backend->read_fd != NULL && backend->write_fd != NULL &&
-        backend->fsync_fd != NULL && backend->close_fd != NULL && backend->renameat_fd != NULL &&
-        backend->unlinkat_fd != NULL;
+        backend->close_fd != NULL;
 }
 
 int asteriskd_state_store_init_with_backend(
@@ -672,7 +647,6 @@ int asteriskd_state_store_init_with_backend(
     store->directory_inode = source_inode;
     store->backend = backend;
     store->backend_context = context;
-    store->temporary_sequence = 1U;
     store->initialized = true;
     set_error(error, error_size, "ok");
     return ASTERISKD_STATE_OK;
@@ -750,10 +724,6 @@ int asteriskd_state_store_save(
     char *error,
     size_t error_size) {
     if (store == NULL || !store->initialized) return ASTERISKD_STATE_INVALID;
-    if (store->write_blocked) {
-        set_error(error, error_size, "state evidence is write-blocked");
-        return ASTERISKD_STATE_WRITE_BLOCKED;
-    }
     char *json = NULL;
     size_t length = 0U;
     int result = asteriskd_state_serialize(state, &json, &length, error, error_size);
@@ -763,70 +733,30 @@ int asteriskd_state_store_save(
         free(json);
         return result;
     }
-    char temporary[96];
     int fd = -1;
-    bool temp_exists = false;
     uint32_t flags = ASTERISKD_STATE_OPEN_WRITE | ASTERISKD_STATE_OPEN_CREATE |
-        ASTERISKD_STATE_OPEN_EXCLUSIVE | ASTERISKD_STATE_OPEN_NOFOLLOW |
-        ASTERISKD_STATE_OPEN_CLOEXEC;
-    for (size_t attempt = 0U; attempt < STATE_TEMP_ATTEMPTS; ++attempt) {
-        uint64_t sequence = store->temporary_sequence++;
-        int count = snprintf(temporary, sizeof(temporary), ".asteriskd.state.tmp.%016" PRIx64, sequence);
-        if (count < 0 || (size_t)count >= sizeof(temporary)) {
-            result = ASTERISKD_STATE_INVALID;
-            break;
-        }
-        errno = 0;
-        int create_result = store->backend->openat_fd(
-                store->backend_context, store->directory_fd, temporary,
-                flags, 0600U, &fd);
-        int create_error = errno;
-        if (create_result == 0 && fd >= 0) {
-            temp_exists = true;
-            result = ASTERISKD_STATE_OK;
-            break;
-        }
-        if (fd >= 0) {
-            (void)store->backend->close_fd(store->backend_context, fd);
-            (void)store->backend->unlinkat_fd(
-                store->backend_context, store->directory_fd, temporary);
-        }
-        fd = -1;
-        if (create_result == 0 || create_error != EEXIST) {
-            result = ASTERISKD_STATE_IO;
-            break;
-        }
-        result = ASTERISKD_STATE_IO;
-    }
-    if (!temp_exists) {
+        ASTERISKD_STATE_OPEN_TRUNCATE | ASTERISKD_STATE_OPEN_CLOEXEC;
+    if (store->backend->openat_fd(
+            store->backend_context, store->directory_fd, ASTERISKD_STATE_LEAF,
+            flags, 0600U, &fd) != 0 || fd < 0) {
+        if (fd >= 0) (void)store->backend->close_fd(store->backend_context, fd);
         free(json);
-        set_error(error, error_size, "create state temp failed");
-        return result;
+        set_error(error, error_size, "open state failed");
+        return ASTERISKD_STATE_IO;
     }
-    result = write_all(store, fd, json, length);
-    if (result == ASTERISKD_STATE_OK &&
-        store->backend->fsync_fd(store->backend_context, fd) != 0) result = ASTERISKD_STATE_IO;
+    uint64_t device, inode;
+    enum asteriskd_file_kind kind;
+    if (store->backend->fstat_fd(
+            store->backend_context, fd, &device, &inode, &kind) != 0 ||
+        kind != ASTERISKD_FILE_REGULAR) {
+        result = ASTERISKD_STATE_IO;
+    } else {
+        result = write_all(store, fd, json, length);
+    }
     if (store->backend->close_fd(store->backend_context, fd) != 0 && result == ASTERISKD_STATE_OK) {
         result = ASTERISKD_STATE_IO;
     }
-    fd = -1;
-    if (result == ASTERISKD_STATE_OK) {
-        if (store->backend->renameat_fd(
-                store->backend_context, store->directory_fd, temporary,
-                store->directory_fd, ASTERISKD_STATE_LEAF) != 0) {
-            result = ASTERISKD_STATE_IO;
-        } else {
-            temp_exists = false;
-            if (store->backend->fsync_fd(store->backend_context, store->directory_fd) != 0) {
-                result = ASTERISKD_STATE_IO;
-                store->write_blocked = true;
-            }
-        }
-    }
-    if (temp_exists) {
-        (void)store->backend->unlinkat_fd(store->backend_context, store->directory_fd, temporary);
-    }
     free(json);
-    set_error(error, error_size, result == ASTERISKD_STATE_OK ? "ok" : "atomic state save failed");
+    set_error(error, error_size, result == ASTERISKD_STATE_OK ? "ok" : "state save failed");
     return result;
 }

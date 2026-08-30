@@ -1734,6 +1734,7 @@ enum asteriskd_state_open_flags {
     ASTERISKD_STATE_OPEN_NOFOLLOW = 1U << 4,
     ASTERISKD_STATE_OPEN_CLOEXEC = 1U << 5,
     ASTERISKD_STATE_OPEN_NONBLOCK = 1U << 6,
+    ASTERISKD_STATE_OPEN_TRUNCATE = 1U << 7,
 };
 
 struct asteriskd_state_file_backend {
@@ -1742,10 +1743,7 @@ struct asteriskd_state_file_backend {
     int (*openat_fd)(void *, int, const char *, uint32_t, uint32_t, int *);
     ptrdiff_t (*read_fd)(void *, int, void *, size_t);
     ptrdiff_t (*write_fd)(void *, int, const void *, size_t);
-    int (*fsync_fd)(void *, int);
     int (*close_fd)(void *, int);
-    int (*renameat_fd)(void *, int, const char *, int, const char *);
-    int (*unlinkat_fd)(void *, int, const char *);
 };
 
 struct asteriskd_state_store {
@@ -1755,9 +1753,7 @@ struct asteriskd_state_store {
     uint64_t directory_inode;
     const struct asteriskd_state_file_backend *backend;
     void *backend_context;
-    uint64_t temporary_sequence;
     bool initialized;
-    bool write_blocked;
 };
 
 enum asteriskd_pin_batch_kind {

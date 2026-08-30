@@ -314,8 +314,7 @@ static const struct asteriskd_clock_backend system_clock_backend = {
 
 static int system_log_open_root(void *context, uint32_t flags, int *fd) {
     (void)context;
-    uint32_t required = ASTERISKD_LOG_OPEN_DIRECTORY | ASTERISKD_LOG_OPEN_NOFOLLOW |
-        ASTERISKD_LOG_OPEN_CLOEXEC;
+    uint32_t required = ASTERISKD_LOG_OPEN_DIRECTORY | ASTERISKD_LOG_OPEN_CLOEXEC;
     if (flags != required || fd == NULL) {
         errno = EINVAL;
         return -1;
@@ -338,18 +337,16 @@ static int system_log_openat(
         errno = EINVAL;
         return -1;
     }
-    uint32_t directory_flags = ASTERISKD_LOG_OPEN_DIRECTORY | ASTERISKD_LOG_OPEN_NOFOLLOW |
-        ASTERISKD_LOG_OPEN_CLOEXEC;
+    uint32_t directory_flags = ASTERISKD_LOG_OPEN_DIRECTORY | ASTERISKD_LOG_OPEN_CLOEXEC;
     uint32_t file_flags = ASTERISKD_LOG_OPEN_APPEND | ASTERISKD_LOG_OPEN_CREATE |
-        ASTERISKD_LOG_OPEN_NONBLOCK | ASTERISKD_LOG_OPEN_NOFOLLOW |
-        ASTERISKD_LOG_OPEN_CLOEXEC;
+        ASTERISKD_LOG_OPEN_NONBLOCK | ASTERISKD_LOG_OPEN_CLOEXEC;
     int opened;
     if (flags == directory_flags && mode == 0U) {
-        opened = openat(parent_fd, name, O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        opened = openat(parent_fd, name, O_PATH | O_DIRECTORY | O_CLOEXEC);
     } else if (flags == file_flags && mode == 0600U) {
         opened = openat(
             parent_fd, name,
-            O_WRONLY | O_APPEND | O_CREAT | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC,
+            O_WRONLY | O_APPEND | O_CREAT | O_NONBLOCK | O_CLOEXEC,
             0600);
     } else {
         errno = EINVAL;
@@ -429,15 +426,14 @@ static bool lexical_log_path_valid(const char *path) {
     return false;
 }
 
-static int open_log_no_follow(
+static int open_log_path(
     const char *path,
     const struct asteriskd_log_file_backend *backend,
     void *context,
     int *out,
     int *parent_out,
     struct asteriskd_log_file_metadata *parent_metadata_out) {
-    uint32_t directory_flags = ASTERISKD_LOG_OPEN_DIRECTORY | ASTERISKD_LOG_OPEN_NOFOLLOW |
-        ASTERISKD_LOG_OPEN_CLOEXEC;
+    uint32_t directory_flags = ASTERISKD_LOG_OPEN_DIRECTORY | ASTERISKD_LOG_OPEN_CLOEXEC;
     int current = -1;
     int open_result = backend->open_root(context, directory_flags, &current);
     if (open_result != 0 || current < 0) {
@@ -460,8 +456,7 @@ static int open_log_no_follow(
         int next = -1;
         uint32_t flags = slash == NULL ?
             (ASTERISKD_LOG_OPEN_APPEND | ASTERISKD_LOG_OPEN_CREATE |
-             ASTERISKD_LOG_OPEN_NONBLOCK | ASTERISKD_LOG_OPEN_NOFOLLOW |
-             ASTERISKD_LOG_OPEN_CLOEXEC) : directory_flags;
+             ASTERISKD_LOG_OPEN_NONBLOCK | ASTERISKD_LOG_OPEN_CLOEXEC) : directory_flags;
         uint32_t mode = slash == NULL ? 0600U : 0U;
         open_result = backend->openat_fd(context, current, name, flags, mode, &next);
         if (open_result != 0 || next < 0) {
@@ -532,7 +527,7 @@ int asteriskd_log_open_append_fd_with_backend(
     int parent_fd = -1;
     struct asteriskd_log_file_metadata parent_metadata;
     memset(&parent_metadata, 0, sizeof(parent_metadata));
-    if (open_log_no_follow(path, file_backend, file_context, &fd, &parent_fd,
+    if (open_log_path(path, file_backend, file_context, &fd, &parent_fd,
             &parent_metadata) != ASTERISKD_LOG_OK) {
         set_error(error, error_size, "open append log failed");
         return ASTERISKD_LOG_IO;
@@ -589,7 +584,7 @@ int asteriskd_log_open_with_backend(
     int parent_fd = -1;
     struct asteriskd_log_file_metadata parent_metadata;
     memset(&parent_metadata, 0, sizeof(parent_metadata));
-    if (open_log_no_follow(
+    if (open_log_path(
             path, file_backend, file_context, &fd, &parent_fd,
             &parent_metadata) != ASTERISKD_LOG_OK) {
         set_error(error, error_size, "open structured log failed");
