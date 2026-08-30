@@ -5065,35 +5065,62 @@ static bool system_hotspot_interface_selected(
 }
 
 static int system_clear_android_hotspot_offload_interface(
-    struct asteriskd_system_supervisor *system, const char *name) {
+    struct asteriskd_system_supervisor *system, const char *name, const char *priority) {
     const char *show[] = {
-        "filter", "show", "dev", name, "ingress", "protocol", "ipv6",
+        "filter", "show", "dev", name, "ingress", "protocol", "ipv6", "pref", priority,
     };
     int exit_status = -1;
-    if (system_tc_command(system, show, 7U, true, &exit_status) != 0 ||
+    if (system_tc_command(system, show, 9U, true, &exit_status) != 0 ||
         exit_status != 0 || system->action_stdout_overflow) return -1;
     if (!asteriskd_hotspot_tc_output_has_android_offload(
             system->action_stdout, system->action_stdout_length)) return 0;
     const char *remove[] = {
-        "filter", "del", "dev", name, "ingress", "protocol", "ipv6", "pref", "2",
+        "filter", "del", "dev", name, "ingress", "protocol", "ipv6", "pref", priority,
     };
     return system_tc_zero(system, remove, 9U);
 }
 
+static void system_log_optional_hotspot_offload_cleanup_failure(
+    struct asteriskd_system_supervisor *system, const char *name, const char *priority) {
+    char message[192U];
+    int written = snprintf(message, sizeof(message),
+        "optional Android IPv6 tethering offload cleanup failed%s%s%s%s; continuing",
+        name != NULL ? " for " : "", name != NULL ? name : "",
+        priority != NULL ? " pref " : "", priority != NULL ? priority : "");
+    if (written > 0 && (size_t)written < sizeof(message)) {
+        (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_WARNING,
+            ASTERISKD_COMPONENT_RUNTIME, ASTERISKD_LOG_EVENT_CAPABILITY_ADJUSTED, message);
+    }
+}
+
 static int system_clear_android_hotspot_offload(
-    struct asteriskd_system_supervisor *system) {
+    struct asteriskd_system_supervisor *system,
+    enum asteriskd_hotspot_ipv6_offload_policy policy) {
+    bool required = policy == ASTERISKD_HOTSPOT_IPV6_OFFLOAD_REMOVE_PREF1_REQUIRED;
+    static const char *const priorities[] = {"1", "2"};
+    size_t priority_count = required ? 1U : 2U;
     DIR *directory = opendir("/sys/class/net");
-    if (directory == NULL) return -1;
+    if (directory == NULL) {
+        if (!required) system_log_optional_hotspot_offload_cleanup_failure(
+            system, NULL, NULL);
+        return required ? -1 : 0;
+    }
     int result = 0;
     struct dirent *entry;
     while ((entry = readdir(directory)) != NULL) {
         if (!system_hotspot_interface_selected(
                 &system->loaded_config.config, entry->d_name)) continue;
-        if (system_clear_android_hotspot_offload_interface(
-                system, entry->d_name) != 0) {
-            result = -1;
-            break;
+        for (size_t priority = 0U; priority < priority_count; ++priority) {
+            if (system_clear_android_hotspot_offload_interface(
+                    system, entry->d_name, priorities[priority]) == 0) continue;
+            if (required) {
+                result = -1;
+                break;
+            }
+            system_log_optional_hotspot_offload_cleanup_failure(
+                system, entry->d_name, priorities[priority]);
         }
+        if (result != 0) break;
     }
     (void)closedir(directory);
     return result;
@@ -5184,10 +5211,10 @@ static int system_reconcile_hotspot_tc_interface(
 
 static int system_reconcile_hotspot_tc(struct asteriskd_system_supervisor *system) {
     bool bpf2socks = system->loaded_config.config.mode == ASTERISKD_MODE_BPF2SOCKS;
-    bool android_ipv6_offload =
-        asteriskd_hotspot_should_clear_android_ipv6_offload(
-            &system->loaded_config.config);
-    if (android_ipv6_offload && system_clear_android_hotspot_offload(system) != 0) return -1;
+    enum asteriskd_hotspot_ipv6_offload_policy offload_policy =
+        asteriskd_hotspot_ipv6_offload_policy_for(&system->loaded_config.config);
+    if (offload_policy != ASTERISKD_HOTSPOT_IPV6_OFFLOAD_KEEP &&
+        system_clear_android_hotspot_offload(system, offload_policy) != 0) return -1;
     if (!bpf2socks) return 0;
     struct ifaddrs *addresses = NULL;
     if (getifaddrs(&addresses) != 0) return -1;

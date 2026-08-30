@@ -3,15 +3,19 @@
 
 #include "asteriskd.h"
 
-bool asteriskd_hotspot_should_clear_android_ipv6_offload(
+enum asteriskd_hotspot_ipv6_offload_policy asteriskd_hotspot_ipv6_offload_policy_for(
     const struct asteriskd_config *config) {
     if (config == NULL || config->hotspot_interface_prefix_count == 0U ||
-        config->mode == ASTERISKD_MODE_EBPF) return false;
-    if (config->enable_ipv6) return true;
-    if (config->mode != ASTERISKD_MODE_TPROXY &&
-        config->mode != ASTERISKD_MODE_TUN &&
-        config->mode != ASTERISKD_MODE_TUN2SOCKS) return false;
-    return config->enable_local_dns && !config->disable_system_ipv6;
+        config->mode == ASTERISKD_MODE_EBPF) return ASTERISKD_HOTSPOT_IPV6_OFFLOAD_KEEP;
+    if (config->mode == ASTERISKD_MODE_BPF2SOCKS) {
+        return ASTERISKD_HOTSPOT_IPV6_OFFLOAD_REMOVE_PREF1_REQUIRED;
+    }
+    if (config->mode == ASTERISKD_MODE_TPROXY ||
+        config->mode == ASTERISKD_MODE_TUN ||
+        config->mode == ASTERISKD_MODE_TUN2SOCKS) {
+        return ASTERISKD_HOTSPOT_IPV6_OFFLOAD_REMOVE_PREF1_PREF2_BEST_EFFORT;
+    }
+    return ASTERISKD_HOTSPOT_IPV6_OFFLOAD_KEEP;
 }
 
 bool asteriskd_hotspot_tc_output_has_android_offload(

@@ -2571,8 +2571,14 @@ const struct asteriskd_network_backend *asteriskd_system_network_backend(void);
 #define ASTERISKD_ETH_PROTOCOL_IPV6 UINT32_C(0x86dd)
 #define ASTERISKD_ETH_PROTOCOL_ALL UINT32_C(0x0003)
 
+enum asteriskd_hotspot_ipv6_offload_policy {
+    ASTERISKD_HOTSPOT_IPV6_OFFLOAD_KEEP,
+    ASTERISKD_HOTSPOT_IPV6_OFFLOAD_REMOVE_PREF1_REQUIRED,
+    ASTERISKD_HOTSPOT_IPV6_OFFLOAD_REMOVE_PREF1_PREF2_BEST_EFFORT,
+};
+
 bool asteriskd_hotspot_tc_output_has_android_offload(const void *, size_t);
-bool asteriskd_hotspot_should_clear_android_ipv6_offload(
+enum asteriskd_hotspot_ipv6_offload_policy asteriskd_hotspot_ipv6_offload_policy_for(
     const struct asteriskd_config *);
 
 enum asteriskd_tc_slot_state {
