@@ -871,8 +871,13 @@ static int system_action_post_setup(
     return 1;
 }
 
-#define ASTERISKD_ACTION_IDENTITY_RETRY_ATTEMPTS 10U
-#define ASTERISKD_ACTION_IDENTITY_RETRY_NANOSECONDS 1000000L
+#define ASTERISKD_ACTION_IDENTITY_RETRY_MILLISECONDS 10U
+
+static bool system_action_identity_wait_can_retry(
+    bool cancelled, int64_t now_milliseconds, int64_t deadline_milliseconds) {
+    return !cancelled && now_milliseconds >= 0 && deadline_milliseconds >= 0 &&
+        now_milliseconds < deadline_milliseconds;
+}
 
 static int system_action_post_identity(
     int identity_result, int reap_result,
@@ -905,6 +910,12 @@ static bool system_action_io_drained_state(
 }
 
 #if defined(ASTERISKD_TESTING)
+bool asteriskd_test_action_identity_wait_can_retry(
+    bool cancelled, int64_t now_milliseconds, int64_t deadline_milliseconds) {
+    return system_action_identity_wait_can_retry(
+        cancelled, now_milliseconds, deadline_milliseconds);
+}
+
 int asteriskd_test_action_post_setup(
     const struct asteriskd_child_setup_stream *setup,
     bool reaped,
@@ -2204,24 +2215,29 @@ static int system_action_run_spec(struct asteriskd_system_supervisor *system,
             system->action_process.pid, ASTERISKD_CHILD_HELPER,
             ASTERISKD_CHILD_TYPE_BPF2SOCKS, spec, &system->action_identity,
             error, sizeof(error));
-    for (unsigned int attempt = 0U; identity_result != 0; ++attempt) {
+    while (identity_result != 0) {
         int post_identity = system_action_post_identity(
             identity_result, system_action_reap_now(system), &system->action_setup,
             system->action_reaped, &system->action_exit, &completed_exit);
         if (post_identity > 0) goto early_exit;
         if (post_identity != ASTERISKD_CONFIG_NOT_READY ||
-            attempt + 1U >= ASTERISKD_ACTION_IDENTITY_RETRY_ATTEMPTS) goto failed;
-#if defined(__linux__) || defined(__ANDROID__)
-        struct timespec retry_delay = {
-            .tv_sec = 0,
-            .tv_nsec = ASTERISKD_ACTION_IDENTITY_RETRY_NANOSECONDS,
+            system_runtime_clock(system, &now) != 0 ||
+            !system_action_identity_wait_can_retry(
+                action_should_cancel(atomic_load_explicit(
+                    &system->runtime->lifecycle.stop_was_requested,
+                    memory_order_acquire), system->cleanup_in_progress),
+                now, setup_deadline.monotonic_milliseconds)) goto failed;
+        struct asteriskd_deadline retry_deadline = {
+            .armed = true,
         };
-        while (nanosleep(&retry_delay, &retry_delay) != 0) {
-            if (errno != EINTR) goto failed;
-        }
-#else
-        goto failed;
-#endif
+        if (runtime_periodic_deadline(
+                now, setup_deadline.monotonic_milliseconds,
+                ASTERISKD_ACTION_IDENTITY_RETRY_MILLISECONDS,
+                &retry_deadline.monotonic_milliseconds) != 0) goto failed;
+        struct asteriskd_runtime_delta delta;
+        if (asteriskd_runtime_pump_once(
+                system->runtime, &retry_deadline, &delta) != 0 ||
+            system_accept_pump_delta(system, &delta) != 0) goto failed;
         identity_result = asteriskd_process_identity_read(
             asteriskd_system_process_identity_backend(),
             system->action_process.pid, ASTERISKD_CHILD_HELPER,

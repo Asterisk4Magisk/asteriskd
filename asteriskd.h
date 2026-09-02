@@ -1023,6 +1023,7 @@ void asteriskd_child_setup_stream_init(struct asteriskd_child_setup_stream *);
 int asteriskd_child_setup_stream_feed(
     struct asteriskd_child_setup_stream *, const void *, size_t, bool);
 #if defined(ASTERISKD_TESTING)
+bool asteriskd_test_action_identity_wait_can_retry(bool, int64_t, int64_t);
 int asteriskd_test_action_post_setup(
     const struct asteriskd_child_setup_stream *, bool,
     const struct asteriskd_child_exit_status *, int *);
