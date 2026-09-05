@@ -410,7 +410,7 @@ static int runtime_commit_rules(struct asteriskd_runtime *runtime, bool active,
     if (asteriskd_state_set_rules(
             runtime->state, active, generation, categories) != ASTERISKD_STATE_OK ||
         runtime_save(runtime) != 0) return ASTERISKD_CONFIG_IO;
-    if (publish && active && runtime->config->mode != ASTERISKD_MODE_EBPF) {
+    if (publish && active && !asteriskd_mode_core_managed(runtime->config->mode)) {
         return runtime_publish_event(runtime, ASTERISKD_CONTROL_EVENT_RULES_CHANGED);
     }
     return 0;
@@ -797,7 +797,7 @@ int asteriskd_runtime_supervise(struct asteriskd_runtime *runtime,
         .has_matcher = config->matcher.enabled,
         .requires_platform_capability = config->matcher.enabled ||
             config->helper.type == ASTERISKD_HELPER_BPF2SOCKS,
-        .standalone_ebpf = config->mode == ASTERISKD_MODE_EBPF,
+        .core_managed_traffic = asteriskd_mode_core_managed(config->mode),
     };
     int started = asteriskd_lifecycle_start(
         &runtime->lifecycle, &runtime_lifecycle_backend, runtime, &options);
@@ -3087,8 +3087,7 @@ static int system_populate_tun_output(
     struct asteriskd_system_supervisor *system, enum asteriskd_ip_family family,
     const char *chain, const char *local_begin, const char *local_end) {
     const struct asteriskd_config *config = &system->loaded_config.config;
-    const char *tunnel = config->mode == ASTERISKD_MODE_TUN
-        ? config->tunnel_name : config->helper.value.hev.tunnel_name;
+    const char *tunnel = config->helper.value.hev.tunnel_name;
     if (family == ASTERISKD_IP_FAMILY_IPV6 && !config->enable_ipv6) {
         return config->enable_local_dns ? system_append_dns_mark(system, family, chain, true) : 0;
     }
@@ -3140,8 +3139,7 @@ static int system_populate_private_chain(
         }
         if (strstr(chain, "FORWARD") != NULL) {
             const struct asteriskd_config *config = &system->loaded_config.config;
-            const char *tunnel = config->mode == ASTERISKD_MODE_TUN
-                ? config->tunnel_name : config->helper.value.hev.tunnel_name;
+            const char *tunnel = config->helper.value.hev.tunnel_name;
             bool dns_only = family == ASTERISKD_IP_FAMILY_IPV6 && !config->enable_ipv6;
             const char *input[] = {"-i", tunnel, "-j", "ACCEPT"};
             const char *output[] = {"-o", tunnel, "-j", "ACCEPT"};
@@ -4905,7 +4903,7 @@ static int system_collect_local_address_set(
 static bool system_uses_iptables_local_bypass(
     const struct asteriskd_system_supervisor *system) {
     enum asteriskd_mode mode = system->loaded_config.config.mode;
-    return mode == ASTERISKD_MODE_TPROXY || mode == ASTERISKD_MODE_TUN ||
+    return mode == ASTERISKD_MODE_TPROXY ||
         mode == ASTERISKD_MODE_TUN2SOCKS;
 }
 
@@ -5269,8 +5267,7 @@ static uint32_t system_rule_categories(const struct asteriskd_config *config) {
         categories |= ASTERISKD_RULE_CATEGORY_BIT(ASTERISKD_RULE_CATEGORY_TPROXY) |
             ASTERISKD_RULE_CATEGORY_BIT(ASTERISKD_RULE_CATEGORY_ROUTING) |
             ASTERISKD_RULE_CATEGORY_BIT(ASTERISKD_RULE_CATEGORY_LOCAL_BYPASS);
-    } else if (config->mode == ASTERISKD_MODE_TUN ||
-        config->mode == ASTERISKD_MODE_TUN2SOCKS) {
+    } else if (config->mode == ASTERISKD_MODE_TUN2SOCKS) {
         categories |= ASTERISKD_RULE_CATEGORY_BIT(ASTERISKD_RULE_CATEGORY_ROUTING) |
             ASTERISKD_RULE_CATEGORY_BIT(ASTERISKD_RULE_CATEGORY_LOCAL_BYPASS);
     } else if (config->mode == ASTERISKD_MODE_BPF2SOCKS) {
@@ -5874,7 +5871,7 @@ static int system_effect_rules(void *opaque, bool *active,
         return -1;
     }
     system->rules_verified = true;
-    if (system->loaded_config.config.mode == ASTERISKD_MODE_EBPF) {
+    if (asteriskd_mode_core_managed(system->loaded_config.config.mode)) {
         *active = false;
         *generation = 0U;
         *categories = 0U;
@@ -5929,7 +5926,7 @@ static int system_effect_reconcile(void *opaque, bool *active,
         return -1;
     }
     system->rules_verified = true;
-    if (system->loaded_config.config.mode == ASTERISKD_MODE_EBPF) {
+    if (asteriskd_mode_core_managed(system->loaded_config.config.mode)) {
         *active = false;
         *generation = 0U;
         *categories = 0U;
@@ -6044,7 +6041,7 @@ static int system_effect_stop_core(void *opaque) {
 static int system_effect_quiesce(void *opaque) {
     struct asteriskd_system_supervisor *system = opaque;
     system->cleanup_in_progress = true;
-    if (system->loaded_config.config.mode == ASTERISKD_MODE_EBPF) {
+    if (asteriskd_mode_core_managed(system->loaded_config.config.mode)) {
         return system_effect_stop_core(opaque);
     }
     if (!system->rules_initialized) return 0;
@@ -6098,7 +6095,7 @@ failed:
 static int system_effect_remove_rules(void *opaque) {
     struct asteriskd_system_supervisor *system = opaque;
     system->cleanup_in_progress = true;
-    if (system->loaded_config.config.mode == ASTERISKD_MODE_EBPF) return 0;
+    if (asteriskd_mode_core_managed(system->loaded_config.config.mode)) return 0;
     if (!system->rules_initialized || asteriskd_rules_remove(
             &system->rules_runtime, &system->rules_backend) != 0) return -1;
     if (asteriskd_runtime_remove_tc_before_helper_stop(

@@ -131,11 +131,10 @@ int asteriskd_tun_rule_transaction_plan_build(
     const struct asteriskd_config *config,
     struct asteriskd_rule_transaction_plan *plan) {
     if (config == NULL || plan == NULL ||
-        (config->mode != ASTERISKD_MODE_TUN && config->mode != ASTERISKD_MODE_TUN2SOCKS)) {
+        config->mode != ASTERISKD_MODE_TUN2SOCKS) {
         return ASTERISKD_CONFIG_INVALID;
     }
-    const char *tunnel = config->mode == ASTERISKD_MODE_TUN ? config->tunnel_name :
-        config->helper.value.hev.tunnel_name;
+    const char *tunnel = config->helper.value.hev.tunnel_name;
     if (add_family(plan, ASTERISKD_IP_FAMILY_IPV4,
             "ASTERISK_TUN_PREROUTING", "ASTERISK_TUN_OUTPUT", "ASTERISK_TUN_FORWARD",
             "ASTERISK_LOCAL4_BEGIN", "ASTERISK_LOCAL4_END", tunnel, false) != 0) {

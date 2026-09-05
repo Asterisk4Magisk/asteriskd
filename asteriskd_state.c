@@ -132,7 +132,7 @@ static bool document_valid(const struct asteriskd_state_document *document) {
         !failure_valid(&document->failure) ||
         (document->matcher.active && !document->matcher.configured) ||
         (document->matcher.configured &&
-         document->mode != ASTERISKD_MODE_TPROXY && document->mode != ASTERISKD_MODE_TUN &&
+         document->mode != ASTERISKD_MODE_TPROXY &&
          document->mode != ASTERISKD_MODE_TUN2SOCKS) ||
         (document->rules.categories & ~ASTERISKD_RULE_CATEGORY_ALL) != 0U) return false;
     if (document->children.core_present &&
@@ -147,14 +147,14 @@ static bool document_valid(const struct asteriskd_state_document *document) {
     if (document->phase == ASTERISKD_PHASE_RUNNING && !document->children.core_present) return false;
     if (document->phase == ASTERISKD_PHASE_RUNNING &&
         (document->failure.present ||
-         (document->mode != ASTERISKD_MODE_EBPF && !document->rules.active) ||
+         (!asteriskd_mode_core_managed(document->mode) && !document->rules.active) ||
          (document->matcher.configured && !document->matcher.active))) return false;
     if (document->phase == ASTERISKD_PHASE_FAILED && !document->failure.present) return false;
     if (!document->rules.active &&
         (document->rules.generation != 0U || document->rules.categories != 0U)) return false;
     if (document->rules.active &&
         (document->rules.generation == 0U || document->rules.categories == 0U)) return false;
-    if (document->mode == ASTERISKD_MODE_EBPF &&
+    if (asteriskd_mode_core_managed(document->mode) &&
         (document->matcher.configured || document->matcher.active || document->rules.active ||
          document->rules.generation != 0U || document->rules.categories != 0U ||
          document->children.helper_present)) return false;
@@ -247,7 +247,7 @@ int asteriskd_state_set_matcher(
     bool configured,
     bool active) {
     if (document == NULL || !document->initialized || active > configured ||
-        (configured && !(document->mode == ASTERISKD_MODE_TPROXY || document->mode == ASTERISKD_MODE_TUN ||
+        (configured && !(document->mode == ASTERISKD_MODE_TPROXY ||
                          document->mode == ASTERISKD_MODE_TUN2SOCKS))) return ASTERISKD_STATE_INVALID;
     document->matcher.configured = configured;
     document->matcher.active = active;
@@ -263,7 +263,7 @@ int asteriskd_state_set_rules(
         (categories & ~ASTERISKD_RULE_CATEGORY_ALL) != 0U ||
         (!active && (generation != 0U || categories != 0U)) ||
         (active && (generation == 0U || categories == 0U)) ||
-        (document->mode == ASTERISKD_MODE_EBPF && active)) return ASTERISKD_STATE_INVALID;
+        (asteriskd_mode_core_managed(document->mode) && active)) return ASTERISKD_STATE_INVALID;
     document->rules.active = active;
     document->rules.generation = generation;
     document->rules.categories = categories;

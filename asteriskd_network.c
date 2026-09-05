@@ -45,9 +45,14 @@ static bool backend_valid(const struct asteriskd_network_backend *backend) {
 }
 
 static uint32_t required_groups(const struct asteriskd_config *config) {
-    if (config->mode == ASTERISKD_MODE_EBPF) {
-        return config->disable_system_ipv6 ?
+    if (asteriskd_mode_core_managed(config->mode)) {
+        uint32_t groups = config->disable_system_ipv6 ?
             ASTERISKD_NETWORK_GROUP_IPV6_ADDRESS | ASTERISKD_NETWORK_GROUP_LINK : 0U;
+        if (config->hotspot_interface_prefix_count != 0U) {
+            groups |= ASTERISKD_NETWORK_GROUP_LINK;
+            if (config->enable_ipv6) groups |= ASTERISKD_NETWORK_GROUP_IPV6_ADDRESS;
+        }
+        return groups;
     }
     uint32_t groups = ASTERISKD_NETWORK_GROUP_IPV4_ADDRESS;
     if (config->enable_ipv6 || config->disable_system_ipv6) {
@@ -190,7 +195,7 @@ static bool hotspot_interface(const struct asteriskd_config *config, const char 
 }
 
 static bool tracked_interface(const struct asteriskd_config *config, const char *name) {
-    if (config->mode == ASTERISKD_MODE_EBPF || strcmp(name, "all") == 0 ||
+    if (asteriskd_mode_core_managed(config->mode) || strcmp(name, "all") == 0 ||
         strcmp(name, "default") == 0 || strcmp(name, "lo") == 0) return false;
     for (size_t index = 0U; index < config->ignored_interface_count; ++index) {
         if (asteriskd_interface_matches_selector(

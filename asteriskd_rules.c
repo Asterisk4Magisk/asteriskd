@@ -116,8 +116,14 @@ int asteriskd_rule_transaction_plan_build(
     struct asteriskd_rule_transaction_plan *plan) {
     if (plan != NULL) memset(plan, 0, sizeof(*plan));
     if (config == NULL || plan == NULL) return ASTERISKD_CONFIG_INVALID;
-    if (config->mode == ASTERISKD_MODE_EBPF) {
-        if (config->owner != ASTERISKD_OWNER_BOX || config->core_type != ASTERISKD_CORE_SING_BOX) {
+    if (asteriskd_mode_core_managed(config->mode)) {
+        bool supported_core = config->owner == ASTERISKD_OWNER_BOX &&
+            config->core_type == ASTERISKD_CORE_SING_BOX;
+        if (config->mode == ASTERISKD_MODE_TUN) {
+            supported_core |= config->owner == ASTERISKD_OWNER_META &&
+                config->core_type == ASTERISKD_CORE_MIHOMO;
+        }
+        if (!supported_core) {
             return ASTERISKD_CONFIG_UNSUPPORTED_COMBINATION;
         }
         plan->no_op = true;
@@ -127,7 +133,7 @@ int asteriskd_rule_transaction_plan_build(
     if (config->mode == ASTERISKD_MODE_TPROXY) {
         result = asteriskd_tproxy_rule_transaction_plan_build(
             config, has_global_ipv6_address, plan);
-    } else if (config->mode == ASTERISKD_MODE_TUN || config->mode == ASTERISKD_MODE_TUN2SOCKS) {
+    } else if (config->mode == ASTERISKD_MODE_TUN2SOCKS) {
         result = asteriskd_tun_rule_transaction_plan_build(config, plan);
     } else if (config->mode != ASTERISKD_MODE_BPF2SOCKS) {
         result = ASTERISKD_CONFIG_INVALID;
@@ -215,8 +221,14 @@ int asteriskd_rule_plan_build(
     plan->route_rule_priority = ASTERISKD_ROUTE_RULE_PRIORITY;
     plan->primary_mark = ASTERISKD_PRIMARY_MARK;
     plan->mark_mask = ASTERISKD_MARK_MASK;
-    if (config->mode == ASTERISKD_MODE_EBPF) {
-        if (config->owner != ASTERISKD_OWNER_BOX || config->core_type != ASTERISKD_CORE_SING_BOX) {
+    if (asteriskd_mode_core_managed(config->mode)) {
+        bool supported_core = config->owner == ASTERISKD_OWNER_BOX &&
+            config->core_type == ASTERISKD_CORE_SING_BOX;
+        if (config->mode == ASTERISKD_MODE_TUN) {
+            supported_core |= config->owner == ASTERISKD_OWNER_META &&
+                config->core_type == ASTERISKD_CORE_MIHOMO;
+        }
+        if (!supported_core) {
             return ASTERISKD_CONFIG_UNSUPPORTED_COMBINATION;
         }
         plan->no_op = true;
@@ -226,10 +238,9 @@ int asteriskd_rule_plan_build(
     plan->uses_helper_tc = config->mode == ASTERISKD_MODE_BPF2SOCKS;
     if (config->mode == ASTERISKD_MODE_TPROXY) {
         plan->routing_table = ASTERISKD_TPROXY_TABLE;
-    } else if (config->mode == ASTERISKD_MODE_TUN || config->mode == ASTERISKD_MODE_TUN2SOCKS) {
+    } else if (config->mode == ASTERISKD_MODE_TUN2SOCKS) {
         plan->routing_table = ASTERISKD_TUN_TABLE;
-        const char *tunnel = config->mode == ASTERISKD_MODE_TUN ?
-            config->tunnel_name : config->helper.value.hev.tunnel_name;
+        const char *tunnel = config->helper.value.hev.tunnel_name;
         if (rule_plan_copy_tunnel(plan, tunnel) != 0) return ASTERISKD_CONFIG_INVALID;
     } else if (config->mode != ASTERISKD_MODE_BPF2SOCKS) {
         return ASTERISKD_CONFIG_INVALID;
@@ -312,7 +323,7 @@ static enum asteriskd_packet_action selected_packet_action(
         return direction == ASTERISKD_PACKET_PREROUTING ?
             ASTERISKD_PACKET_TPROXY : ASTERISKD_PACKET_MARK_PRIMARY;
     }
-    if (config->mode == ASTERISKD_MODE_TUN || config->mode == ASTERISKD_MODE_TUN2SOCKS) {
+    if (config->mode == ASTERISKD_MODE_TUN2SOCKS) {
         return ASTERISKD_PACKET_MARK_PRIMARY;
     }
     return ASTERISKD_PACKET_NONE;

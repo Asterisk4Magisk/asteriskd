@@ -79,7 +79,7 @@ int asteriskd_local_address_set_build(
         return ASTERISKD_CONFIG_INVALID;
     }
     set->family = family;
-    if (config->mode == ASTERISKD_MODE_EBPF) return 0;
+    if (asteriskd_mode_core_managed(config->mode)) return 0;
     struct binary_address *desired = candidate_count == 0U ? NULL :
         calloc(candidate_count, sizeof(*desired));
     if (candidate_count != 0U && desired == NULL) {

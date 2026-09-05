@@ -288,6 +288,11 @@ enum asteriskd_mode {
     ASTERISKD_MODE_EBPF,
 };
 
+// Supported TUN and eBPF cores own traffic policy and its lifecycle.
+static inline bool asteriskd_mode_core_managed(enum asteriskd_mode mode) {
+    return mode == ASTERISKD_MODE_TUN || mode == ASTERISKD_MODE_EBPF;
+}
+
 enum asteriskd_app_policy_mode {
     ASTERISKD_APP_POLICY_GLOBAL,
     ASTERISKD_APP_POLICY_BLACKLIST,
@@ -536,7 +541,7 @@ struct asteriskd_lifecycle_options {
     bool has_helper;
     bool has_matcher;
     bool requires_platform_capability;
-    bool standalone_ebpf;
+    bool core_managed_traffic;
 };
 
 enum asteriskd_child_role {

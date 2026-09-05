@@ -560,12 +560,12 @@ bool asteriskd_control_snapshot_valid(const struct asteriskd_control_snapshot *s
             !snapshot->has_core_pid || snapshot->has_error ||
             (snapshot->helper_type != ASTERISKD_HELPER_NONE && !snapshot->has_helper_pid) ||
             (snapshot->matcher_configured && !snapshot->matcher_active) ||
-            (snapshot->mode != ASTERISKD_MODE_EBPF && !snapshot->rules.active)) return false;
+            (!asteriskd_mode_core_managed(snapshot->mode) && !snapshot->rules.active)) return false;
     } else if (snapshot->network.ipv4_ready || snapshot->network.ipv6_ready) {
         return false;
     }
     if (snapshot->phase == ASTERISKD_PHASE_FAILED && !snapshot->has_error) return false;
-    if (snapshot->mode == ASTERISKD_MODE_EBPF &&
+    if (asteriskd_mode_core_managed(snapshot->mode) &&
         (snapshot->rules.active || snapshot->rules.generation != 0U || snapshot->rules.categories != 0U ||
          snapshot->matcher_configured || snapshot->matcher_active ||
          snapshot->helper_type != ASTERISKD_HELPER_NONE || snapshot->has_helper_pid)) return false;
@@ -883,7 +883,7 @@ static int control_decode_json_string_bytes(
             case 'b': case 'f': case 'n': case 'r': case 't': {
                 static const char decoded[] = {'\b', '\f', '\n', '\r', '\t'};
                 static const char encoded[] = {'b', 'f', 'n', 'r', 't'};
-                const char *found = strchr(encoded, (int)value);
+                const char *found = memchr(encoded, (int)value, sizeof(encoded));
                 if (found == NULL || length + 1U >= out_size) return -1;
                 out[length++] = decoded[(size_t)(found - encoded)];
                 break;

@@ -942,7 +942,7 @@ static int validate_cross_fields(struct asteriskd_config *config) {
     if ((config->mode == ASTERISKD_MODE_TUN2SOCKS && config->helper.type != ASTERISKD_HELPER_HEV_SOCKS5_TUNNEL) ||
         (config->mode == ASTERISKD_MODE_BPF2SOCKS && config->helper.type != ASTERISKD_HELPER_BPF2SOCKS) ||
         ((config->mode == ASTERISKD_MODE_TPROXY || config->mode == ASTERISKD_MODE_TUN || config->mode == ASTERISKD_MODE_EBPF) && config->helper.type != ASTERISKD_HELPER_NONE)) return -1;
-    if (config->matcher.enabled && !(config->mode == ASTERISKD_MODE_TPROXY || config->mode == ASTERISKD_MODE_TUN || config->mode == ASTERISKD_MODE_TUN2SOCKS)) return -1;
+    if (config->matcher.enabled && !(config->mode == ASTERISKD_MODE_TPROXY || config->mode == ASTERISKD_MODE_TUN2SOCKS)) return -1;
     bool direct_consumer = config->matcher.enabled ^ (config->mode == ASTERISKD_MODE_BPF2SOCKS);
     if (config->has_direct_cidr_paths && !direct_consumer) return -1;
     if (config->helper.type == ASTERISKD_HELPER_HEV_SOCKS5_TUNNEL) {
@@ -951,14 +951,16 @@ static int validate_cross_fields(struct asteriskd_config *config) {
             (config->enable_local_dns && !config->disable_system_ipv6);
         if (helper_ipv6 != hev->has_ipv6_address || (helper_ipv6 && hev->mtu < 1280U)) return -1;
     }
-    if (config->mode == ASTERISKD_MODE_EBPF &&
+    if (asteriskd_mode_core_managed(config->mode) &&
         (config->enable_local_dns || config->enable_fake_dns || config->has_fake_dns_ipv4_pool ||
          config->ignored_interface_count != 0U || config->virtual_interface_count != 0U ||
-         config->hotspot_interface_prefix_count != 0U || config->proxy_private_cidr_count != 0U ||
+         (config->mode == ASTERISKD_MODE_EBPF && config->hotspot_interface_prefix_count != 0U) ||
+         config->proxy_private_cidr_count != 0U ||
          config->bypass_private_cidr_count != 0U || config->app_policy_mode != ASTERISKD_APP_POLICY_GLOBAL ||
          config->uid_count != 0U || config->bypass_uid_count != 0U || config->has_direct_cidr_paths ||
          config->matcher.enabled || config->helper.type != ASTERISKD_HELPER_NONE ||
-         config->has_transparent_port || config->has_tunnel_name)) return -1;
+         config->has_transparent_port ||
+         (config->mode == ASTERISKD_MODE_EBPF && config->has_tunnel_name))) return -1;
     return 0;
 }
 

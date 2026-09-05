@@ -98,8 +98,15 @@ sing-box owns its cgroup BPF, route, shared-interface TC, UID/direct policy, and
 `route_localnet`; daemon rule state remains inactive. Core-owned eBPF lifecycle
 and residue cleanup remain the core's responsibility.
 
-The matcher is an independent required overlay for `tproxy`, `tun`, or
-`tun2socks`. For both the matcher and bpf2socks, optional SELinux policy setup
+`tun` is also core-managed: sing-box/Mihomo owns routing, firewall policy,
+UID selection, DNS and shared-interface traffic. asteriskd waits for the named
+TUN interface, supervises the core and stops it before cleanup; daemon rule
+state remains inactive. The daemon network contract accepts only IPv6 intent
+and shared-interface selectors used for Android tethering offload preparation.
+Matcher, local/fake DNS, ignored/virtual interfaces, private CIDRs and UID/direct
+policy must be empty. `tun2socks` retains the daemon-owned TUN rules.
+
+The matcher is an independent required overlay for `tproxy` or `tun2socks`. For both the matcher and bpf2socks, optional SELinux policy setup
 is best-effort and emits a warning when unavailable or unsuccessful. One-shot
 loading, complete pin verification, or policy-map verification failure still
 aborts startup; there is no silent fallback to non-matcher rules.
@@ -115,8 +122,9 @@ foreign object or absence cannot be proved. The catalog is independent of the
 current owner, mode, IPv6 setting, matcher setting, saved phase, and saved
 configuration. Old per-application names are intentionally ignored.
 
-Core readiness is adapter-specific and identity-bound. TUN/HEV and bpf2socks
-modes require the core SOCKS listener before helper readiness. BOX `ebpf`
+Core readiness is adapter-specific and identity-bound. Native TUN waits for
+the named interface. TUN2SOCKS and bpf2socks require the core SOCKS listener
+before helper readiness. BOX `ebpf`
 requires the same verified core identity to survive a fixed 1000 ms window and
 does not wait for a shared interface.
 

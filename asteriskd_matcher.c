@@ -165,7 +165,7 @@ int asteriskd_matcher_render_documents(
     if (documents != NULL) memset(documents, 0, sizeof(*documents));
     if (error != NULL && error_size != 0U) error[0] = '\0';
     if (config == NULL || documents == NULL || !config->matcher.enabled ||
-        (config->mode != ASTERISKD_MODE_TPROXY && config->mode != ASTERISKD_MODE_TUN &&
+        (config->mode != ASTERISKD_MODE_TPROXY &&
          config->mode != ASTERISKD_MODE_TUN2SOCKS)) {
         matcher_error(error, error_size, "invalid matcher document configuration");
         return ASTERISKD_CONFIG_INVALID;

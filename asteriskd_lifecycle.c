@@ -190,7 +190,7 @@ int asteriskd_lifecycle_start(
     lifecycle->options = *options;
     lifecycle->starting = true;
     int result = call_effect(lifecycle, &lifecycle->acquire, "acquire", backend->acquire);
-    if (result == 0 && options->standalone_ebpf) lifecycle->traffic_may_be_active = true;
+    if (result == 0 && options->core_managed_traffic) lifecycle->traffic_may_be_active = true;
     if (result == 0) result = call_effect(lifecycle, &lifecycle->core, "start_core", backend->start_core);
     if (result == 0) result = call_observer(lifecycle, "wait_core", backend->wait_core);
     if (result == 0 && options->requires_platform_capability) {
