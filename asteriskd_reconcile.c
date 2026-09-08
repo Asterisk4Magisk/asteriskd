@@ -38,20 +38,31 @@ int asteriskd_reconcile_owned_resources(
         int result;
 
         report->attempted[phase] = true;
+        if (error != NULL && error_size != 0U) error[0] = '\0';
         result = backend->remove_phase(
             backend->context, phase, error, error_size);
         if (result != 0) {
-            report->failed_phase = phase;
-            return result;
+            /* Cleanup is best effort; retain diagnostics without skipping later phases. */
+            if (report->failed_phase == ASTERISKD_RECONCILE_PHASE_COUNT) {
+                report->failed_phase = phase;
+            }
+            if (backend->warn != NULL) backend->warn(backend->context, phase,
+                error != NULL && error_size != 0U && error[0] != '\0'
+                    ? error : "owned resource cleanup failed");
         }
     }
 
     {
+        if (error != NULL && error_size != 0U) error[0] = '\0';
         int result = backend->verify_absent(
             backend->context, error, error_size);
-        if (result != 0) return result;
+        report->verified_absent = result == 0;
+        if (result != 0 && backend->warn != NULL) backend->warn(
+            backend->context, ASTERISKD_RECONCILE_PHASE_COUNT,
+            error != NULL && error_size != 0U && error[0] != '\0'
+                ? error : "owned resource verification failed");
     }
-    report->verified_absent = true;
+    if (error != NULL && error_size != 0U) error[0] = '\0';
     return 0;
 }
 

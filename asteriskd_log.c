@@ -738,6 +738,52 @@ int asteriskd_log_line(
         (const unsigned char *)message, message_length, message_length, false);
 }
 
+#ifndef _WIN32
+struct diagnostic_sink {
+    int (*write)(void *, const char *, size_t);
+    void *context;
+};
+
+static ptrdiff_t diagnostic_write(void *opaque, int fd, const void *bytes, size_t length) {
+    struct diagnostic_sink *sink = opaque;
+    (void)fd;
+    return sink->write(sink->context, bytes, length) == 0 ? (ptrdiff_t)length : -1;
+}
+#endif
+
+void asteriskd_log_diagnostic(enum asteriskd_log_level level,
+    enum asteriskd_component component, const char *message,
+    int (*write_sink)(void *, const char *, size_t), void *context) {
+    int saved_errno = errno;
+#ifndef _WIN32
+    struct asteriskd_logger *logger = calloc(1U, sizeof(*logger));
+    if (logger != NULL && write_sink != NULL) {
+        struct diagnostic_sink sink = {.write = write_sink, .context = context};
+        const struct asteriskd_log_file_backend backend = {.write_fd = diagnostic_write};
+        logger->opened = true;
+        logger->clock = system_clock_backend;
+        logger->file_backend = &backend;
+        logger->file_context = &sink;
+        (void)asteriskd_log_line(logger, level, component,
+            ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+    }
+    free(logger);
+#else
+    (void)level; (void)component; (void)message; (void)write_sink; (void)context;
+#endif
+    errno = saved_errno;
+}
+
+static int diagnostic_stderr(void *context, const char *bytes, size_t length) {
+    (void)context;
+    return fwrite(bytes, 1U, length, stderr) == length && fflush(stderr) == 0 ? 0 : -1;
+}
+
+void asteriskd_log_stderr(enum asteriskd_log_level level,
+    enum asteriskd_component component, const char *message) {
+    asteriskd_log_diagnostic(level, component, message, diagnostic_stderr, NULL);
+}
+
 static void partial_reset(struct asteriskd_log_partial *partial) {
     memset(partial, 0, sizeof(*partial));
 }

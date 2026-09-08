@@ -1133,6 +1133,7 @@ struct asteriskd_system_supervisor {
     struct asteriskd_address_set local_ipv4_snapshot;
     struct asteriskd_address_set local_ipv6_snapshot;
     bool cleanup_in_progress;
+    bool owned_cleanup_in_progress;
 };
 
 static int system_collect_local_address_set(
@@ -2186,7 +2187,8 @@ static int system_action_run_spec(struct asteriskd_system_supervisor *system,
             "action execution failed: phase=spawn detail=%s",
             error[0] == '\0' ? "unavailable" : error);
         if (written > 0 && (size_t)written < sizeof(message)) {
-            (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
+            (void)asteriskd_log_line(&system->logger,
+                system->owned_cleanup_in_progress ? ASTERISKD_LOG_LEVEL_WARNING : ASTERISKD_LOG_LEVEL_ERROR,
                 ASTERISKD_COMPONENT_RUNTIME, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
         }
         return -1;
@@ -2290,7 +2292,8 @@ failed:
             system->action_setup.fatal ? 1 : 0,
             error[0] == '\0' ? "unavailable" : error);
         if (written > 0 && (size_t)written < sizeof(message)) {
-            (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
+            (void)asteriskd_log_line(&system->logger,
+                system->owned_cleanup_in_progress ? ASTERISKD_LOG_LEVEL_WARNING : ASTERISKD_LOG_LEVEL_ERROR,
                 ASTERISKD_COMPONENT_RUNTIME, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
         }
     }
@@ -5402,13 +5405,14 @@ static int system_reconcile_hooks(
     const struct asteriskd_owned_resource_catalog *catalog =
         asteriskd_owned_resource_catalog();
     size_t index;
+    int result = 0;
 
     for (index = 0U; index < catalog->hook_count; ++index) {
         if (system_reconcile_hook(system, &catalog->hooks[index], remove) != 0) {
-            return -1;
+            result = -1;
         }
     }
-    return 0;
+    return result;
 }
 
 static int system_owned_chain_presence(
@@ -5430,33 +5434,43 @@ static int system_reconcile_private_chains(
     const struct asteriskd_owned_resource_catalog *catalog =
         asteriskd_owned_resource_catalog();
     size_t index;
+    int result = 0;
 
     for (index = 0U; index < catalog->chain_count; ++index) {
         const struct asteriskd_owned_chain *chain = &catalog->chains[index];
         bool present = false;
         int exit_status = -1;
 
-        if (system_owned_chain_presence(system, chain, &present) != 0) return -1;
+        if (system_owned_chain_presence(system, chain, &present) != 0) {
+            result = -1;
+            continue;
+        }
         if (!present) continue;
-        if (!remove) return -1;
+        if (!remove) {
+            result = -1;
+            continue;
+        }
         if (system_xtables(system, chain->family, chain->table,
                 "-F", chain->name, NULL, 0U, &exit_status) != 0 ||
-            exit_status != 0) return -1;
+            exit_status != 0) result = -1;
     }
-    if (!remove) return 0;
+    if (!remove) return result;
 
     for (index = catalog->chain_count; index > 0U; --index) {
         const struct asteriskd_owned_chain *chain = &catalog->chains[index - 1U];
         bool present = false;
         int exit_status = -1;
 
-        if (system_owned_chain_presence(system, chain, &present) != 0) return -1;
+        if (system_owned_chain_presence(system, chain, &present) != 0) {
+            result = -1;
+            continue;
+        }
         if (!present) continue;
         if (system_xtables(system, chain->family, chain->table,
                 "-X", chain->name, NULL, 0U, &exit_status) != 0 ||
-            exit_status != 0) return -1;
+            exit_status != 0) result = -1;
     }
-    return 0;
+    return result;
 }
 
 static int system_owned_policy_rule_count(
@@ -5584,19 +5598,21 @@ static int system_reconcile_policy_routing(
     const struct asteriskd_owned_resource_catalog *catalog =
         asteriskd_owned_resource_catalog();
     size_t index;
+    int result = 0;
 
     for (index = 0U; index < catalog->policy_rule_count; ++index) {
         if (system_reconcile_policy_rule(
-                system, &catalog->policy_rules[index], remove) != 0) return -1;
+                system, &catalog->policy_rules[index], remove) != 0) result = -1;
     }
     for (index = 0U;
          index < sizeof(system_owned_route_tables) /
              sizeof(system_owned_route_tables[0]);
          ++index) {
         if (system_reconcile_route_table(
-                system, &system_owned_route_tables[index], remove) != 0) return -1;
+                system, &system_owned_route_tables[index], remove) != 0) result = -1;
     }
-    return system_reconcile_token_route(system, remove);
+    if (system_reconcile_token_route(system, remove) != 0) result = -1;
+    return result;
 }
 
 static int system_remove_owned_bpf_tree(const char *path) {
@@ -5623,7 +5639,7 @@ static int system_remove_owned_bpf_tree(const char *path) {
             if (written <= 0 || (size_t)written >= sizeof(child) ||
                 system_remove_owned_bpf_tree(child) != 0) {
                 result = -1;
-                break;
+                continue;
             }
         }
         if (closedir(directory) != 0) result = -1;
@@ -5729,18 +5745,20 @@ static int system_reconcile_tc_filters(
             strcmp(entry->d_name, "..") == 0) continue;
         if (length == 0U || length >= ASTERISKD_MAX_INTERFACE_NAME) {
             result = -1;
-            break;
+            continue;
         }
         interface_index = if_nametoindex(entry->d_name);
-        if (interface_index == 0U ||
-            system_reconcile_tc_filter(system, entry->d_name, interface_index,
+        if (interface_index == 0U) {
+            result = -1;
+            continue;
+        }
+        if (system_reconcile_tc_filter(system, entry->d_name, interface_index,
                 ASTERISKD_TC_DIRECTION_INGRESS,
-                ASTERISKD_PROGRAM_BPF2SOCKS_INGRESS, remove) != 0 ||
-            system_reconcile_tc_filter(system, entry->d_name, interface_index,
+                ASTERISKD_PROGRAM_BPF2SOCKS_INGRESS, remove) != 0) result = -1;
+        if (system_reconcile_tc_filter(system, entry->d_name, interface_index,
                 ASTERISKD_TC_DIRECTION_EGRESS,
                 ASTERISKD_PROGRAM_BPF2SOCKS_EGRESS, remove) != 0) {
             result = -1;
-            break;
         }
     }
     if (closedir(directory) != 0) result = -1;
@@ -5757,11 +5775,21 @@ static int system_reconcile_remove_phase(
 
     if (system == NULL) return -1;
     switch (phase) {
-        case ASTERISKD_RECONCILE_QUIESCE:
-            result = system_reconcile_hooks(system, true);
-            if (result == 0) result = system_prepare_owned_tc_identity(system);
-            if (result == 0) result = system_reconcile_tc_filters(system, true);
+        case ASTERISKD_RECONCILE_QUIESCE: {
+            int hooks = system_reconcile_hooks(system, true);
+            int identity = system_prepare_owned_tc_identity(system);
+            int filters = system_reconcile_tc_filters(system, true);
+            if (hooks != 0 || identity != 0 || filters != 0) {
+                char detail[128U];
+                (void)snprintf(detail, sizeof(detail),
+                    "quiesce incomplete: hooks=%d bpf-identity=%d tc-filters=%d",
+                    hooks, identity, filters);
+                system_reconcile_error(error, error_size, detail);
+                return -1;
+            }
+            result = 0;
             break;
+        }
         case ASTERISKD_RECONCILE_PRIVATE_CHAINS:
             result = system_reconcile_private_chains(system, true);
             break;
@@ -5809,12 +5837,28 @@ static int system_reconcile_verify_absent(
     return 0;
 }
 
+static void system_reconcile_warn(void *opaque,
+    enum asteriskd_reconcile_phase phase, const char *detail) {
+    struct asteriskd_system_supervisor *system = opaque;
+    static const char *const names[] = {
+        "quiesce", "private-chains", "policy-routing", "bpf-pins", "verification",
+    };
+    char message[384U];
+    (void)snprintf(message, sizeof(message),
+        "owned resource cleanup incomplete; continuing: phase=%s detail=%.256s",
+        phase >= ASTERISKD_RECONCILE_QUIESCE && phase <= ASTERISKD_RECONCILE_PHASE_COUNT
+            ? names[phase] : "invalid", detail);
+    (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_WARNING,
+        ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+}
+
 static struct asteriskd_reconcile_backend system_reconcile_backend(
     struct asteriskd_system_supervisor *system) {
     const struct asteriskd_reconcile_backend backend = {
         .context = system,
         .remove_phase = system_reconcile_remove_phase,
         .verify_absent = system_reconcile_verify_absent,
+        .warn = system_reconcile_warn,
     };
     return backend;
 }
@@ -5830,8 +5874,11 @@ static int system_reconcile_owned_resources_after_listener(
 
     system_rule_batch_destroy(&system->rule_commands);
     system_rule_snapshot_destroy(&system->rule_snapshot);
-    return asteriskd_reconcile_after_listener(
+    system->owned_cleanup_in_progress = true;
+    int result = asteriskd_reconcile_after_listener(
         listener_result, &backend, &report, error, error_size);
+    system->owned_cleanup_in_progress = false;
+    return result;
 }
 
 static int system_reconcile_owned_resources(

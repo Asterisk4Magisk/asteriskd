@@ -1220,6 +1220,7 @@ struct asteriskd_reconcile_backend {
     int (*remove_phase)(
         void *, enum asteriskd_reconcile_phase, char *, size_t);
     int (*verify_absent)(void *, char *, size_t);
+    void (*warn)(void *, enum asteriskd_reconcile_phase, const char *);
 };
 
 struct asteriskd_reconcile_report {
@@ -2315,6 +2316,11 @@ int asteriskd_log_open_with_backend(
 int asteriskd_log_line(
     struct asteriskd_logger *, enum asteriskd_log_level, enum asteriskd_component,
     enum asteriskd_log_event, const char *);
+void asteriskd_log_diagnostic(
+    enum asteriskd_log_level, enum asteriskd_component, const char *,
+    int (*)(void *, const char *, size_t), void *);
+void asteriskd_log_stderr(
+    enum asteriskd_log_level, enum asteriskd_component, const char *);
 int asteriskd_log_child_bytes(
     struct asteriskd_logger *, enum asteriskd_child_role, enum asteriskd_log_stream,
     const unsigned char *, size_t, uint64_t, bool);

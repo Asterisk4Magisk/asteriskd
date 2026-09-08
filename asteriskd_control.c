@@ -171,7 +171,9 @@ static int control_system_accept(void *context, int listener, int *fd, uint32_t 
 
 static int control_system_io_error(const char *operation) {
     int saved_errno = errno;
-    fprintf(stderr, "asteriskd_control operation=%s errno=%d\n", operation, saved_errno);
+    char message[128U];
+    (void)snprintf(message, sizeof(message), "control I/O failed: operation=%s errno=%d", operation, saved_errno);
+    asteriskd_log_stderr(ASTERISKD_LOG_LEVEL_WARNING, ASTERISKD_COMPONENT_CONTROL, message);
     errno = saved_errno;
     return ASTERISKD_CONTROL_BACKEND_ERROR;
 }
@@ -1518,8 +1520,10 @@ enum asteriskd_control_client_result asteriskd_control_client_run_with_backend(
                     ? ASTERISKD_CONTROL_CLIENT_OK
                     : ASTERISKD_CONTROL_CLIENT_PROTOCOL_ERROR;
             if (result != ASTERISKD_CONTROL_CLIENT_OK) {
-                fprintf(stderr, "asteriskd_control operation=read_eof initial=%d partial_bytes=%zu\n",
+                char message[128U];
+                (void)snprintf(message, sizeof(message), "control stream ended unexpectedly: initial=%d partial_bytes=%zu",
                     initial_received ? 1 : 0, line_length);
+                asteriskd_log_stderr(ASTERISKD_LOG_LEVEL_WARNING, ASTERISKD_COMPONENT_CONTROL, message);
             }
             return control_client_close_result(backend, context, &fd, result, response);
         }
@@ -1680,7 +1684,9 @@ static enum asteriskd_control_connect_result control_system_finish_connect(
     }
     if (length != sizeof(error)) return ASTERISKD_CONTROL_CONNECT_ERROR;
     if (control_system_connect_result(error) == ASTERISKD_CONTROL_CONNECT_ERROR) {
-        fprintf(stderr, "asteriskd_control operation=finish_connect errno=%d\n", error);
+        char message[128U];
+        (void)snprintf(message, sizeof(message), "control I/O failed: operation=finish_connect errno=%d", error);
+        asteriskd_log_stderr(ASTERISKD_LOG_LEVEL_WARNING, ASTERISKD_COMPONENT_CONTROL, message);
     }
     return control_system_connect_result(error);
 }
@@ -1887,12 +1893,13 @@ static int control_cli_run_control(
     if (result != ASTERISKD_CONTROL_CLIENT_ABSENT) {
         char diagnostic[160U];
         int length = snprintf(diagnostic, sizeof(diagnostic),
-            "asteriskd_control request=%s result=%s lines=%zu\n", request_id,
+            "control request failed: request=%s result=%s lines=%zu", request_id,
             result == ASTERISKD_CONTROL_CLIENT_TIMEOUT ? "timeout" :
                 result == ASTERISKD_CONTROL_CLIENT_IO_ERROR ? "io_error" : "protocol_error",
             sink.lines);
         if (length > 0 && (size_t)length < sizeof(diagnostic)) {
-            (void)backend->write_stderr(context, diagnostic, (size_t)length);
+            asteriskd_log_diagnostic(ASTERISKD_LOG_LEVEL_WARNING, ASTERISKD_COMPONENT_CONTROL,
+                diagnostic, backend->write_stderr, context);
         }
     }
     if (sink.lines != 0U) return 1;

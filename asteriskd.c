@@ -37,13 +37,17 @@ static int system_prepare_session(void) {
     if (getpgrp() == getpid()) {
         pid_t pid = fork();
         if (pid < 0) {
-            perror("asteriskd: fork");
+            char message[96U];
+            (void)snprintf(message, sizeof(message), "supervisor fork failed: errno=%d", errno);
+            asteriskd_log_stderr(ASTERISKD_LOG_LEVEL_ERROR, ASTERISKD_COMPONENT_RUNTIME, message);
             return -1;
         }
         if (pid > 0) return 1;
     }
     if (setsid() < 0) {
-        perror("asteriskd: setsid");
+        char message[96U];
+        (void)snprintf(message, sizeof(message), "supervisor setsid failed: errno=%d", errno);
+        asteriskd_log_stderr(ASTERISKD_LOG_LEVEL_ERROR, ASTERISKD_COMPONENT_RUNTIME, message);
         return -1;
     }
 #endif
@@ -53,9 +57,12 @@ static int system_prepare_session(void) {
 static void system_log_early_result(const char *mode, int status,
     bool has_result, const struct asteriskd_control_result *result) {
     if (!has_result) return;
-    fprintf(stderr, "asteriskd_start mode=%s stage=early_exit status=%d code=%d detail=%.256s\n",
+    char message[384U];
+    (void)snprintf(message, sizeof(message), "supervisor exited before ready: mode=%s status=%d code=%d detail=%.256s",
         mode, status, (int)result->code,
         result->has_message && result->message != NULL ? result->message : "unavailable");
+    asteriskd_log_stderr(status == 0 ? ASTERISKD_LOG_LEVEL_INFO : ASTERISKD_LOG_LEVEL_ERROR,
+        ASTERISKD_COMPONENT_RUNTIME, message);
 }
 
 static int system_run_start(
@@ -66,7 +73,8 @@ static int system_run_start(
     (void)context;
     int session = system_prepare_session();
     if (session != 0) return session < 0 ? -1 : 0;
-    fprintf(stderr, "asteriskd_start mode=start stage=runtime_enter\n");
+    asteriskd_log_stderr(ASTERISKD_LOG_LEVEL_INFO, ASTERISKD_COMPONENT_RUNTIME,
+        "entering supervisor runtime: mode=start");
     int status = asteriskd_runtime_start_system(
         config_path, has_early_result, early_result);
     system_log_early_result("start", status, *has_early_result, early_result);
@@ -81,7 +89,8 @@ static int system_run_monitor(
     (void)context;
     int session = system_prepare_session();
     if (session != 0) return session < 0 ? -1 : 0;
-    fprintf(stderr, "asteriskd_start mode=monitor stage=runtime_enter\n");
+    asteriskd_log_stderr(ASTERISKD_LOG_LEVEL_INFO, ASTERISKD_COMPONENT_RUNTIME,
+        "entering supervisor runtime: mode=monitor");
     int status = asteriskd_runtime_monitor_system(
         config_path, has_early_result, early_result);
     system_log_early_result("monitor", status, *has_early_result, early_result);
