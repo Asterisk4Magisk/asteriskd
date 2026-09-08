@@ -15,8 +15,6 @@
 #include <string.h>
 
 #if defined(__linux__)
-#include <ctype.h>
-#include <dirent.h>
 #include <fcntl.h>
 #include <grp.h>
 #include <linux/memfd.h>
@@ -572,14 +570,6 @@ static bool readiness_role_valid(
              config->mode == ASTERISKD_MODE_BPF2SOCKS));
 }
 
-static int readiness_listener_owned(
-    const struct asteriskd_readiness_backend *backend,
-    const struct asteriskd_child_identity *identity,
-    uint16_t port,
-    bool *owned) {
-    return backend->listener_owned(backend->context, identity, "*", port, owned);
-}
-
 int asteriskd_readiness_preflight(
     const struct asteriskd_config *config,
     enum asteriskd_child_role role,
@@ -602,7 +592,7 @@ int asteriskd_readiness_init(
     struct asteriskd_readiness_tracker *tracker) {
     if (tracker != NULL) memset(tracker, 0, sizeof(*tracker));
     if (config == NULL || tracker == NULL || backend == NULL ||
-        backend->identity_valid == NULL || backend->listener_owned == NULL ||
+        backend->child_alive == NULL || backend->listener_ready == NULL ||
         backend->interface_exists == NULL ||
         !readiness_role_valid(config, role) ||
         now_milliseconds > UINT64_MAX - config->readiness_timeout_milliseconds) {
@@ -624,18 +614,18 @@ int asteriskd_readiness_poll(
     bool stop_requested) {
     if (config == NULL || tracker == NULL || identity == NULL || backend == NULL ||
         !tracker->initialized || tracker->mode != config->mode ||
-        backend->identity_valid == NULL || backend->listener_owned == NULL ||
+        backend->child_alive == NULL || backend->listener_ready == NULL ||
         backend->interface_exists == NULL) return ASTERISKD_CONFIG_INVALID;
     if (stop_requested) return ASTERISKD_READINESS_STOP_REQUESTED;
-    bool identity_valid = false;
-    if (backend->identity_valid(backend->context, identity, &identity_valid) != 0) {
+    bool child_alive = false;
+    if (backend->child_alive(backend->context, identity, &child_alive) != 0) {
         return ASTERISKD_READINESS_IO;
     }
-    if (!identity_valid) return ASTERISKD_READINESS_CHILD_LOST;
+    if (!child_alive) return ASTERISKD_READINESS_CHILD_LOST;
     bool ready = false;
     if (tracker->role == ASTERISKD_CHILD_CORE && config->mode == ASTERISKD_MODE_TPROXY) {
-        if (readiness_listener_owned(
-                backend, identity, config->transparent_port, &ready) != 0) {
+        if (backend->listener_ready(
+                backend->context, "*", config->transparent_port, &ready) != 0) {
             return ASTERISKD_READINESS_IO;
         }
     } else if (tracker->role == ASTERISKD_CHILD_CORE && config->mode == ASTERISKD_MODE_TUN) {
@@ -643,12 +633,12 @@ int asteriskd_readiness_poll(
                 backend->context, config->tunnel_name, &ready) != 0) return ASTERISKD_READINESS_IO;
     } else if (tracker->role == ASTERISKD_CHILD_CORE && config->mode == ASTERISKD_MODE_TUN2SOCKS) {
         const struct asteriskd_hev_helper_config *hev = &config->helper.value.hev;
-        if (readiness_listener_owned(backend, identity, hev->socks_port, &ready) != 0) {
+        if (backend->listener_ready(backend->context, "*", hev->socks_port, &ready) != 0) {
             return ASTERISKD_READINESS_IO;
         }
     } else if (tracker->role == ASTERISKD_CHILD_CORE && config->mode == ASTERISKD_MODE_BPF2SOCKS) {
         const struct asteriskd_bpf_helper_config *bpf = &config->helper.value.bpf;
-        if (readiness_listener_owned(backend, identity, bpf->socks_port, &ready) != 0) {
+        if (backend->listener_ready(backend->context, "*", bpf->socks_port, &ready) != 0) {
             return ASTERISKD_READINESS_IO;
         }
     } else if (tracker->role == ASTERISKD_CHILD_CORE && config->mode == ASTERISKD_MODE_EBPF) {
@@ -660,7 +650,7 @@ int asteriskd_readiness_poll(
         }
     } else if (tracker->role == ASTERISKD_CHILD_HELPER && config->mode == ASTERISKD_MODE_BPF2SOCKS) {
         const struct asteriskd_bpf_helper_config *bpf = &config->helper.value.bpf;
-        if (readiness_listener_owned(backend, identity, bpf->bridge_port, &ready) != 0) {
+        if (backend->listener_ready(backend->context, "*", bpf->bridge_port, &ready) != 0) {
             return ASTERISKD_READINESS_IO;
         }
     } else {
@@ -1302,10 +1292,10 @@ static int process_listener_table_line(
     const struct process_listener_table *table,
     uint16_t port,
     const char *line,
-    uint64_t *inode) {
-    if (inode != NULL) *inode = 0U;
+    bool *listening) {
+    if (listening != NULL) *listening = false;
     if (table == NULL || table->path == NULL || table->address_length == 0U ||
-        line == NULL || inode == NULL) {
+        line == NULL || listening == NULL) {
         return ASTERISKD_CONFIG_INVALID;
     }
     char expected_local[65U];
@@ -1315,18 +1305,16 @@ static int process_listener_table_line(
     if (result <= 0 || (size_t)result >= sizeof(expected_local)) return ASTERISKD_CONFIG_INVALID;
     char local[65U];
     char state[3U];
-    unsigned long long observed_inode = 0ULL;
     int fields = sscanf(line,
-        " %*u: %64s %*64s %2s %*s %*s %*s %*u %*u %llu",
-        local, state, &observed_inode);
-    if (fields != 3 || strcmp(state, "0A") != 0 || observed_inode == 0ULL) return 0;
+        " %*u: %64s %*64s %2s", local, state);
+    if (fields != 2 || strcmp(state, "0A") != 0) return 0;
     const char *observed_local = local;
     if (table->address == NULL) {
         if (strlen(local) != table->address_length + 5U) return 0;
         observed_local += table->address_length;
     }
     if (strcmp(observed_local, expected_local) != 0) return 0;
-    *inode = (uint64_t)observed_inode;
+    *listening = true;
     return 1;
 }
 
@@ -1336,13 +1324,13 @@ int asteriskd_test_listener_table_line(
     uint16_t port,
     size_t table_index,
     const char *line,
-    uint64_t *inode) {
-    if (inode != NULL) *inode = 0U;
+    bool *listening) {
+    if (listening != NULL) *listening = false;
     struct process_listener_table table;
     if (process_listener_table_spec(host, table_index, &table) != 0) {
         return ASTERISKD_CONFIG_INVALID;
     }
-    return process_listener_table_line(&table, port, line, inode);
+    return process_listener_table_line(&table, port, line, listening);
 }
 #endif
 
@@ -1392,86 +1380,31 @@ static int system_context_interface_exists(void *opaque, const char *name, bool 
     return 0;
 }
 
-static bool system_proc_pid_name(const char *name, int *pid) {
-    if (name == NULL || name[0] == '\0') return false;
-    uint64_t value = 0U;
-    for (const unsigned char *cursor = (const unsigned char *)name; *cursor != '\0'; ++cursor) {
-        if (!isdigit(*cursor) || value > (uint64_t)INT32_MAX / 10U) return false;
-        value = value * 10U + (uint64_t)(*cursor - '0');
-        if (value > INT32_MAX) return false;
-    }
-    if (value == 0U) return false;
-    *pid = (int)value;
-    return true;
+/* Observe exit without consuming the status owned by the runtime reaper. */
+static int system_context_child_alive(
+    void *opaque,
+    const struct asteriskd_child_identity *identity,
+    bool *alive) {
+    (void)opaque;
+    *alive = false;
+    if (identity->pid <= 0) return -1;
+    siginfo_t info = {0};
+    int result;
+    do {
+        result = waitid(P_PID, (id_t)identity->pid, &info, WEXITED | WNOHANG | WNOWAIT);
+    } while (result != 0 && errno == EINTR);
+    if (result != 0) return errno == ECHILD ? 0 : -1;
+    *alive = info.si_pid == 0;
+    return 0;
 }
 
-static int system_member_stat(int pid, struct process_stat_snapshot *snapshot) {
-    char path[64];
-    char text[4096U];
-    size_t length = 0U;
-    if (system_proc_path(path, sizeof(path), pid, "stat") != 0 ||
-        system_read_proc_file(path, (unsigned char *)text, sizeof(text) - 1U, &length) != 0) return -1;
-    return process_parse_stat(text, length, pid, snapshot);
-}
-
-static bool system_fd_table_has_inode(int pid, uint64_t inode) {
-    char directory_path[64];
-    int count = snprintf(directory_path, sizeof(directory_path), "/proc/%d/fd", pid);
-    if (count <= 0 || (size_t)count >= sizeof(directory_path)) return false;
-    DIR *directory = opendir(directory_path);
-    if (directory == NULL) return false;
-    char expected[64];
-    count = snprintf(expected, sizeof(expected), "socket:[%" PRIu64 "]", inode);
-    bool found = false;
-    struct dirent *entry;
-    while (!found && (entry = readdir(directory)) != NULL) {
-        int fd_number;
-        if (!system_proc_pid_name(entry->d_name, &fd_number)) continue;
-        char link_path[96];
-        count = snprintf(link_path, sizeof(link_path), "%s/%d", directory_path, fd_number);
-        if (count <= 0 || (size_t)count >= sizeof(link_path)) continue;
-        char target[64];
-        ssize_t target_length = readlink(link_path, target, sizeof(target) - 1U);
-        if (target_length <= 0 || (size_t)target_length >= sizeof(target)) continue;
-        target[target_length] = '\0';
-        found = strcmp(target, expected) == 0;
-    }
-    (void)closedir(directory);
-    return found;
-}
-
-static bool system_group_has_inode(
-    const struct asteriskd_child_identity *leader,
-    uint64_t inode) {
-    DIR *proc = opendir("/proc");
-    if (proc == NULL) return false;
-    bool found = false;
-    struct dirent *entry;
-    while (!found && (entry = readdir(proc)) != NULL) {
-        int pid;
-        if (!system_proc_pid_name(entry->d_name, &pid)) continue;
-        struct process_stat_snapshot first;
-        if (system_member_stat(pid, &first) != 0 ||
-            first.process_group_id != leader->process_group_id ||
-            first.session_id != leader->process_group_id) continue;
-        if (!system_fd_table_has_inode(pid, inode)) continue;
-        struct process_stat_snapshot second;
-        if (system_member_stat(pid, &second) == 0 &&
-            second.process_group_id == first.process_group_id &&
-            second.session_id == first.session_id &&
-            second.start_time_ticks == first.start_time_ticks) found = true;
-    }
-    (void)closedir(proc);
-    return found;
-}
-
-static int system_collect_listener_inodes(
+static int system_context_listener_ready(
+    void *opaque,
     const char *host,
     uint16_t port,
-    uint64_t *inodes,
-    size_t capacity,
-    size_t *count) {
-    *count = 0U;
+    bool *ready) {
+    (void)opaque;
+    *ready = false;
     for (size_t table_index = 0U;; ++table_index) {
         struct process_listener_table table;
         if (process_listener_table_spec(host, table_index, &table) != 0) {
@@ -1484,39 +1417,18 @@ static int system_collect_listener_inodes(
         }
         char line[1024U];
         while (fgets(line, sizeof(line), file) != NULL) {
-            uint64_t inode = 0U;
-            int matched = process_listener_table_line(&table, port, line, &inode);
-            if (matched < 0 || (matched == 1 && *count >= capacity)) {
+            int matched = process_listener_table_line(&table, port, line, ready);
+            if (matched < 0) {
                 (void)fclose(file);
                 return -1;
             }
-            if (matched == 1) inodes[(*count)++] = inode;
+            if (*ready) break;
         }
         bool failed = ferror(file) != 0;
         int close_result = fclose(file);
         if (failed || close_result != 0) return -1;
+        if (*ready) return 0;
     }
-}
-
-static int system_context_listener_owned(
-    void *opaque,
-    const struct asteriskd_child_identity *identity,
-    const char *host,
-    uint16_t port,
-    bool *owned) {
-    *owned = false;
-    bool valid = false;
-    if (system_context_identity_valid(opaque, identity, &valid) != 0 || !valid) return 0;
-    uint64_t inodes[64U];
-    size_t count = 0U;
-    if (system_collect_listener_inodes(host, port, inodes,
-            sizeof(inodes) / sizeof(inodes[0]), &count) != 0) return -1;
-    for (size_t index = 0U; index < count && !*owned; ++index) {
-        *owned = system_group_has_inode(identity, inodes[index]);
-    }
-    valid = false;
-    if (system_context_identity_valid(opaque, identity, &valid) != 0 || !valid) *owned = false;
-    return 0;
 }
 
 static int system_context_signal_group(
@@ -1564,8 +1476,8 @@ int asteriskd_system_process_backends_init(
     context->core_spec = core_spec;
     context->helper_spec = helper_spec;
     readiness->context = context;
-    readiness->identity_valid = system_context_identity_valid;
-    readiness->listener_owned = system_context_listener_owned;
+    readiness->child_alive = system_context_child_alive;
+    readiness->listener_ready = system_context_listener_ready;
     readiness->interface_exists = system_context_interface_exists;
     stop->context = context;
     stop->identity_valid = system_context_identity_valid;

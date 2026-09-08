@@ -950,8 +950,8 @@ struct asteriskd_readiness_tracker {
 
 struct asteriskd_readiness_backend {
     void *context;
-    int (*identity_valid)(void *, const struct asteriskd_child_identity *, bool *);
-    int (*listener_owned)(void *, const struct asteriskd_child_identity *, const char *, uint16_t, bool *);
+    int (*child_alive)(void *, const struct asteriskd_child_identity *, bool *);
+    int (*listener_ready)(void *, const char *, uint16_t, bool *);
     int (*interface_exists)(void *, const char *, bool *);
 };
 
@@ -967,7 +967,7 @@ int asteriskd_readiness_poll(
     uint64_t, bool);
 #if defined(ASTERISKD_TESTING)
 int asteriskd_test_listener_table_line(
-    const char *, uint16_t, size_t, const char *, uint64_t *);
+    const char *, uint16_t, size_t, const char *, bool *);
 #endif
 
 struct asteriskd_child_exit_status {
