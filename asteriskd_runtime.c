@@ -2301,11 +2301,24 @@ failed:
     return -1;
 }
 
+static int system_capability_find(
+    void *opaque, const char *name, char *path, size_t capacity);
+
 static int system_action_spec(const char *const *argv, struct asteriskd_process_spec *spec) {
-    if (argv == NULL || argv[0] == NULL || argv[0][0] != '/' || spec == NULL) return -1;
+    if (argv == NULL || argv[0] == NULL || argv[0][0] == '\0' || spec == NULL) return -1;
+    const char *executable = argv[0];
+    char *resolved = NULL;
+    if (executable[0] != '/') {
+        char path[ASTERISKD_MAX_PATH];
+        if (system_capability_find(NULL, executable, path, sizeof(path)) != 1) return -1;
+        resolved = realpath(path, NULL);
+        if (resolved == NULL) return -1;
+        executable = resolved;
+    }
     memset(spec, 0, sizeof(*spec));
     int executable_length = snprintf(
-        spec->executable_path, sizeof(spec->executable_path), "%s", argv[0]);
+        spec->executable_path, sizeof(spec->executable_path), "%s", executable);
+    free(resolved);
     int directory_length = snprintf(
         spec->working_directory, sizeof(spec->working_directory), "%s", "/");
     if (executable_length <= 0 || (size_t)executable_length >= sizeof(spec->executable_path) ||
@@ -2470,7 +2483,7 @@ static int system_rule_batch_flush(
             batch->ip[ASTERISKD_IP_FAMILY_IPV6].length,
             batch->xtables_after_ip.bytes, batch->xtables_after_ip.length,
             &document.bytes, &document.length) != 0) return -1;
-    const char *argv[] = {"/system/bin/sh", "/proc/self/fd/3", NULL};
+    const char *argv[] = {"sh", "/proc/self/fd/3", NULL};
     int exit_status = -1;
     int result = system_action_run_document(
         system, argv, &document, &exit_status);
@@ -2561,8 +2574,8 @@ static int system_effect_capability(void *opaque) {
 
 static const char *system_xtables_path(enum asteriskd_ip_family family) {
     return family == ASTERISKD_IP_FAMILY_IPV4
-        ? "/system/bin/iptables" : family == ASTERISKD_IP_FAMILY_IPV6
-            ? "/system/bin/ip6tables" : NULL;
+        ? "iptables" : family == ASTERISKD_IP_FAMILY_IPV6
+            ? "ip6tables" : NULL;
 }
 
 static const char *system_table_name(enum asteriskd_ip_table table) {
@@ -3435,7 +3448,7 @@ static int system_ip_command(struct asteriskd_system_supervisor *system,
         exit_status == NULL) return -1;
     const char *argv[24U];
     size_t count = 0U;
-    argv[count++] = "/system/bin/ip";
+    argv[count++] = "ip";
     argv[count++] = family == ASTERISKD_IP_FAMILY_IPV4 ? "-4" : "-6";
     for (size_t index = 0U; index < argument_count; ++index) {
         if (arguments[index] == NULL || arguments[index][0] == '\0') return -1;
@@ -3453,7 +3466,7 @@ static int system_ip_zero(struct asteriskd_system_supervisor *system,
             (argument_count != 0U && arguments == NULL)) return -1;
         const char *argv[24U];
         size_t count = 0U;
-        argv[count++] = "/system/bin/ip";
+        argv[count++] = "ip";
         argv[count++] = family == ASTERISKD_IP_FAMILY_IPV4 ? "-4" : "-6";
         for (size_t index = 0U; index < argument_count; ++index) {
             if (arguments[index] == NULL || arguments[index][0] == '\0') return -1;
@@ -3569,7 +3582,7 @@ static int system_tc_command(struct asteriskd_system_supervisor *system,
     if (arguments == NULL || argument_count == 0U || argument_count > 20U ||
         exit_status == NULL) return -1;
     const char *argv[22U];
-    argv[0] = "/system/bin/tc";
+    argv[0] = "tc";
     for (size_t index = 0U; index < argument_count; ++index) {
         if (arguments[index] == NULL || arguments[index][0] == '\0') return -1;
         argv[index + 1U] = arguments[index];

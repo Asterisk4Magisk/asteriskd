@@ -169,6 +169,13 @@ static int control_system_accept(void *context, int listener, int *fd, uint32_t 
     return ASTERISKD_CONTROL_BACKEND_OK;
 }
 
+static int control_system_io_error(const char *operation) {
+    int saved_errno = errno;
+    fprintf(stderr, "asteriskd_control operation=%s errno=%d\n", operation, saved_errno);
+    errno = saved_errno;
+    return ASTERISKD_CONTROL_BACKEND_ERROR;
+}
+
 static ptrdiff_t control_system_read(
     void *context,
     int fd,
@@ -179,7 +186,7 @@ static ptrdiff_t control_system_read(
     if (result >= 0) return (ptrdiff_t)result;
     if (errno == EINTR) return ASTERISKD_CONTROL_BACKEND_INTERRUPTED;
     if (errno == EAGAIN || errno == EWOULDBLOCK) return ASTERISKD_CONTROL_BACKEND_AGAIN;
-    return ASTERISKD_CONTROL_BACKEND_ERROR;
+    return control_system_io_error("recv");
 }
 
 static ptrdiff_t control_system_write(
@@ -192,7 +199,7 @@ static ptrdiff_t control_system_write(
     if (result >= 0) return (ptrdiff_t)result;
     if (errno == EINTR) return ASTERISKD_CONTROL_BACKEND_INTERRUPTED;
     if (errno == EAGAIN || errno == EWOULDBLOCK) return ASTERISKD_CONTROL_BACKEND_AGAIN;
-    return ASTERISKD_CONTROL_BACKEND_ERROR;
+    return control_system_io_error("send");
 }
 
 static const struct asteriskd_control_transport_backend control_system_transport_backend = {
@@ -1510,6 +1517,10 @@ enum asteriskd_control_client_result asteriskd_control_client_run_with_backend(
                 (!watch_stream || final_event_received)
                     ? ASTERISKD_CONTROL_CLIENT_OK
                     : ASTERISKD_CONTROL_CLIENT_PROTOCOL_ERROR;
+            if (result != ASTERISKD_CONTROL_CLIENT_OK) {
+                fprintf(stderr, "asteriskd_control operation=read_eof initial=%d partial_bytes=%zu\n",
+                    initial_received ? 1 : 0, line_length);
+            }
             return control_client_close_result(backend, context, &fd, result, response);
         }
         for (size_t index = 0U; index < (size_t)count; ++index) {
@@ -1639,6 +1650,7 @@ static enum asteriskd_control_connect_result control_system_connect_abstract(
     int connected_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd != NULL) *fd = connected_fd;
     if (connected_fd < 0 || fd == NULL || name == NULL || name_length == 0U) {
+        if (connected_fd < 0) (void)control_system_io_error("socket");
         return ASTERISKD_CONTROL_CONNECT_ERROR;
     }
     struct sockaddr_un address;
@@ -1650,7 +1662,10 @@ static enum asteriskd_control_connect_result control_system_connect_abstract(
     if (connect(connected_fd, (const struct sockaddr *)&address, length) == 0) {
         return ASTERISKD_CONTROL_CONNECT_OK;
     }
-    return control_system_connect_result(errno);
+    int saved_errno = errno;
+    enum asteriskd_control_connect_result result = control_system_connect_result(saved_errno);
+    if (result == ASTERISKD_CONTROL_CONNECT_ERROR) (void)control_system_io_error("connect");
+    return result;
 }
 
 static enum asteriskd_control_connect_result control_system_finish_connect(
@@ -1659,8 +1674,14 @@ static enum asteriskd_control_connect_result control_system_finish_connect(
     (void)context;
     int error = 0;
     socklen_t length = (socklen_t)sizeof(error);
-    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) != 0 ||
-        length != sizeof(error)) return ASTERISKD_CONTROL_CONNECT_ERROR;
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) != 0) {
+        (void)control_system_io_error("getsockopt");
+        return ASTERISKD_CONTROL_CONNECT_ERROR;
+    }
+    if (length != sizeof(error)) return ASTERISKD_CONTROL_CONNECT_ERROR;
+    if (control_system_connect_result(error) == ASTERISKD_CONTROL_CONNECT_ERROR) {
+        fprintf(stderr, "asteriskd_control operation=finish_connect errno=%d\n", error);
+    }
     return control_system_connect_result(error);
 }
 
@@ -1693,8 +1714,11 @@ static enum asteriskd_control_wait_result control_system_wait_ready(
         .events = (short)(want_read ? POLLIN : POLLOUT),
     };
     int result = poll(&descriptor, 1U, timeout);
-    if (result < 0) return errno == EINTR
-        ? ASTERISKD_CONTROL_WAIT_INTERRUPTED : ASTERISKD_CONTROL_WAIT_ERROR;
+    if (result < 0) {
+        if (errno == EINTR) return ASTERISKD_CONTROL_WAIT_INTERRUPTED;
+        (void)control_system_io_error("poll");
+        return ASTERISKD_CONTROL_WAIT_ERROR;
+    }
     if (result == 0) return ASTERISKD_CONTROL_WAIT_TIMEOUT;
     if ((descriptor.revents & POLLNVAL) != 0) return ASTERISKD_CONTROL_WAIT_ERROR;
     if (want_read && (descriptor.revents & (POLLIN | POLLHUP | POLLERR)) != 0) *readable = true;
@@ -1860,6 +1884,17 @@ static int control_cli_run_control(
         return exit_code;
     }
     asteriskd_control_response_destroy(&response);
+    if (result != ASTERISKD_CONTROL_CLIENT_ABSENT) {
+        char diagnostic[160U];
+        int length = snprintf(diagnostic, sizeof(diagnostic),
+            "asteriskd_control request=%s result=%s lines=%zu\n", request_id,
+            result == ASTERISKD_CONTROL_CLIENT_TIMEOUT ? "timeout" :
+                result == ASTERISKD_CONTROL_CLIENT_IO_ERROR ? "io_error" : "protocol_error",
+            sink.lines);
+        if (length > 0 && (size_t)length < sizeof(diagnostic)) {
+            (void)backend->write_stderr(context, diagnostic, (size_t)length);
+        }
+    }
     if (sink.lines != 0U) return 1;
     if (result == ASTERISKD_CONTROL_CLIENT_ABSENT) {
         return control_cli_write_response(

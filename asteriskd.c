@@ -32,14 +32,45 @@ static enum asteriskd_control_client_result system_control_client(
         method, request_id, sink, sink_context, response);
 }
 
+static int system_prepare_session(void) {
+#if defined(__linux__) || defined(__ANDROID__)
+    if (getpgrp() == getpid()) {
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("asteriskd: fork");
+            return -1;
+        }
+        if (pid > 0) return 1;
+    }
+    if (setsid() < 0) {
+        perror("asteriskd: setsid");
+        return -1;
+    }
+#endif
+    return 0;
+}
+
+static void system_log_early_result(const char *mode, int status,
+    bool has_result, const struct asteriskd_control_result *result) {
+    if (!has_result) return;
+    fprintf(stderr, "asteriskd_start mode=%s stage=early_exit status=%d code=%d detail=%.256s\n",
+        mode, status, (int)result->code,
+        result->has_message && result->message != NULL ? result->message : "unavailable");
+}
+
 static int system_run_start(
     void *context,
     const char *config_path,
     bool *has_early_result,
     struct asteriskd_control_result *early_result) {
     (void)context;
-    return asteriskd_runtime_start_system(
+    int session = system_prepare_session();
+    if (session != 0) return session < 0 ? -1 : 0;
+    fprintf(stderr, "asteriskd_start mode=start stage=runtime_enter\n");
+    int status = asteriskd_runtime_start_system(
         config_path, has_early_result, early_result);
+    system_log_early_result("start", status, *has_early_result, early_result);
+    return status;
 }
 
 static int system_run_monitor(
@@ -48,8 +79,13 @@ static int system_run_monitor(
     bool *has_early_result,
     struct asteriskd_control_result *early_result) {
     (void)context;
-    return asteriskd_runtime_monitor_system(
+    int session = system_prepare_session();
+    if (session != 0) return session < 0 ? -1 : 0;
+    fprintf(stderr, "asteriskd_start mode=monitor stage=runtime_enter\n");
+    int status = asteriskd_runtime_monitor_system(
         config_path, has_early_result, early_result);
+    system_log_early_result("monitor", status, *has_early_result, early_result);
+    return status;
 }
 
 static int system_write_fd(int fd, const char *bytes, size_t length) {
