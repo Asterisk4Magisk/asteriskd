@@ -625,7 +625,7 @@ int asteriskd_readiness_poll(
     bool ready = false;
     if (tracker->role == ASTERISKD_CHILD_CORE && config->mode == ASTERISKD_MODE_TPROXY) {
         if (backend->listener_ready(
-                backend->context, "*", config->transparent_port, &ready) != 0) {
+                backend->context, identity->pid, config->transparent_port, &ready) != 0) {
             return ASTERISKD_READINESS_IO;
         }
     } else if (tracker->role == ASTERISKD_CHILD_CORE && config->mode == ASTERISKD_MODE_TUN) {
@@ -633,12 +633,12 @@ int asteriskd_readiness_poll(
                 backend->context, config->tunnel_name, &ready) != 0) return ASTERISKD_READINESS_IO;
     } else if (tracker->role == ASTERISKD_CHILD_CORE && config->mode == ASTERISKD_MODE_TUN2SOCKS) {
         const struct asteriskd_hev_helper_config *hev = &config->helper.value.hev;
-        if (backend->listener_ready(backend->context, "*", hev->socks_port, &ready) != 0) {
+        if (backend->listener_ready(backend->context, identity->pid, hev->socks_port, &ready) != 0) {
             return ASTERISKD_READINESS_IO;
         }
     } else if (tracker->role == ASTERISKD_CHILD_CORE && config->mode == ASTERISKD_MODE_BPF2SOCKS) {
         const struct asteriskd_bpf_helper_config *bpf = &config->helper.value.bpf;
-        if (backend->listener_ready(backend->context, "*", bpf->socks_port, &ready) != 0) {
+        if (backend->listener_ready(backend->context, identity->pid, bpf->socks_port, &ready) != 0) {
             return ASTERISKD_READINESS_IO;
         }
     } else if (tracker->role == ASTERISKD_CHILD_CORE && config->mode == ASTERISKD_MODE_EBPF) {
@@ -650,7 +650,7 @@ int asteriskd_readiness_poll(
         }
     } else if (tracker->role == ASTERISKD_CHILD_HELPER && config->mode == ASTERISKD_MODE_BPF2SOCKS) {
         const struct asteriskd_bpf_helper_config *bpf = &config->helper.value.bpf;
-        if (backend->listener_ready(backend->context, "*", bpf->bridge_port, &ready) != 0) {
+        if (backend->listener_ready(backend->context, identity->pid, bpf->bridge_port, &ready) != 0) {
             return ASTERISKD_READINESS_IO;
         }
     } else {
@@ -1239,101 +1239,6 @@ spawn_failed:
 #endif
 }
 
-struct process_listener_table {
-    const char *path;
-    const char *address;
-    size_t address_length;
-};
-
-static int process_listener_table_spec(
-    const char *host,
-    size_t table_index,
-    struct process_listener_table *table) {
-    if (host == NULL || table == NULL) return ASTERISKD_CONFIG_INVALID;
-    memset(table, 0, sizeof(*table));
-    if (strcmp(host, "*") == 0) {
-        if (table_index == 0U) {
-            table->path = "/proc/net/tcp";
-            table->address_length = 8U;
-            return 0;
-        }
-        if (table_index == 1U) {
-            table->path = "/proc/net/tcp6";
-            table->address_length = 32U;
-            return 0;
-        }
-        return ASTERISKD_CONFIG_INVALID;
-    }
-    if (strcmp(host, "0.0.0.0") == 0) {
-        if (table_index == 0U) {
-            table->path = "/proc/net/tcp";
-            table->address = "00000000";
-            table->address_length = 8U;
-            return 0;
-        }
-        if (table_index == 1U) {
-            table->path = "/proc/net/tcp6";
-            table->address = "00000000000000000000000000000000";
-            table->address_length = 32U;
-            return 0;
-        }
-        return ASTERISKD_CONFIG_INVALID;
-    }
-    if (strcmp(host, "127.0.0.1") == 0 && table_index == 0U) {
-        table->path = "/proc/net/tcp";
-        table->address = "0100007F";
-        table->address_length = 8U;
-        return 0;
-    }
-    return ASTERISKD_CONFIG_INVALID;
-}
-
-static int process_listener_table_line(
-    const struct process_listener_table *table,
-    uint16_t port,
-    const char *line,
-    bool *listening) {
-    if (listening != NULL) *listening = false;
-    if (table == NULL || table->path == NULL || table->address_length == 0U ||
-        line == NULL || listening == NULL) {
-        return ASTERISKD_CONFIG_INVALID;
-    }
-    char expected_local[65U];
-    int result = table->address != NULL ?
-        snprintf(expected_local, sizeof(expected_local), "%s:%04X", table->address, (unsigned)port) :
-        snprintf(expected_local, sizeof(expected_local), ":%04X", (unsigned)port);
-    if (result <= 0 || (size_t)result >= sizeof(expected_local)) return ASTERISKD_CONFIG_INVALID;
-    char local[65U];
-    char state[3U];
-    int fields = sscanf(line,
-        " %*u: %64s %*64s %2s", local, state);
-    if (fields != 2 || strcmp(state, "0A") != 0) return 0;
-    const char *observed_local = local;
-    if (table->address == NULL) {
-        if (strlen(local) != table->address_length + 5U) return 0;
-        observed_local += table->address_length;
-    }
-    if (strcmp(observed_local, expected_local) != 0) return 0;
-    *listening = true;
-    return 1;
-}
-
-#if defined(ASTERISKD_TESTING)
-int asteriskd_test_listener_table_line(
-    const char *host,
-    uint16_t port,
-    size_t table_index,
-    const char *line,
-    bool *listening) {
-    if (listening != NULL) *listening = false;
-    struct process_listener_table table;
-    if (process_listener_table_spec(host, table_index, &table) != 0) {
-        return ASTERISKD_CONFIG_INVALID;
-    }
-    return process_listener_table_line(&table, port, line, listening);
-}
-#endif
-
 #if defined(__linux__)
 static const struct asteriskd_process_spec *system_context_spec(
     const struct asteriskd_system_process_context *context,
@@ -1398,37 +1303,42 @@ static int system_context_child_alive(
     return 0;
 }
 
+/* Match the port marker anywhere in the TCP table. */
+static bool process_listener_file_matches(const char *path, uint16_t port) {
+    char marker[8U];
+    int length = snprintf(marker, sizeof(marker), ":%04X ", (unsigned)port);
+    if (length <= 0 || (size_t)length >= sizeof(marker)) return false;
+    FILE *file = fopen(path, "re");
+    if (file == NULL) return false;
+    char *line = NULL;
+    size_t capacity = 0U;
+    bool matched = false;
+    while (getline(&line, &capacity, file) >= 0) {
+        if (strstr(line, marker) != NULL) matched = true;
+    }
+    bool complete = feof(file) != 0 && ferror(file) == 0;
+    free(line);
+    (void)fclose(file);
+    return complete && matched;
+}
+
 static int system_context_listener_ready(
     void *opaque,
-    const char *host,
+    int pid,
     uint16_t port,
     bool *ready) {
     (void)opaque;
     *ready = false;
-    for (size_t table_index = 0U;; ++table_index) {
-        struct process_listener_table table;
-        if (process_listener_table_spec(host, table_index, &table) != 0) {
-            return table_index == 0U ? -1 : 0;
+    static const char *const tables[] = {"net/tcp6", "net/tcp"};
+    for (size_t index = 0U; index < sizeof(tables) / sizeof(tables[0]); ++index) {
+        char path[64U];
+        if (system_proc_path(path, sizeof(path), pid, tables[index]) != 0) return -1;
+        if (process_listener_file_matches(path, port)) {
+            *ready = true;
+            break;
         }
-        FILE *file = fopen(table.path, "re");
-        if (file == NULL) {
-            if (table_index > 0U && errno == ENOENT) continue;
-            return -1;
-        }
-        char line[1024U];
-        while (fgets(line, sizeof(line), file) != NULL) {
-            int matched = process_listener_table_line(&table, port, line, ready);
-            if (matched < 0) {
-                (void)fclose(file);
-                return -1;
-            }
-            if (*ready) break;
-        }
-        bool failed = ferror(file) != 0;
-        int close_result = fclose(file);
-        if (failed || close_result != 0) return -1;
-        if (*ready) return 0;
     }
+    return 0;
 }
 
 static int system_context_signal_group(

@@ -123,9 +123,12 @@ current owner, mode, IPv6 setting, matcher setting, saved phase, and saved
 configuration. Old per-application names are intentionally ignored.
 
 Readiness is adapter-specific and requires a live child. TPROXY waits for
-the configured TCP listener; TUN2SOCKS and bpf2socks wait for the core SOCKS
-listener, and the bpf2socks helper waits for its bridge listener. Port checks
-do not inspect socket ownership or process-group file descriptors. Native TUN
+the configured TCP port; TUN2SOCKS and bpf2socks wait for the core SOCKS
+port, and the bpf2socks helper waits for its bridge port. Port checks
+search for the four-digit hexadecimal port
+marker in /proc/<child-pid>/net/tcp6, then tcp. They do not filter TCP state
+or local versus remote ports, and read failures remain pending until timeout.
+Socket ownership and process-group file descriptors are not inspected. Native TUN
 and the HEV helper wait for the named interface. BOX `ebpf` requires the core
 to survive a fixed 1000 ms window and does not wait for a shared interface.
 Identity checks used to protect process-group termination remain separate.
