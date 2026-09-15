@@ -1188,7 +1188,7 @@ struct asteriskd_owned_token_route {
 
 struct asteriskd_owned_resource_catalog {
     const char *bpf_root;
-    const char *bpf2_root;
+    const char *b2s_root;
     const char *fake_dns_output_chain;
     const char *fake_dns_prerouting_chain;
     const struct asteriskd_owned_chain *chains;
@@ -1683,7 +1683,7 @@ struct asteriskd_token_route_plan {
     struct asteriskd_resource_operation operation;
 };
 
-int asteriskd_bpf2_token_route_plan_build(
+int asteriskd_b2s_token_route_plan_build(
     const struct asteriskd_config *, enum asteriskd_route_slot_state, uint32_t,
     struct asteriskd_token_route_plan *, char *, size_t);
 
@@ -2439,34 +2439,34 @@ int asteriskd_matcher_verify(
     const struct asteriskd_bpf_program_backend *, struct asteriskd_matcher_verification *,
     char *, size_t);
 
-struct asteriskd_bpf2_pin_expectation {
+struct asteriskd_b2s_pin_expectation {
     enum asteriskd_pin_id pin_id;
     char path[ASTERISKD_MAX_PATH];
     bool program;
     char program_name[ASTERISKD_MAX_INTERFACE_NAME];
 };
 
-struct asteriskd_bpf2_pin_plan {
-    struct asteriskd_bpf2_pin_expectation pins[4U];
+struct asteriskd_b2s_pin_plan {
+    struct asteriskd_b2s_pin_expectation pins[4U];
     size_t pin_count;
 };
 
-struct asteriskd_bpf2_verified_pin {
+struct asteriskd_b2s_verified_pin {
     enum asteriskd_pin_id pin_id;
     uint64_t object_id;
     unsigned char tag[ASTERISKD_BPF_PROGRAM_TAG_SIZE];
 };
 
-struct asteriskd_bpf2_verification {
-    struct asteriskd_bpf2_verified_pin pins[4U];
+struct asteriskd_b2s_verification {
+    struct asteriskd_b2s_verified_pin pins[4U];
     size_t pin_count;
 };
 
-int asteriskd_bpf2_pin_plan_build(
-    const struct asteriskd_config *, struct asteriskd_bpf2_pin_plan *);
-const char *asteriskd_bpf2_tc_filter_attachment_name(enum asteriskd_program_id);
-int asteriskd_bpf2_pin_records_build(
-    const struct asteriskd_bpf2_pin_plan *, struct asteriskd_resource_operation *,
+int asteriskd_b2s_pin_plan_build(
+    const struct asteriskd_config *, struct asteriskd_b2s_pin_plan *);
+const char *asteriskd_b2s_tc_filter_attachment_name(enum asteriskd_program_id);
+int asteriskd_b2s_pin_records_build(
+    const struct asteriskd_b2s_pin_plan *, struct asteriskd_resource_operation *,
     size_t, size_t *);
 
 struct asteriskd_bpf_pin_ownership_backend {
@@ -2478,8 +2478,8 @@ struct asteriskd_bpf_pin_ownership_backend {
 int asteriskd_matcher_pin_preflight(
     const struct asteriskd_matcher_pin_plan *,
     const struct asteriskd_bpf_pin_ownership_backend *, char *, size_t);
-int asteriskd_bpf2_pin_preflight(
-    const struct asteriskd_bpf2_pin_plan *,
+int asteriskd_b2s_pin_preflight(
+    const struct asteriskd_b2s_pin_plan *,
     const struct asteriskd_bpf_pin_ownership_backend *, char *, size_t);
 int asteriskd_bpf_pin_cleanup_owned(
     const char *, uint64_t, const struct asteriskd_bpf_pin_ownership_backend *, char *, size_t);
@@ -2488,16 +2488,16 @@ int asteriskd_matcher_verify_residue(
     const struct asteriskd_bpf_program_backend *,
     const struct asteriskd_bpf_pin_ownership_backend *,
     struct asteriskd_matcher_verification *, char *, size_t);
-int asteriskd_bpf2_verify_residue(
-    const struct asteriskd_config *, const struct asteriskd_bpf2_pin_plan *,
+int asteriskd_b2s_verify_residue(
+    const struct asteriskd_config *, const struct asteriskd_b2s_pin_plan *,
     const struct asteriskd_bpf_program_backend *,
     const struct asteriskd_bpf_pin_ownership_backend *,
-    struct asteriskd_bpf2_verification *, char *, size_t);
+    struct asteriskd_b2s_verification *, char *, size_t);
 const struct asteriskd_bpf_pin_ownership_backend *
     asteriskd_system_bpf_pin_ownership_backend(void);
-int asteriskd_bpf2_verify(
-    const struct asteriskd_config *, const struct asteriskd_bpf2_pin_plan *,
-    const struct asteriskd_bpf_program_backend *, struct asteriskd_bpf2_verification *,
+int asteriskd_b2s_verify(
+    const struct asteriskd_config *, const struct asteriskd_b2s_pin_plan *,
+    const struct asteriskd_bpf_program_backend *, struct asteriskd_b2s_verification *,
     char *, size_t);
 const struct asteriskd_bpf_program_backend *asteriskd_system_bpf_program_backend(void);
 

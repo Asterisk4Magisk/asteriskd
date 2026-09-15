@@ -109,7 +109,7 @@ static const struct asteriskd_owned_policy_rule owned_policy_rules[] = {
 
 static const struct asteriskd_owned_resource_catalog owned_resource_catalog = {
     .bpf_root = "/sys/fs/bpf/asterisk",
-    .bpf2_root = "/sys/fs/bpf/asterisk/bpf2socks",
+    .b2s_root = "/sys/fs/bpf/asterisk/bpf2socks",
     .fake_dns_output_chain = "ASTERISK_FAKE_IP_ICMP",
     .fake_dns_prerouting_chain = "ASTERISK_FAKE_IP_ICMP_PRE",
     .chains = owned_chains,

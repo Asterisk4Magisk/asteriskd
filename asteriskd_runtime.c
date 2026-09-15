@@ -9,6 +9,8 @@
 #include <string.h>
 
 #if defined(__linux__) || defined(__ANDROID__)
+#include "udp6_recovery_netlink.h"
+
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <dirent.h>
@@ -1082,10 +1084,10 @@ struct asteriskd_system_supervisor {
     bool matcher_launch_ready;
     bool matcher_plan_ready;
     bool matcher_verified;
-    struct asteriskd_bpf2_pin_plan bpf2_pin_plan;
-    struct asteriskd_bpf2_verification bpf2_verification;
-    bool bpf2_plan_ready;
-    bool bpf2_verified;
+    struct asteriskd_b2s_pin_plan b2s_pin_plan;
+    struct asteriskd_b2s_verification b2s_verification;
+    bool b2s_plan_ready;
+    bool b2s_verified;
     int tc_netlink_fd;
     uint32_t tc_netlink_port_id;
     bool tc_netlink_fd_owned;
@@ -1143,7 +1145,7 @@ static const char *system_pin_path(
     struct asteriskd_system_supervisor *, enum asteriskd_pin_id);
 static uint64_t system_verified_pin_id(
     const struct asteriskd_system_supervisor *, enum asteriskd_pin_id);
-static const struct asteriskd_bpf2_verified_pin *system_bpf2_verified_pin(
+static const struct asteriskd_b2s_verified_pin *system_b2s_verified_pin(
     const struct asteriskd_system_supervisor *, enum asteriskd_pin_id);
 static int system_tc_netlink_dispatch(struct asteriskd_system_supervisor *, short);
 
@@ -3811,9 +3813,9 @@ static int system_expected_tc_netlink_probe(
             ? ASTERISKD_PIN_BPF2SOCKS_TC_INGRESS
             : resource->program_id == ASTERISKD_PROGRAM_BPF2SOCKS_EGRESS
                 ? ASTERISKD_PIN_BPF2SOCKS_TC_EGRESS : ASTERISKD_PIN_COUNT;
-    const struct asteriskd_bpf2_verified_pin *verified =
-        system_bpf2_verified_pin(system, pin_id);
-    const char *name = asteriskd_bpf2_tc_filter_attachment_name(resource->program_id);
+    const struct asteriskd_b2s_verified_pin *verified =
+        system_b2s_verified_pin(system, pin_id);
+    const char *name = asteriskd_b2s_tc_filter_attachment_name(resource->program_id);
     uint32_t parent = resource->direction == ASTERISKD_TC_DIRECTION_INGRESS
         ? ASTERISKD_TC_PARENT_CLSACT_INGRESS
         : resource->direction == ASTERISKD_TC_DIRECTION_EGRESS
@@ -4115,15 +4117,15 @@ static const char *system_pin_path(
             }
         }
     }
-    if (!system->bpf2_plan_ready && system->loaded_config.config.mode == ASTERISKD_MODE_BPF2SOCKS &&
-        asteriskd_bpf2_pin_plan_build(
-            &system->loaded_config.config, &system->bpf2_pin_plan) == 0) {
-        system->bpf2_plan_ready = true;
+    if (!system->b2s_plan_ready && system->loaded_config.config.mode == ASTERISKD_MODE_BPF2SOCKS &&
+        asteriskd_b2s_pin_plan_build(
+            &system->loaded_config.config, &system->b2s_pin_plan) == 0) {
+        system->b2s_plan_ready = true;
     }
-    if (system->bpf2_plan_ready) {
-        for (size_t index = 0U; index < system->bpf2_pin_plan.pin_count; ++index) {
-            if (system->bpf2_pin_plan.pins[index].pin_id == pin_id) {
-                return system->bpf2_pin_plan.pins[index].path;
+    if (system->b2s_plan_ready) {
+        for (size_t index = 0U; index < system->b2s_pin_plan.pin_count; ++index) {
+            if (system->b2s_pin_plan.pins[index].pin_id == pin_id) {
+                return system->b2s_pin_plan.pins[index].path;
             }
         }
     }
@@ -4139,22 +4141,22 @@ static uint64_t system_verified_pin_id(
             }
         }
     }
-    if (system->bpf2_verified) {
-        for (size_t index = 0U; index < system->bpf2_verification.pin_count; ++index) {
-            if (system->bpf2_verification.pins[index].pin_id == pin_id) {
-                return system->bpf2_verification.pins[index].object_id;
+    if (system->b2s_verified) {
+        for (size_t index = 0U; index < system->b2s_verification.pin_count; ++index) {
+            if (system->b2s_verification.pins[index].pin_id == pin_id) {
+                return system->b2s_verification.pins[index].object_id;
             }
         }
     }
     return 0U;
 }
 
-static const struct asteriskd_bpf2_verified_pin *system_bpf2_verified_pin(
+static const struct asteriskd_b2s_verified_pin *system_b2s_verified_pin(
     const struct asteriskd_system_supervisor *system, enum asteriskd_pin_id pin_id) {
-    if (!system->bpf2_verified) return NULL;
-    for (size_t index = 0U; index < system->bpf2_verification.pin_count; ++index) {
-        if (system->bpf2_verification.pins[index].pin_id == pin_id) {
-            return &system->bpf2_verification.pins[index];
+    if (!system->b2s_verified) return NULL;
+    for (size_t index = 0U; index < system->b2s_verification.pin_count; ++index) {
+        if (system->b2s_verification.pins[index].pin_id == pin_id) {
+            return &system->b2s_verification.pins[index];
         }
     }
     return NULL;
@@ -4174,21 +4176,21 @@ static int system_run_matcher_loader(struct asteriskd_system_supervisor *system)
     return 0;
 }
 
-static bool system_bpf2_pins_ready(void *opaque) {
+static bool system_b2s_pins_ready(void *opaque) {
     struct asteriskd_system_supervisor *system = opaque;
     if (system->helper_reaped) return true;
     char error[128U];
-    if (asteriskd_bpf2_verify(
-            &system->loaded_config.config, &system->bpf2_pin_plan,
-            asteriskd_system_bpf_program_backend(), &system->bpf2_verification,
+    if (asteriskd_b2s_verify(
+            &system->loaded_config.config, &system->b2s_pin_plan,
+            asteriskd_system_bpf_program_backend(), &system->b2s_verification,
             error, sizeof(error)) == 0) {
-        system->bpf2_verified = true;
+        system->b2s_verified = true;
         return true;
     }
     return false;
 }
 
-static int system_start_and_verify_bpf2(struct asteriskd_system_supervisor *system) {
+static int system_start_and_verify_b2s(struct asteriskd_system_supervisor *system) {
     if (system_start_helper_process(system, &system->helper_identity) != 0) return -1;
     int64_t now = 0;
     if (system_runtime_clock(system, &now) != 0) return -1;
@@ -4198,8 +4200,8 @@ static int system_start_and_verify_bpf2(struct asteriskd_system_supervisor *syst
             (int64_t)system->loaded_config.config.readiness_timeout_milliseconds,
     };
     return system_pump_condition_periodic(system, &deadline,
-            ASTERISKD_READINESS_POLL_INTERVAL_MILLIS, system_bpf2_pins_ready) == 0 &&
-        system->bpf2_verified && !system->helper_reaped ? 0 : -1;
+            ASTERISKD_READINESS_POLL_INTERVAL_MILLIS, system_b2s_pins_ready) == 0 &&
+        system->b2s_verified && !system->helper_reaped ? 0 : -1;
 }
 
 static int system_sysctl_open(
@@ -4469,11 +4471,11 @@ rule_batch_failed:
     if (!system->pin_batch_active) return -1;
     bool matcher_batch = system->active_pin_batch == ASTERISKD_PIN_BATCH_MATCHER_IPV4 ||
         system->active_pin_batch == ASTERISKD_PIN_BATCH_MATCHER_DUAL_STACK;
-    bool bpf2_batch = system->active_pin_batch == ASTERISKD_PIN_BATCH_BPF2SOCKS_IPV4 ||
+    bool b2s_batch = system->active_pin_batch == ASTERISKD_PIN_BATCH_BPF2SOCKS_IPV4 ||
         system->active_pin_batch == ASTERISKD_PIN_BATCH_BPF2SOCKS_DUAL_STACK;
-    if ((!matcher_batch && !bpf2_batch) ||
+    if ((!matcher_batch && !b2s_batch) ||
         (matcher_batch ? system_run_matcher_loader(system) :
-            system_start_and_verify_bpf2(system)) != 0) {
+            system_start_and_verify_b2s(system)) != 0) {
         if (error != NULL && error_size != 0U) {
             (void)snprintf(error, error_size, "%s",
                 matcher_batch ? "matcher loader or pin verification failed" :
@@ -4847,15 +4849,15 @@ static int system_effect_start_helper(
     const struct asteriskd_bpf_pin_ownership_backend *pin_backend =
         asteriskd_system_bpf_pin_ownership_backend();
     char error[256U];
-    if (asteriskd_bpf2_pin_plan_build(
-            &system->loaded_config.config, &system->bpf2_pin_plan) != 0) return -1;
-    system->bpf2_plan_ready = true;
-    if (pin_backend == NULL || asteriskd_bpf2_pin_preflight(
-            &system->bpf2_pin_plan, pin_backend, error, sizeof(error)) != 0) return -1;
+    if (asteriskd_b2s_pin_plan_build(
+            &system->loaded_config.config, &system->b2s_pin_plan) != 0) return -1;
+    system->b2s_plan_ready = true;
+    if (pin_backend == NULL || asteriskd_b2s_pin_preflight(
+            &system->b2s_pin_plan, pin_backend, error, sizeof(error)) != 0) return -1;
     struct asteriskd_resource_operation records[4U];
     size_t count = 0U;
-    if (asteriskd_bpf2_pin_records_build(
-            &system->bpf2_pin_plan, records, 4U, &count) != 0) return -1;
+    if (asteriskd_b2s_pin_records_build(
+            &system->b2s_pin_plan, records, 4U, &count) != 0) return -1;
     system->active_pin_batch = system->loaded_config.config.enable_ipv6
         ? ASTERISKD_PIN_BATCH_BPF2SOCKS_DUAL_STACK
         : ASTERISKD_PIN_BATCH_BPF2SOCKS_IPV4;
@@ -5059,11 +5061,11 @@ static int system_reconcile_iptables_local_bypass(
             system, ASTERISKD_IP_FAMILY_IPV6) == 0 ? 0 : -1;
 }
 
-static int system_reconcile_bpf2_local_maps(
+static int system_reconcile_b2s_local_maps(
     struct asteriskd_system_supervisor *system) {
     if (system->loaded_config.config.mode != ASTERISKD_MODE_BPF2SOCKS) return 0;
     const struct asteriskd_bpf_map_backend *backend = asteriskd_system_bpf_map_backend();
-    if (!system->bpf2_verified || backend == NULL) return -1;
+    if (!system->b2s_verified || backend == NULL) return -1;
     struct asteriskd_address_set addresses;
     char error[128U];
     const char *path = system_pin_path(
@@ -5668,17 +5670,17 @@ static int system_prepare_owned_tc_identity(
     config.mode = ASTERISKD_MODE_BPF2SOCKS;
     config.helper.type = ASTERISKD_HELPER_BPF2SOCKS;
     config.enable_ipv6 = true;
-    memset(&system->bpf2_pin_plan, 0, sizeof(system->bpf2_pin_plan));
-    memset(&system->bpf2_verification, 0, sizeof(system->bpf2_verification));
-    if (asteriskd_bpf2_pin_plan_build(
-            &config, &system->bpf2_pin_plan) != 0 ||
-        asteriskd_bpf2_verify_residue(
-            &config, &system->bpf2_pin_plan,
+    memset(&system->b2s_pin_plan, 0, sizeof(system->b2s_pin_plan));
+    memset(&system->b2s_verification, 0, sizeof(system->b2s_verification));
+    if (asteriskd_b2s_pin_plan_build(
+            &config, &system->b2s_pin_plan) != 0 ||
+        asteriskd_b2s_verify_residue(
+            &config, &system->b2s_pin_plan,
             asteriskd_system_bpf_program_backend(),
             asteriskd_system_bpf_pin_ownership_backend(),
-            &system->bpf2_verification, error, sizeof(error)) != 0) return -1;
-    system->bpf2_plan_ready = true;
-    system->bpf2_verified = true;
+            &system->b2s_verification, error, sizeof(error)) != 0) return -1;
+    system->b2s_plan_ready = true;
+    system->b2s_verified = true;
     return 0;
 }
 
@@ -5733,7 +5735,7 @@ static int system_reconcile_tc_filters(
     struct asteriskd_system_supervisor *system, bool remove) {
     DIR *directory = opendir("/sys/class/net");
     struct dirent *entry;
-    int result = 0;
+    int result = udp6_recovery_reconcile(remove);
 
     if (directory == NULL) return -1;
     while ((entry = readdir(directory)) != NULL) {
@@ -5911,7 +5913,7 @@ static int system_effect_rules(void *opaque, bool *active,
             &system->loaded_config.config, false,
             &system->rules_backend) != 0) {
         failed_stage = "install";
-    } else if (system_reconcile_bpf2_local_maps(system) != 0) {
+    } else if (system_reconcile_b2s_local_maps(system) != 0) {
         failed_stage = "bpf2-local-map-reconcile";
     } else if (system_reconcile_hotspot_tc(system) != 0) {
         failed_stage = "hotspot-tc-reconcile";
@@ -5965,7 +5967,7 @@ static int system_effect_reconcile(void *opaque, bool *active,
             system, &system->rules_runtime.plan,
             SYSTEM_RULE_SNAPSHOT_AFTER_APPLY) != 0) {
         failed_stage = "rules-snapshot-after-reconcile";
-    } else if (system_reconcile_bpf2_local_maps(system) != 0) {
+    } else if (system_reconcile_b2s_local_maps(system) != 0) {
         failed_stage = "bpf2-local-map";
     } else if (system_reconcile_hotspot_tc(system) != 0) {
         failed_stage = "hotspot-tc";

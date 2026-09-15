@@ -61,8 +61,8 @@ int asteriskd_matcher_pin_preflight(
     return preflight_paths(paths, plan->pin_count, backend, error, error_size);
 }
 
-int asteriskd_bpf2_pin_preflight(
-    const struct asteriskd_bpf2_pin_plan *plan,
+int asteriskd_b2s_pin_preflight(
+    const struct asteriskd_b2s_pin_plan *plan,
     const struct asteriskd_bpf_pin_ownership_backend *backend,
     char *error,
     size_t error_size) {

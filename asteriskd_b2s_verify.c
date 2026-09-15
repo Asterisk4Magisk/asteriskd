@@ -3,7 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 
-const char *asteriskd_bpf2_tc_filter_attachment_name(enum asteriskd_program_id program_id) {
+const char *asteriskd_b2s_tc_filter_attachment_name(enum asteriskd_program_id program_id) {
     return program_id == ASTERISKD_PROGRAM_BPF2SOCKS_INGRESS
         ? "tc_ingress:[*fsobj]"
         : program_id == ASTERISKD_PROGRAM_BPF2SOCKS_EGRESS
@@ -22,10 +22,10 @@ static void set_error(char *error, size_t capacity, const char *message) {
 }
 
 static int append_pin(
-    struct asteriskd_bpf2_pin_plan *plan, enum asteriskd_pin_id pin_id,
+    struct asteriskd_b2s_pin_plan *plan, enum asteriskd_pin_id pin_id,
     const char *root, const char *leaf, bool program, const char *program_name) {
     if (plan->pin_count >= sizeof(plan->pins) / sizeof(plan->pins[0])) return -1;
-    struct asteriskd_bpf2_pin_expectation *pin = &plan->pins[plan->pin_count++];
+    struct asteriskd_b2s_pin_expectation *pin = &plan->pins[plan->pin_count++];
     pin->pin_id = pin_id;
     int written = snprintf(pin->path, sizeof(pin->path), "%s/%s", root, leaf);
     if (written <= 0 || (size_t)written >= sizeof(pin->path)) return -1;
@@ -37,12 +37,12 @@ static int append_pin(
     return 0;
 }
 
-int asteriskd_bpf2_pin_plan_build(
-    const struct asteriskd_config *config, struct asteriskd_bpf2_pin_plan *plan) {
+int asteriskd_b2s_pin_plan_build(
+    const struct asteriskd_config *config, struct asteriskd_b2s_pin_plan *plan) {
     if (plan != NULL) memset(plan, 0, sizeof(*plan));
     if (config == NULL || plan == NULL || config->mode != ASTERISKD_MODE_BPF2SOCKS ||
         config->helper.type != ASTERISKD_HELPER_BPF2SOCKS) return ASTERISKD_CONFIG_INVALID;
-    const char *root = asteriskd_owned_resource_catalog()->bpf2_root;
+    const char *root = asteriskd_owned_resource_catalog()->b2s_root;
     if (append_pin(plan, ASTERISKD_PIN_BPF2SOCKS_LOCAL_ADDRESS_V4,
         root, "local_addr_v4", false, NULL) != 0 ||
         (config->enable_ipv6 && append_pin(plan, ASTERISKD_PIN_BPF2SOCKS_LOCAL_ADDRESS_V6,
@@ -57,8 +57,8 @@ int asteriskd_bpf2_pin_plan_build(
     return 0;
 }
 
-int asteriskd_bpf2_pin_records_build(
-    const struct asteriskd_bpf2_pin_plan *plan, struct asteriskd_resource_operation *records,
+int asteriskd_b2s_pin_records_build(
+    const struct asteriskd_b2s_pin_plan *plan, struct asteriskd_resource_operation *records,
     size_t capacity, size_t *count) {
     if (count != NULL) *count = 0U;
     if (plan == NULL || records == NULL || count == NULL ||
@@ -81,7 +81,7 @@ static bool backend_valid(const struct asteriskd_bpf_program_backend *backend) {
 }
 
 static int verify_map_pin(
-    const struct asteriskd_bpf2_pin_expectation *pin,
+    const struct asteriskd_b2s_pin_expectation *pin,
     const struct asteriskd_bpf_program_backend *backend, uint64_t *object_id) {
     int fd = -1;
     int result = ASTERISKD_CONFIG_IO;
@@ -101,7 +101,7 @@ static int verify_map_pin(
 }
 
 static int verify_program_pin(
-    const struct asteriskd_bpf2_pin_expectation *pin,
+    const struct asteriskd_b2s_pin_expectation *pin,
     const struct asteriskd_bpf_program_backend *backend,
     uint64_t *object_id, unsigned char tag[ASTERISKD_BPF_PROGRAM_TAG_SIZE]) {
     int fd = -1;
@@ -122,10 +122,10 @@ static int verify_program_pin(
 }
 
 static int verify_pins(
-    const struct asteriskd_config *config, const struct asteriskd_bpf2_pin_plan *plan,
+    const struct asteriskd_config *config, const struct asteriskd_b2s_pin_plan *plan,
     const struct asteriskd_bpf_program_backend *backend,
     const struct asteriskd_bpf_pin_ownership_backend *ownership,
-    bool allow_absent, struct asteriskd_bpf2_verification *verification,
+    bool allow_absent, struct asteriskd_b2s_verification *verification,
     char *error, size_t error_capacity) {
     if (verification != NULL) memset(verification, 0, sizeof(*verification));
     if (error != NULL && error_capacity != 0U) error[0] = '\0';
@@ -137,7 +137,7 @@ static int verify_pins(
         set_error(error, error_capacity, "invalid bpf2socks pin verification input");
         return ASTERISKD_CONFIG_INVALID;
     }
-    struct asteriskd_bpf2_verification result;
+    struct asteriskd_b2s_verification result;
     memset(&result, 0, sizeof(result));
     for (size_t index = 0U; index < plan->pin_count; ++index) {
         uint64_t expected_object_id = 0U;
@@ -151,7 +151,7 @@ static int verify_pins(
             }
             if (!exists) continue;
         }
-        struct asteriskd_bpf2_verified_pin *verified = &result.pins[result.pin_count];
+        struct asteriskd_b2s_verified_pin *verified = &result.pins[result.pin_count];
         verified->pin_id = plan->pins[index].pin_id;
         int pin_result = plan->pins[index].program ?
             verify_program_pin(&plan->pins[index], backend, &verified->object_id, verified->tag) :
@@ -167,19 +167,19 @@ static int verify_pins(
     return 0;
 }
 
-int asteriskd_bpf2_verify(
-    const struct asteriskd_config *config, const struct asteriskd_bpf2_pin_plan *plan,
+int asteriskd_b2s_verify(
+    const struct asteriskd_config *config, const struct asteriskd_b2s_pin_plan *plan,
     const struct asteriskd_bpf_program_backend *backend,
-    struct asteriskd_bpf2_verification *verification, char *error, size_t error_capacity) {
+    struct asteriskd_b2s_verification *verification, char *error, size_t error_capacity) {
     return verify_pins(config, plan, backend, NULL, false,
         verification, error, error_capacity);
 }
 
-int asteriskd_bpf2_verify_residue(
-    const struct asteriskd_config *config, const struct asteriskd_bpf2_pin_plan *plan,
+int asteriskd_b2s_verify_residue(
+    const struct asteriskd_config *config, const struct asteriskd_b2s_pin_plan *plan,
     const struct asteriskd_bpf_program_backend *backend,
     const struct asteriskd_bpf_pin_ownership_backend *ownership,
-    struct asteriskd_bpf2_verification *verification, char *error, size_t error_capacity) {
+    struct asteriskd_b2s_verification *verification, char *error, size_t error_capacity) {
     return verify_pins(config, plan, backend, ownership, true,
         verification, error, error_capacity);
 }

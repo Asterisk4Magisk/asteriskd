@@ -3,7 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 
-int asteriskd_bpf2_token_route_plan_build(
+int asteriskd_b2s_token_route_plan_build(
     const struct asteriskd_config *config, enum asteriskd_route_slot_state slot,
     uint32_t loopback_interface_index, struct asteriskd_token_route_plan *plan,
     char *error, size_t error_capacity) {

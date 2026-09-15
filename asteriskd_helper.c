@@ -230,7 +230,7 @@ static unsigned policy_mode(enum asteriskd_app_policy_mode mode) {
 
 static int render_bpf(const struct asteriskd_config *config, int direct_ipv4_fd, int direct_ipv6_fd, struct asteriskd_helper_documents *documents) {
     const struct asteriskd_bpf_helper_config *bpf = &config->helper.value.bpf;
-    const char *pin_namespace = asteriskd_owned_resource_catalog()->bpf2_root;
+    const char *pin_namespace = asteriskd_owned_resource_catalog()->b2s_root;
     if (policy_mode(config->app_policy_mode) > 2U) return ASTERISKD_CONFIG_INVALID;
     bool direct = config->direct_cidrs != NULL;
     if (direct && (direct_ipv4_fd < 0 || direct_ipv6_fd < 0 || direct_ipv4_fd == direct_ipv6_fd)) return ASTERISKD_CONFIG_INVALID;
