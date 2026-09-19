@@ -975,14 +975,11 @@ static bool supported(const struct asteriskd_config *config) {
 
 static int validate_topology(const struct asteriskd_config *config) {
     const char *directory = config->owner == ASTERISKD_OWNER_NG ? "xray" : config->owner == ASTERISKD_OWNER_BOX ? "sing-box" : "clash";
-    const char *executable = config->owner == ASTERISKD_OWNER_NG ? "xray" : config->owner == ASTERISKD_OWNER_BOX ? "sing-box" : "mihomo";
     const char *config_name = config->owner == ASTERISKD_OWNER_META ? "config.yaml" : "config.json";
     const char *basename = strrchr(config->working_directory, '/');
     if (basename == NULL || strcmp(basename + 1, directory) != 0) return -1;
     char expected[ASTERISKD_MAX_PATH];
-    int length = snprintf(expected, sizeof(expected), "%s/%s", config->working_directory, executable);
-    if (length < 0 || (size_t)length >= sizeof(expected) || strcmp(expected, config->core_executable_path) != 0) return -1;
-    length = snprintf(expected, sizeof(expected), "%s/%s", config->working_directory, config_name);
+    int length = snprintf(expected, sizeof(expected), "%s/%s", config->working_directory, config_name);
     if (length < 0 || (size_t)length >= sizeof(expected) || strcmp(expected, config->core_config_path) != 0) return -1;
     length = snprintf(expected, sizeof(expected), "%s/asteriskd.state", config->working_directory);
     if (length < 0 || (size_t)length >= sizeof(expected) || strcmp(expected, config->state_path) != 0) return -1;
