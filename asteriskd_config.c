@@ -605,11 +605,23 @@ static int parse_network(
     static const char *const names[] = {
         "enableIpv6", "disableSystemIpv6", "enableLocalDns", "enableFakeDns", "fakeDnsIpv4Pool",
         "ignoredInterfaces", "virtualInterfaces", "hotspotInterfacePrefixes", "proxyPrivateCidrs",
-        "bypassPrivateCidrs", "appPolicy",
+        "bypassPrivateCidrs", "appPolicy", "dnsHijackScope",
     };
-    size_t values[11];
-    if (object_fields(document, object, names, 11U, values) != 0 ||
-        parse_bool(document, values[0], &config->enable_ipv6) != 0 ||
+    size_t values[12];
+    // The DNS hijack scope is optional: configurations written before it existed
+    // keep the historical global interception behaviour.
+    bool has_dns_hijack_scope = object_fields(document, object, names, 12U, values) == 0;
+    if (!has_dns_hijack_scope &&
+        object_fields(document, object, names, 11U, values) != 0) return -1;
+    config->dns_hijack_scope = ASTERISKD_DNS_HIJACK_GLOBAL;
+    if (has_dns_hijack_scope) {
+        if (token_equals(document, values[11], "global")) {
+            config->dns_hijack_scope = ASTERISKD_DNS_HIJACK_GLOBAL;
+        } else if (token_equals(document, values[11], "appPolicy")) {
+            config->dns_hijack_scope = ASTERISKD_DNS_HIJACK_APP_POLICY;
+        } else return -1;
+    }
+    if (parse_bool(document, values[0], &config->enable_ipv6) != 0 ||
         parse_bool(document, values[1], &config->disable_system_ipv6) != 0 ||
         parse_bool(document, values[2], &config->enable_local_dns) != 0 ||
         parse_bool(document, values[3], &config->enable_fake_dns) != 0) return -1;
@@ -810,9 +822,13 @@ static int parse_mode_options(
     const struct asteriskd_json_document *document,
     size_t object,
     struct asteriskd_config *config) {
-    static const char *const names[] = {"transparentPort", "tunnelName"};
-    size_t values[2];
-    if (object_fields(document, object, names, 2U, values) != 0) return -1;
+    static const char *const names[] = {"transparentPort", "tunnelName", "fakeIpRelayPort"};
+    size_t values[3];
+    // The relay port is optional: a configuration written before it existed, and
+    // one written by an application that keeps the relay on the fallback port,
+    // both leave it out.
+    bool has_relay_port = object_fields(document, object, names, 3U, values) == 0;
+    if (!has_relay_port && object_fields(document, object, names, 2U, values) != 0) return -1;
     if (document->tokens[values[0]].type != ASTERISKD_JSON_NULL) {
         uint32_t port = 0U;
         if (parse_u32(document, values[0], &port) != 0 || port == 0U || port > 65535U) return -1;
@@ -823,6 +839,13 @@ static int parse_mode_options(
         config->has_tunnel_name = true;
         if (copy_string(document, values[1], config->tunnel_name, sizeof(config->tunnel_name)) != 0 ||
             !interface_is_valid(config->tunnel_name, false)) return -1;
+    }
+    config->fake_ip_relay_port = (uint16_t)ASTERISKD_FAKE_IP_RELAY_PORT;
+    if (has_relay_port && document->tokens[values[2]].type != ASTERISKD_JSON_NULL) {
+        uint32_t port = 0U;
+        if (parse_u32(document, values[2], &port) != 0 || port == 0U || port > 65535U) return -1;
+        config->has_fake_ip_relay_port = true;
+        config->fake_ip_relay_port = (uint16_t)port;
     }
     return 0;
 }
@@ -935,10 +958,33 @@ static int validate_cross_fields(struct asteriskd_config *config) {
         unsigned long prefix = strtoul(slash + 1, NULL, 10);
         if (prefix < 1UL || prefix > 30UL) return -1;
     } else if (config->has_fake_dns_ipv4_pool) return -1;
+    // Following the application policy for DNS only makes sense when an
+    // application policy exists; the global policy already covers every uid.
+    if (config->dns_hijack_scope == ASTERISKD_DNS_HIJACK_APP_POLICY &&
+        config->app_policy_mode == ASTERISKD_APP_POLICY_GLOBAL) return -1;
     if ((config->mode == ASTERISKD_MODE_TPROXY) != config->has_transparent_port ||
         (config->mode == ASTERISKD_MODE_TUN) != config->has_tunnel_name) return -1;
     if (config->mode != ASTERISKD_MODE_TPROXY && config->has_transparent_port) return -1;
     if (config->mode != ASTERISKD_MODE_TUN && config->has_tunnel_name) return -1;
+    // The relay runs in the modes that enforce the application policy themselves.
+    if (config->has_fake_ip_relay_port && config->mode != ASTERISKD_MODE_TPROXY &&
+        config->mode != ASTERISKD_MODE_TUN2SOCKS && config->mode != ASTERISKD_MODE_BPF2SOCKS) {
+        return -1;
+    }
+    // Two inbounds cannot share one port, and the relay is the one that moves.
+    // The port counts even when the configuration left it out, because the relay
+    // then falls back to the fixed one. Only a configuration that can hand out
+    // fake answers for the applications the policy leaves out is checked at all,
+    // which is the condition the relay itself runs under: an application that
+    // keeps the core's inbounds to itself still names a port, and a configuration
+    // that never relays must not be rejected over a port nothing listens on. A
+    // transparent port only exists in the mode that proxies with it, which is one
+    // of the three the relay serves.
+    if (config->enable_fake_dns && config->has_fake_dns_ipv4_pool &&
+        config->dns_hijack_scope == ASTERISKD_DNS_HIJACK_APP_POLICY &&
+        config->app_policy_mode != ASTERISKD_APP_POLICY_GLOBAL &&
+        config->has_transparent_port &&
+        config->fake_ip_relay_port == config->transparent_port) return -1;
     if ((config->mode == ASTERISKD_MODE_TUN2SOCKS && config->helper.type != ASTERISKD_HELPER_HEV_SOCKS5_TUNNEL) ||
         (config->mode == ASTERISKD_MODE_BPF2SOCKS && config->helper.type != ASTERISKD_HELPER_BPF2SOCKS) ||
         ((config->mode == ASTERISKD_MODE_TPROXY || config->mode == ASTERISKD_MODE_TUN || config->mode == ASTERISKD_MODE_EBPF) && config->helper.type != ASTERISKD_HELPER_NONE)) return -1;
@@ -959,7 +1005,7 @@ static int validate_cross_fields(struct asteriskd_config *config) {
          config->bypass_private_cidr_count != 0U || config->app_policy_mode != ASTERISKD_APP_POLICY_GLOBAL ||
          config->uid_count != 0U || config->bypass_uid_count != 0U || config->has_direct_cidr_paths ||
          config->matcher.enabled || config->helper.type != ASTERISKD_HELPER_NONE ||
-         config->has_transparent_port ||
+         config->has_transparent_port || config->has_fake_ip_relay_port ||
          (config->mode == ASTERISKD_MODE_EBPF && config->has_tunnel_name))) return -1;
     return 0;
 }

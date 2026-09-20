@@ -76,7 +76,13 @@ struct asteriskd_resource_operation;
     ASTERISKD_ANONYMOUS_SEAL_SEAL)
 #define ASTERISKD_IPTABLES_WAIT_SECONDS 100U
 #define ASTERISKD_ROUTE_RULE_PRIORITY 14599U
+// RELAY marks the connections and the datagrams the fake IP relay takes over.
+// They are routed to the same local table as proxied traffic, but through a
+// rule of their own, so a relayed packet can never be mistaken for a proxied
+// one.
+#define ASTERISKD_RELAY_ROUTE_RULE_PRIORITY 14598U
 #define ASTERISKD_PRIMARY_MARK UINT32_C(0x20000000)
+#define ASTERISKD_RELAY_MARK UINT32_C(0x40000000)
 #define ASTERISKD_MARK_MASK UINT32_C(0x60000000)
 #define ASTERISKD_TPROXY_TABLE 160U
 #define ASTERISKD_TUN_TABLE 168U
@@ -299,6 +305,32 @@ enum asteriskd_app_policy_mode {
     ASTERISKD_APP_POLICY_WHITELIST,
 };
 
+// DNS interception scope for locally generated queries.
+//
+// ASTERISKD_DNS_HIJACK_GLOBAL intercepts DNS for every uid and leaves the
+// applications the policy excludes to the address the core answered with.
+//
+// ASTERISKD_DNS_HIJACK_APP_POLICY intercepts DNS for every uid as well and
+// additionally keeps the excluded applications working: the Android resolver
+// answers for every application at once, so a fake answer reaches applications
+// the policy excludes. Those connections are handed to the supervised core's
+// direct inbound instead of being sent to an address only the core can
+// translate. The configured answer mode (fake-ip or redir-host) is never
+// rewritten by this scope.
+enum asteriskd_dns_hijack_scope {
+    ASTERISKD_DNS_HIJACK_GLOBAL,
+    ASTERISKD_DNS_HIJACK_APP_POLICY,
+};
+
+// Port the relay takes its traffic over to. The configuration may choose another
+// one, because the mode that runs the relay may already use this port for the
+// inbound its own traffic arrives on; this is only the fallback.
+//
+// One inbound serves both transports: the core's tproxy listener takes
+// connections and datagrams on the same port, so the relay needs a single
+// endpoint and a single delivery mechanism for both.
+#define ASTERISKD_FAKE_IP_RELAY_PORT 65534U
+
 enum asteriskd_helper_type {
     ASTERISKD_HELPER_NONE,
     ASTERISKD_HELPER_HEV_SOCKS5_TUNNEL,
@@ -381,6 +413,7 @@ struct asteriskd_config {
     bool enable_fake_dns;
     bool has_fake_dns_ipv4_pool;
     char fake_dns_ipv4_pool[ASTERISKD_MAX_CIDR];
+    enum asteriskd_dns_hijack_scope dns_hijack_scope;
     char ignored_interfaces[ASTERISKD_MAX_INTERFACES][ASTERISKD_MAX_INTERFACE_NAME];
     size_t ignored_interface_count;
     char virtual_interfaces[ASTERISKD_MAX_INTERFACES][ASTERISKD_MAX_INTERFACE_NAME];
@@ -403,6 +436,8 @@ struct asteriskd_config {
 
     bool has_transparent_port;
     uint16_t transparent_port;
+    bool has_fake_ip_relay_port;
+    uint16_t fake_ip_relay_port;
     bool has_tunnel_name;
     char tunnel_name[ASTERISKD_MAX_TUNNEL_NAME];
     struct asteriskd_matcher_config matcher;
@@ -1115,6 +1150,7 @@ enum asteriskd_chain_id {
     ASTERISKD_CHAIN_ROUTING,
     ASTERISKD_CHAIN_DNS,
     ASTERISKD_CHAIN_FAKE_DNS,
+    ASTERISKD_CHAIN_FAKE_IP_RELAY,
     ASTERISKD_CHAIN_LOCAL_BYPASS,
     ASTERISKD_CHAIN_HOTSPOT,
     ASTERISKD_CHAIN_COUNT,
@@ -1125,6 +1161,7 @@ enum asteriskd_rule_id {
     ASTERISKD_RULE_ROUTING_ENTRY,
     ASTERISKD_RULE_DNS_ENTRY,
     ASTERISKD_RULE_FAKE_DNS_ENTRY,
+    ASTERISKD_RULE_FAKE_IP_RELAY_ENTRY,
     ASTERISKD_RULE_LOCAL_BYPASS_ENTRY,
     ASTERISKD_RULE_HOTSPOT_ENTRY,
     ASTERISKD_RULE_COUNT,
@@ -1132,6 +1169,7 @@ enum asteriskd_rule_id {
 
 enum asteriskd_ip_rule_id {
     ASTERISKD_IP_RULE_TPROXY,
+    ASTERISKD_IP_RULE_TPROXY_RELAY,
     ASTERISKD_IP_RULE_TUNNEL,
     ASTERISKD_IP_RULE_TOKEN,
     ASTERISKD_IP_RULE_COUNT,
@@ -1536,6 +1574,15 @@ void asteriskd_rules_runtime_init(struct asteriskd_rules_runtime *);
 bool asteriskd_xtables_private_chain_shape_valid(
     const char *, size_t, const char *, size_t);
 size_t asteriskd_xtables_fake_dns_arguments(const char *, const char **);
+size_t asteriskd_xtables_fake_ip_relay_mark_arguments(
+    const char *, const char *, const char *, const char **);
+size_t asteriskd_xtables_fake_ip_relay_mark_all_arguments(
+    const char *, const char *, const char **);
+size_t asteriskd_xtables_fake_ip_relay_return_arguments(
+    const char *, const char *, const char *, const char **);
+size_t asteriskd_xtables_fake_ip_relay_transparent_arguments(
+    const char *, const char *, const char *, const char **);
+bool asteriskd_fake_ip_relay_enabled(const struct asteriskd_config *);
 int asteriskd_xtables_private_chain_counts(
     const char *, size_t, const char *, size_t *, size_t *);
 size_t asteriskd_xtables_hook_arguments(

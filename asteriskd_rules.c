@@ -110,6 +110,87 @@ static int transaction_add_fake_dns(
     return 0;
 }
 
+// A mode that routes its own marked traffic into the transparent table has
+// already put the local route there, and a table holds one local default route:
+// adding it twice fails the transaction, so the relay only brings its own when
+// nothing has routed into that table yet.
+static bool transaction_routes_locally(
+    const struct asteriskd_rule_transaction_plan *plan,
+    enum asteriskd_ip_family family,
+    uint32_t table) {
+    for (size_t index = 0U; index < plan->route_count; ++index) {
+        const struct asteriskd_route_effect *effect = &plan->routes[index];
+        if (effect->kind == ASTERISKD_ROUTE_EFFECT_ROUTE &&
+            effect->family == family && effect->table == table &&
+            effect->local_route) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Relayed connections and datagrams are delivered to a socket on this device, so
+// they need the local table and a selector of their own: the proxy mark names the
+// applications the policy proxies, and the relay mark the ones it leaves out. The
+// relay brings its own chains because the modes it serves disagree about the mark
+// they use for proxied traffic.
+static int transaction_add_relay(
+    struct asteriskd_rule_transaction_plan *plan) {
+    struct asteriskd_private_chain_group *group = transaction_add_private_group(plan,
+        ASTERISKD_IP_FAMILY_IPV4, ASTERISKD_IP_TABLE_MANGLE,
+        ASTERISKD_CHAIN_FAKE_IP_RELAY);
+    if (group == NULL ||
+        transaction_copy_text(group->names[0], ASTERISKD_MAX_CHAIN_NAME,
+            "ASTERISK_RELAY_PREROUTING") != 0 ||
+        transaction_copy_text(group->names[1], ASTERISKD_MAX_CHAIN_NAME,
+            "ASTERISK_RELAY_OUTPUT") != 0) {
+        return ASTERISKD_CONFIG_INVALID;
+    }
+    group->name_count = 2U;
+    struct asteriskd_traffic_hook_group *hooks = transaction_add_hook_group(plan,
+        ASTERISKD_IP_FAMILY_IPV4, ASTERISKD_IP_TABLE_MANGLE,
+        ASTERISKD_CHAIN_FAKE_IP_RELAY, ASTERISKD_RULE_FAKE_IP_RELAY_ENTRY);
+    // The takeover runs on the local path the mark routes into, which enters the
+    // stack again at the prerouting hook. Both jumps stay behind the ones of the
+    // proxy policy, because the relay has to see what that policy marked.
+    if (transaction_add_hook(hooks, ASTERISKD_BUILTIN_PREROUTING, false,
+            ASTERISKD_HOOK_JUMP, false, group->names[0]) != 0 ||
+        transaction_add_hook(hooks, ASTERISKD_BUILTIN_OUTPUT, false,
+            ASTERISKD_HOOK_JUMP, false, group->names[1]) != 0) {
+        return ASTERISKD_CONFIG_INVALID;
+    }
+    bool needs_local_route = !transaction_routes_locally(
+        plan, ASTERISKD_IP_FAMILY_IPV4, ASTERISKD_TPROXY_TABLE);
+    if (plan->route_count + (needs_local_route ? 2U : 1U) >
+        ASTERISKD_RULE_TRANSACTION_MAX_ROUTES) {
+        return ASTERISKD_CONFIG_INVALID;
+    }
+    struct asteriskd_route_effect *rule = &plan->routes[plan->route_count++];
+    memset(rule, 0, sizeof(*rule));
+    rule->kind = ASTERISKD_ROUTE_EFFECT_IP_RULE;
+    rule->family = ASTERISKD_IP_FAMILY_IPV4;
+    rule->table = ASTERISKD_TPROXY_TABLE;
+    rule->priority = ASTERISKD_RELAY_ROUTE_RULE_PRIORITY;
+    rule->mark = ASTERISKD_RELAY_MARK;
+    rule->mark_mask = ASTERISKD_MARK_MASK;
+    rule->ip_rule_id = ASTERISKD_IP_RULE_TPROXY_RELAY;
+    if (!needs_local_route) return 0;
+    struct asteriskd_route_effect *route = &plan->routes[plan->route_count++];
+    memset(route, 0, sizeof(*route));
+    route->kind = ASTERISKD_ROUTE_EFFECT_ROUTE;
+    route->family = ASTERISKD_IP_FAMILY_IPV4;
+    route->table = ASTERISKD_TPROXY_TABLE;
+    route->local_route = true;
+    route->route_id = ASTERISKD_ROUTE_TPROXY;
+    if (transaction_copy_text(route->destination,
+            sizeof(route->destination), "default") != 0 ||
+        transaction_copy_text(route->interface_name,
+            sizeof(route->interface_name), "lo") != 0) {
+        return ASTERISKD_CONFIG_INVALID;
+    }
+    return 0;
+}
+
 int asteriskd_rule_transaction_plan_build(
     const struct asteriskd_config *config,
     bool has_global_ipv6_address,
@@ -158,6 +239,9 @@ int asteriskd_rule_transaction_plan_build(
         }
     }
     if (config->enable_fake_dns && transaction_add_fake_dns(plan) != 0) {
+        return ASTERISKD_CONFIG_INVALID;
+    }
+    if (asteriskd_fake_ip_relay_enabled(config) && transaction_add_relay(plan) != 0) {
         return ASTERISKD_CONFIG_INVALID;
     }
     plan->hooks_are_last = true;

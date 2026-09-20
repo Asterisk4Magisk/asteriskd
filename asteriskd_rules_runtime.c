@@ -12,6 +12,28 @@ struct output_token {
     size_t length;
 };
 
+// The relay mark is named once: the rule that applies it and the rule that
+// selects it again have to spell out exactly the same value.
+static const char *const relay_mark_text = "0x40000000/0x60000000";
+
+// The relay takes over the two transports the core's transparent inbound
+// serves. Every rule it builds names exactly one of them, so a rule that named
+// anything else would silently carry nothing.
+static bool relay_protocol_supported(const char *protocol) {
+    return protocol != NULL &&
+        (strcmp(protocol, "tcp") == 0 || strcmp(protocol, "udp") == 0);
+}
+
+// Text a relay rule spells out is compared with the kernel output later, so it
+// may carry nothing but the value itself.
+static bool relay_text_supported(const char *text, size_t capacity, bool digits_only) {
+    size_t length = text == NULL ? 0U : strnlen(text, capacity);
+    if (length == 0U || length >= capacity || strpbrk(text, " \t\r\n") != NULL) {
+        return false;
+    }
+    return !digits_only || strspn(text, "0123456789") == length;
+}
+
 static bool output_token_equals(const struct output_token *token, const char *text) {
     size_t length = strlen(text);
     return token->length == length && memcmp(token->bytes, text, length) == 0;
@@ -236,6 +258,155 @@ size_t asteriskd_xtables_fake_dns_arguments(
     arguments[8] = "-j";
     arguments[9] = "REDIRECT";
     return 10U;
+}
+
+// A fake answer is only routable through the core that produced it. When the
+// application policy leaves a connection out, it is not handed to the core, so
+// the fake address the platform resolver delivered would stay unreachable. Such
+// traffic is handed to the core's direct inbound instead, which resolves the
+// fake address back to its domain and connects without the proxy. Only traffic
+// the policy did not mark is taken over, and the supervised core is exempt so
+// its own direct connections cannot be captured again.
+//
+// The mark is applied per transport. Everything it selects is routed into the
+// local table, where only the transparent rules below accept it, and those
+// serve connections and datagrams: another protocol taken there would be lost.
+//
+// The mark has to select the applications the policy leaves out, and which
+// shape expresses that depends on the policy: a blacklist without a matcher
+// makes them known by uid, everything else by the absence of the proxy mark.
+// A NULL uid selects the latter.
+size_t asteriskd_xtables_fake_ip_relay_mark_arguments(
+    const char *pool, const char *uid, const char *protocol,
+    const char **arguments) {
+    if (arguments == NULL || !relay_text_supported(pool, ASTERISKD_MAX_CIDR, false)) return 0U;
+    if (!relay_protocol_supported(protocol)) return 0U;
+    if (uid != NULL && !relay_text_supported(uid, 16U, true)) return 0U;
+    size_t count = 0U;
+    arguments[count++] = "-d";
+    arguments[count++] = pool;
+    arguments[count++] = "-p";
+    arguments[count++] = protocol;
+    if (uid == NULL) {
+        arguments[count++] = "-m";
+        arguments[count++] = "mark";
+        arguments[count++] = "!";
+        arguments[count++] = "--mark";
+        arguments[count++] = "0x20000000/0x60000000";
+    } else {
+        arguments[count++] = "-m";
+        arguments[count++] = "owner";
+        arguments[count++] = "--uid-owner";
+        arguments[count++] = uid;
+    }
+    arguments[count++] = "-m";
+    arguments[count++] = "owner";
+    arguments[count++] = "!";
+    arguments[count++] = "--gid-owner";
+    arguments[count++] = "3005";
+    arguments[count++] = "-j";
+    arguments[count++] = "MARK";
+    arguments[count++] = "--set-xmark";
+    arguments[count++] = relay_mark_text;
+    return count;
+}
+
+// Marks the fake addresses of every application but the supervised core. A mode
+// whose application policy lives outside netfilter cannot be asked about the
+// proxy mark, so there the relay names the applications it takes over by uid
+// instead: this rule covers all of them, and the return rule below takes the
+// ones the policy does proxy back out again.
+size_t asteriskd_xtables_fake_ip_relay_mark_all_arguments(
+    const char *pool, const char *protocol, const char **arguments) {
+    if (arguments == NULL || !relay_text_supported(pool, ASTERISKD_MAX_CIDR, false) ||
+        !relay_protocol_supported(protocol)) return 0U;
+    size_t count = 0U;
+    arguments[count++] = "-d";
+    arguments[count++] = pool;
+    arguments[count++] = "-p";
+    arguments[count++] = protocol;
+    arguments[count++] = "-m";
+    arguments[count++] = "owner";
+    arguments[count++] = "!";
+    arguments[count++] = "--gid-owner";
+    arguments[count++] = "3005";
+    arguments[count++] = "-j";
+    arguments[count++] = "MARK";
+    arguments[count++] = "--set-xmark";
+    arguments[count++] = relay_mark_text;
+    return count;
+}
+
+// Leaves the marked traffic of one application to the proxy itself, which is how
+// a whitelist expresses the applications the policy leaves out.
+size_t asteriskd_xtables_fake_ip_relay_return_arguments(
+    const char *pool, const char *uid, const char *protocol, const char **arguments) {
+    if (arguments == NULL || !relay_text_supported(pool, ASTERISKD_MAX_CIDR, false) ||
+        !relay_text_supported(uid, 16U, true) ||
+        !relay_protocol_supported(protocol)) return 0U;
+    size_t count = 0U;
+    arguments[count++] = "-d";
+    arguments[count++] = pool;
+    arguments[count++] = "-p";
+    arguments[count++] = protocol;
+    arguments[count++] = "-m";
+    arguments[count++] = "owner";
+    arguments[count++] = "--uid-owner";
+    arguments[count++] = uid;
+    arguments[count++] = "-j";
+    arguments[count++] = "RETURN";
+    return count;
+}
+
+// Takes over the marked traffic on the local path. The destination is kept
+// unchanged, so the core still learns the fake address the application wanted
+// to reach: connections are delivered to the transparent socket under the
+// address they were sent to, and datagrams carry that address beside them.
+//
+// Only the pool is taken over, although the mark is already limited to it: the
+// core answers under the fake address, so its replies carry the same mark while
+// they are on their way back to the application, and taking those over would
+// hand them to the core again instead of delivering them.
+//
+// Both transports share the endpoint, because the core's transparent inbound
+// serves both on one port.
+size_t asteriskd_xtables_fake_ip_relay_transparent_arguments(
+    const char *pool, const char *port, const char *protocol, const char **arguments) {
+    if (arguments == NULL || !relay_text_supported(pool, ASTERISKD_MAX_CIDR, false) ||
+        !relay_text_supported(port, 6U, true) ||
+        !relay_protocol_supported(protocol)) return 0U;
+    size_t count = 0U;
+    arguments[count++] = "-d";
+    arguments[count++] = pool;
+    arguments[count++] = "-p";
+    arguments[count++] = protocol;
+    arguments[count++] = "-m";
+    arguments[count++] = "mark";
+    arguments[count++] = "--mark";
+    arguments[count++] = relay_mark_text;
+    arguments[count++] = "-j";
+    arguments[count++] = "TPROXY";
+    arguments[count++] = "--on-port";
+    arguments[count++] = port;
+    arguments[count++] = "--on-ip";
+    arguments[count++] = "0.0.0.0";
+    arguments[count++] = "--tproxy-mark";
+    arguments[count++] = relay_mark_text;
+    return count;
+}
+
+// The relay only has a purpose while the platform resolver hands out fake
+// answers, the policy actually leaves applications out of the proxy, and the
+// mode takes its application policy from netfilter. A core managed mode routes
+// every application itself, so nothing is left for a relay to keep working.
+bool asteriskd_fake_ip_relay_enabled(const struct asteriskd_config *config) {
+    return config != NULL &&
+        (config->mode == ASTERISKD_MODE_TPROXY ||
+            config->mode == ASTERISKD_MODE_TUN2SOCKS ||
+            config->mode == ASTERISKD_MODE_BPF2SOCKS) &&
+        config->dns_hijack_scope == ASTERISKD_DNS_HIJACK_APP_POLICY &&
+        config->app_policy_mode != ASTERISKD_APP_POLICY_GLOBAL &&
+        config->enable_fake_dns && config->has_fake_dns_ipv4_pool;
 }
 
 int asteriskd_xtables_private_chain_counts(

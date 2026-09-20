@@ -73,11 +73,18 @@ Top-level sections are:
 - `schemaVersion`, `owner`, `coreType`, and `mode`;
 - `paths` for the core executable/config, working directory, state, and log;
 - `core` for the readiness timeout and optional Mihomo AGE secret;
-- `modeOptions` for the tproxy port or TUN name;
+- `modeOptions` for the tproxy port, the TUN name, or the fake IP relay port;
 - `network` for IPv6 intent, DNS/fake-DNS, interface selectors, private CIDRs,
   UID policy, and inline canonical direct CIDRs;
 - nullable `helper` (`hev-socks5-tunnel` or `bpf2socks`);
 - nullable `matcher`, containing only its executable path.
+
+Two keys are optional, so a configuration written before they existed keeps
+parsing: `network.dnsHijackScope` defaults to `global`, and
+`modeOptions.fakeIpRelayPort` defaults to the fixed relay port. The relay port is
+accepted by the modes that enforce the application policy themselves and has to
+differ from the tproxy port, and `appPolicy` requires an application policy other
+than `global`.
 
 Direct CIDRs are inline immutable snapshots. The supervisor renders matcher and
 bpf2socks policy/config into sealed anonymous descriptors and passes
