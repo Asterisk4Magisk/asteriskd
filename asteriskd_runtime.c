@@ -6449,8 +6449,7 @@ static int system_runtime_run(const char *config_path, bool initial_start,
     size_t secret_length = secret == NULL ? 0U : strlen((const char *)secret);
     if (asteriskd_log_open(&system.logger, system.loaded_config.config.log_path,
             secret, secret_length, &clock, error, sizeof(error)) != 0 ||
-        asteriskd_state_store_init(&system.store, system.loaded_config.directory.fd,
-            system.loaded_config.directory.device, system.loaded_config.directory.inode,
+        asteriskd_state_store_init(&system.store, system.loaded_config.config.state_path,
             error, sizeof(error)) != ASTERISKD_STATE_OK) {
         (void)close(listener);
         *has_early_result = true;

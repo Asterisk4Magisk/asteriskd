@@ -55,6 +55,11 @@ int asteriskd_core_process_spec(
     }
     memcpy(spec->executable_path, config->core_executable_path, executable_length + 1U);
     memcpy(spec->working_directory, config->working_directory, directory_length + 1U);
+    if (asteriskd_log_sibling_path(config->log_path, "error.log",
+            spec->output_path, sizeof(spec->output_path)) != 0) {
+        core_error(error, error_size, "invalid core log path");
+        return ASTERISKD_CONFIG_INVALID;
+    }
     spec->uid = 0U;
     spec->gid = 3005U;
     spec->output_mode = ASTERISKD_PROCESS_OUTPUT_APPEND_CORE_LOG;

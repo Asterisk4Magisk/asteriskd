@@ -597,6 +597,7 @@ int asteriskd_state_store_init_with_backend(
     int runtime_directory_fd,
     uint64_t expected_device,
     uint64_t expected_inode,
+    const char *file_name,
     const struct asteriskd_state_file_backend *backend,
     void *context,
     char *error,
@@ -606,6 +607,9 @@ int asteriskd_state_store_init_with_backend(
         store->directory_fd = -1;
     }
     if (store == NULL || runtime_directory_fd < 0 || expected_inode == 0U ||
+        file_name == NULL || file_name[0] == '\0' || strchr(file_name, '/') != NULL ||
+        strcmp(file_name, ".") == 0 || strcmp(file_name, "..") == 0 ||
+        strnlen(file_name, sizeof(store->file_name)) >= sizeof(store->file_name) ||
         !file_backend_complete(backend)) {
         set_error(error, error_size, "invalid state store arguments");
         return ASTERISKD_STATE_INVALID;
@@ -642,6 +646,7 @@ int asteriskd_state_store_init_with_backend(
         return ASTERISKD_STATE_INVALID;
     }
     store->directory_fd = duplicate;
+    memcpy(store->file_name, file_name, strlen(file_name) + 1U);
     store->directory_fd_owned = true;
     store->directory_device = source_device;
     store->directory_inode = source_inode;
@@ -654,9 +659,7 @@ int asteriskd_state_store_init_with_backend(
 
 int asteriskd_state_store_init(
     struct asteriskd_state_store *store,
-    int runtime_directory_fd,
-    uint64_t expected_device,
-    uint64_t expected_inode,
+    const char *path,
     char *error,
     size_t error_size) {
 #ifdef _WIN32
@@ -664,15 +667,22 @@ int asteriskd_state_store_init(
         memset(store, 0, sizeof(*store));
         store->directory_fd = -1;
     }
-    (void)runtime_directory_fd;
-    (void)expected_device;
-    (void)expected_inode;
+    (void)path;
     set_error(error, error_size, "real state store requires Linux; use injected host backend");
     return ASTERISKD_STATE_IO;
 #else
-    return asteriskd_state_store_init_with_backend(
-        store, runtime_directory_fd, expected_device, expected_inode,
+    if (store == NULL) return ASTERISKD_STATE_INVALID;
+    memset(store, 0, sizeof(*store));
+    store->directory_fd = -1;
+    struct asteriskd_runtime_directory directory;
+    if (asteriskd_runtime_directory_open(path, &directory, error, error_size) != 0) {
+        return ASTERISKD_STATE_IO;
+    }
+    int result = asteriskd_state_store_init_with_backend(
+        store, directory.fd, directory.device, directory.inode, strrchr(path, '/') + 1,
         &system_state_backend, NULL, error, error_size);
+    asteriskd_runtime_directory_release(&directory);
+    return result;
 #endif
 }
 
@@ -737,7 +747,7 @@ int asteriskd_state_store_save(
     uint32_t flags = ASTERISKD_STATE_OPEN_WRITE | ASTERISKD_STATE_OPEN_CREATE |
         ASTERISKD_STATE_OPEN_TRUNCATE | ASTERISKD_STATE_OPEN_CLOEXEC;
     if (store->backend->openat_fd(
-            store->backend_context, store->directory_fd, ASTERISKD_STATE_LEAF,
+            store->backend_context, store->directory_fd, store->file_name,
             flags, 0600U, &fd) != 0 || fd < 0) {
         if (fd >= 0) (void)store->backend->close_fd(store->backend_context, fd);
         free(json);

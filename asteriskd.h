@@ -34,7 +34,6 @@ struct asteriskd_resource_operation;
 #define ASTERISKD_MAX_COMMAND_MARKER 256U
 #define ASTERISKD_SYNC_DEBOUNCE_MILLIS 1500
 #define ASTERISKD_STATE_VERSION 2U
-#define ASTERISKD_STATE_LEAF "asteriskd.state"
 #define ASTERISKD_LEGACY_ROUTE_LOCALNET_LEAF "asteriskd.state.route-localnet"
 #define ASTERISKD_MAX_CHILD_ARGV 16U
 #define ASTERISKD_MAX_PROCESS_ARGV 32U
@@ -672,6 +671,7 @@ enum asteriskd_process_output_mode {
 struct asteriskd_process_spec {
     char executable_path[ASTERISKD_MAX_PATH];
     char working_directory[ASTERISKD_MAX_PATH];
+    char output_path[ASTERISKD_MAX_PATH];
     uint32_t uid;
     uint32_t gid;
     char argv[ASTERISKD_MAX_PROCESS_ARGV][ASTERISKD_MAX_CHILD_ARG];
@@ -749,6 +749,7 @@ int asteriskd_process_argument_add(
     struct asteriskd_process_spec *, const char *);
 int asteriskd_process_core_log_path(
     const struct asteriskd_process_spec *, char *, size_t);
+int asteriskd_log_sibling_path(const char *, const char *, char *, size_t);
 int asteriskd_helper_render_documents(
     const struct asteriskd_config *, int, int,
     struct asteriskd_helper_documents *, char *, size_t);
@@ -1751,6 +1752,7 @@ struct asteriskd_state_file_backend {
 
 struct asteriskd_state_store {
     int directory_fd;
+    char file_name[ASTERISKD_MAX_PATH];
     bool directory_fd_owned;
     uint64_t directory_device;
     uint64_t directory_inode;
@@ -1784,9 +1786,9 @@ bool asteriskd_state_is_stopped(const struct asteriskd_state_document *);
 int asteriskd_state_serialize(
     const struct asteriskd_state_document *, char **, size_t *, char *, size_t);
 int asteriskd_state_store_init(
-    struct asteriskd_state_store *, int, uint64_t, uint64_t, char *, size_t);
+    struct asteriskd_state_store *, const char *, char *, size_t);
 int asteriskd_state_store_init_with_backend(
-    struct asteriskd_state_store *, int, uint64_t, uint64_t,
+    struct asteriskd_state_store *, int, uint64_t, uint64_t, const char *,
     const struct asteriskd_state_file_backend *, void *, char *, size_t);
 int asteriskd_state_store_save(
     struct asteriskd_state_store *, const struct asteriskd_state_document *, char *, size_t);

@@ -274,10 +274,6 @@ int asteriskd_cli_parse(
     }
     size_t path_length = 0U;
     if (!control_cli_config_path_valid(argv[3], &path_length)) goto invalid;
-    static const char leaf[] = "asteriskd.json";
-    if (path_length <= sizeof(leaf) ||
-        memcmp(argv[3] + path_length - (sizeof(leaf) - 1U), leaf, sizeof(leaf)) != 0 ||
-        argv[3][path_length - sizeof(leaf)] != '/') goto invalid;
     memcpy(invocation->path, argv[3], path_length + 1U);
     return 0;
 invalid:

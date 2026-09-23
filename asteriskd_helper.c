@@ -137,9 +137,8 @@ static int render_hev(const struct asteriskd_config *config, struct asteriskd_an
         hev->tcp_fast_open ? "true" : "false", hev->tcp_read_write_timeout_milliseconds,
         hev->udp_read_write_timeout_milliseconds);
     char log_path[ASTERISKD_MAX_PATH];
-    int log_length = snprintf(log_path, sizeof(log_path), "%s/logs/tun2socks.log",
-        config->working_directory);
-    if (log_length <= 0 || (size_t)log_length >= sizeof(log_path)) {
+    if (asteriskd_log_sibling_path(config->log_path, "tun2socks.log",
+            log_path, sizeof(log_path)) != 0) {
         free(writer.bytes);
         return ASTERISKD_CONFIG_INVALID;
     }
@@ -363,6 +362,8 @@ int asteriskd_helper_process_spec(
         executable = config->helper.value.bpf.executable_path;
         spec->gid = 3005U;
         spec->output_mode = ASTERISKD_PROCESS_OUTPUT_APPEND_CORE_LOG;
+        if (asteriskd_log_sibling_path(config->log_path, "error.log",
+                spec->output_path, sizeof(spec->output_path)) != 0) goto invalid;
     } else {
         goto invalid;
     }

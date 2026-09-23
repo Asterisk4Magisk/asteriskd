@@ -41,6 +41,16 @@ Applications perform a read-only status preflight and publish the latest config
 through same-directory temporary files plus atomic rename. The abstract
 control-socket bind is the cross-process single-instance authority.
 
+The application supplies all configuration, resource, state and log paths.
+`--config` accepts any configuration filename. These files need not share a
+directory with each other or with `core.workingDirectory`; the supervisor does
+not require product-specific directory names. Paths must be normalized absolute
+paths, and the referenced files/directories must satisfy their access needs.
+Configuration directories may be read-only. CIDR files are read from the supplied
+paths, and telemetry is written to `statePath`. The core's working directory also
+sets its asset environment variable. Core/BPF helper stderr (`error.log`) and HEV
+logs (`tun2socks.log`) are placed beside the configured supervisor `logPath`.
+
 ## Control plane
 
 The only endpoint is the Linux abstract Unix-domain socket

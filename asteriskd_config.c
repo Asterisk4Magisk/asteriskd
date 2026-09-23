@@ -267,6 +267,7 @@ static int parse_u32(
 
 static bool path_is_normal(const char *path) {
     size_t length = strlen(path);
+    if (length == 1U && path[0] == '/') return true;
     if (length == 0U || length >= ASTERISKD_MAX_PATH || path[0] != '/' ||
         path[length - 1U] == '/' || strstr(path, "//") != NULL ||
         strchr(path, '\r') != NULL || strchr(path, '\n') != NULL) {
@@ -973,27 +974,6 @@ static bool supported(const struct asteriskd_config *config) {
     return false;
 }
 
-static int validate_topology(const struct asteriskd_config *config) {
-    const char *directory = config->owner == ASTERISKD_OWNER_NG ? "xray" : config->owner == ASTERISKD_OWNER_BOX ? "sing-box" : "clash";
-    const char *config_name = config->owner == ASTERISKD_OWNER_META ? "config.yaml" : "config.json";
-    const char *basename = strrchr(config->working_directory, '/');
-    if (basename == NULL || strcmp(basename + 1, directory) != 0) return -1;
-    char expected[ASTERISKD_MAX_PATH];
-    int length = snprintf(expected, sizeof(expected), "%s/%s", config->working_directory, config_name);
-    if (length < 0 || (size_t)length >= sizeof(expected) || strcmp(expected, config->core_config_path) != 0) return -1;
-    length = snprintf(expected, sizeof(expected), "%s/asteriskd.state", config->working_directory);
-    if (length < 0 || (size_t)length >= sizeof(expected) || strcmp(expected, config->state_path) != 0) return -1;
-    length = snprintf(expected, sizeof(expected), "%s/logs/asteriskd.log", config->working_directory);
-    if (length < 0 || (size_t)length >= sizeof(expected) || strcmp(expected, config->log_path) != 0) return -1;
-    if (!config->has_direct_cidr_paths) return 0;
-    length = snprintf(expected, sizeof(expected), "%s/direct-cidr-v4.txt", config->working_directory);
-    if (length < 0 || (size_t)length >= sizeof(expected) ||
-        strcmp(expected, config->direct_cidr_path_v4) != 0) return -1;
-    length = snprintf(expected, sizeof(expected), "%s/direct-cidr-v6.txt", config->working_directory);
-    return length >= 0 && (size_t)length < sizeof(expected) &&
-        strcmp(expected, config->direct_cidr_path_v6) == 0 ? 0 : -1;
-}
-
 int asteriskd_config_parse(
     const char *json,
     size_t length,
@@ -1055,7 +1035,6 @@ int asteriskd_config_parse(
         set_message(message, message_size, "unsupported combination");
         return ASTERISKD_CONFIG_UNSUPPORTED_COMBINATION;
     }
-    if (validate_topology(config) != 0) goto invalid;
     asteriskd_json_document_destroy(&document);
     set_message(message, message_size, "ok");
     return 0;
@@ -1158,8 +1137,7 @@ int asteriskd_config_load_with_backend(
     loaded->close_context = context;
     loaded->directory.close_owned_fd = backend->close_fd;
     loaded->directory.close_context = context;
-    if (path == NULL || !path_is_normal(path) ||
-        strcmp(strrchr(path, '/') + 1, "asteriskd.json") != 0) {
+    if (path == NULL || !path_is_normal(path)) {
         set_message(message, message_size, "invalid config path");
         return ASTERISKD_CONFIG_INVALID;
     }
@@ -1247,6 +1225,11 @@ static int open_parent_walk(const char *path, int *parent_fd, char *leaf) {
     int current = open("/", O_PATH | O_DIRECTORY | O_CLOEXEC);
     if (current < 0) return path_open_error(errno, ASTERISKD_CONFIG_INVALID);
     int result = checked_stat(current, ASTERISKD_FILE_DIRECTORY, false, false, true, NULL);
+    if (result == 0 && strcmp(path, "/") == 0) {
+        memcpy(leaf, ".", 2U);
+        *parent_fd = current;
+        return 0;
+    }
     const char *component = path + 1;
     while (result == 0) {
         const char *slash = strchr(component, '/');
@@ -1396,9 +1379,7 @@ static int validate_regular_path(
         NULL);
 }
 
-static int validate_loaded_paths(const struct asteriskd_config *config, int runtime_directory_fd) {
-    int directory_fd = -1;
-    struct stat expected, actual;
+static int validate_loaded_paths(const struct asteriskd_config *config) {
     int result = open_verified_absolute(
         config->working_directory,
         ASTERISKD_FILE_DIRECTORY,
@@ -1409,12 +1390,8 @@ static int validate_loaded_paths(const struct asteriskd_config *config, int runt
         false,
         O_RDONLY,
         ASTERISKD_CONFIG_INVALID,
-        &directory_fd,
-        &expected);
-    if (result == 0 && (fstat(runtime_directory_fd, &actual) != 0 || !same_inode(&expected, &actual))) {
-        result = ASTERISKD_CONFIG_INVALID;
-    }
-    if (directory_fd >= 0) close(directory_fd);
+        NULL,
+        NULL);
     if (result == 0) result = validate_regular_path(config->core_config_path, true, false, false, false, false);
     if (result == 0) result = validate_regular_path(config->state_path, true, true, false, true, true);
     if (result == 0) result = validate_regular_path(config->log_path, false, true, false, true, true);
@@ -1449,17 +1426,17 @@ static int read_fd_bounded(int fd, char **out, size_t *length) {
     return 0;
 }
 
-static int read_direct_resource_child(
-    int directory_fd,
-    const char *name,
+static int read_direct_resource(
+    const char *path,
     char **out,
     size_t *length) {
     int fd = -1;
-    int result = open_verified_child(
-        directory_fd,
-        name,
+    int result = open_verified_absolute(
+        path,
         ASTERISKD_FILE_REGULAR,
         true,
+        false,
+        false,
         false,
         false,
         O_RDONLY,
@@ -1471,19 +1448,17 @@ static int read_direct_resource_child(
     return result;
 }
 
-static int load_direct_resources_linux(
-    struct asteriskd_config *config,
-    int directory_fd) {
+static int load_direct_resources_linux(struct asteriskd_config *config) {
     if (!config->has_direct_cidr_paths) return 0;
     char *ipv4 = NULL;
     size_t ipv4_length = 0U;
     char *ipv6 = NULL;
     size_t ipv6_length = 0U;
-    int result = read_direct_resource_child(
-        directory_fd, "direct-cidr-v4.txt", &ipv4, &ipv4_length);
+    int result = read_direct_resource(
+        config->direct_cidr_path_v4, &ipv4, &ipv4_length);
     if (result == 0 && config->enable_ipv6) {
-        result = read_direct_resource_child(
-            directory_fd, "direct-cidr-v6.txt", &ipv6, &ipv6_length);
+        result = read_direct_resource(
+            config->direct_cidr_path_v6, &ipv6, &ipv6_length);
     }
     if (result == 0) {
         result = asteriskd_config_load_direct_cidrs(
@@ -1496,8 +1471,9 @@ static int load_direct_resources_linux(
 
 static int parent_path(const char *path, char *out, size_t out_size) {
     const char *slash = strrchr(path, '/');
-    if (slash == NULL || slash == path || (size_t)(slash - path) >= out_size) return -1;
-    size_t length = (size_t)(slash - path);
+    if (slash == NULL) return -1;
+    size_t length = slash == path ? 1U : (size_t)(slash - path);
+    if (length >= out_size) return -1;
     memcpy(out, path, length);
     out[length] = '\0';
     return 0;
@@ -1513,8 +1489,7 @@ int asteriskd_runtime_directory_open(
     directory_handle->fd = -1;
     char directory[ASTERISKD_MAX_PATH];
     if (path == NULL || !path_is_normal(path) ||
-        parent_path(path, directory, sizeof(directory)) != 0 ||
-        strcmp(strrchr(path, '/') + 1, "asteriskd.json") != 0) {
+        parent_path(path, directory, sizeof(directory)) != 0) {
         set_message(message, message_size, "invalid config path");
         return ASTERISKD_CONFIG_INVALID;
     }
@@ -1523,7 +1498,7 @@ int asteriskd_runtime_directory_open(
         directory,
         ASTERISKD_FILE_DIRECTORY,
         true,
-        true,
+        false,
         true,
         false,
         false,
@@ -1556,7 +1531,7 @@ int asteriskd_config_load(
     struct stat config_status;
     result = open_verified_child(
         loaded->directory.fd,
-        "asteriskd.json",
+        strrchr(path, '/') + 1,
         ASTERISKD_FILE_REGULAR,
         true,
         false,
@@ -1580,7 +1555,7 @@ int asteriskd_config_load(
     if (result == 0) {
         result = open_verified_child(
             loaded->directory.fd,
-            "asteriskd.json",
+            strrchr(path, '/') + 1,
             ASTERISKD_FILE_REGULAR,
             true,
             false,
@@ -1592,8 +1567,8 @@ int asteriskd_config_load(
         if (result == 0 && !same_inode(&config_status, &verify_status)) result = ASTERISKD_CONFIG_INVALID;
     }
     if (verify_fd >= 0) close(verify_fd);
-    if (result == 0) result = validate_loaded_paths(&loaded->config, loaded->directory.fd);
-    if (result == 0) result = load_direct_resources_linux(&loaded->config, loaded->directory.fd);
+    if (result == 0) result = validate_loaded_paths(&loaded->config);
+    if (result == 0) result = load_direct_resources_linux(&loaded->config);
     if (result != 0) {
         asteriskd_loaded_config_release(loaded);
         return result;

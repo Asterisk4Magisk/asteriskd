@@ -146,17 +146,12 @@ int asteriskd_process_core_log_path(
         spec->output_mode != ASTERISKD_PROCESS_OUTPUT_APPEND_CORE_LOG) {
         return ASTERISKD_CONFIG_INVALID;
     }
-    size_t directory_length = process_bounded_length(
-        spec->working_directory, sizeof(spec->working_directory));
-    static const char suffix[] = "/logs/error.log";
-    if (directory_length == 0U || directory_length >= sizeof(spec->working_directory) ||
-        spec->working_directory[0] != '/' ||
-        directory_length > path_size - 1U ||
-        sizeof(suffix) - 1U > path_size - directory_length - 1U) {
+    size_t length = process_bounded_length(spec->output_path, sizeof(spec->output_path));
+    if (length == 0U || length >= sizeof(spec->output_path) ||
+        spec->output_path[0] != '/' || length >= path_size) {
         return ASTERISKD_CONFIG_INVALID;
     }
-    memcpy(path, spec->working_directory, directory_length);
-    memcpy(path + directory_length, suffix, sizeof(suffix));
+    memcpy(path, spec->output_path, length + 1U);
     return 0;
 }
 

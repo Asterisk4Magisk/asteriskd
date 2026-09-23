@@ -426,6 +426,19 @@ static bool lexical_log_path_valid(const char *path) {
     return false;
 }
 
+int asteriskd_log_sibling_path(const char *log_path, const char *name, char *out, size_t size) {
+    if (out != NULL && size != 0U) out[0] = '\0';
+    if (!lexical_log_path_valid(log_path) || name == NULL || name[0] == '\0' ||
+        strchr(name, '/') != NULL || strcmp(name, ".") == 0 || strcmp(name, "..") == 0 ||
+        out == NULL || size == 0U) return -1;
+    size_t prefix = (size_t)(strrchr(log_path, '/') - log_path) + 1U;
+    size_t length = strnlen(name, ASTERISKD_MAX_PATH);
+    if (prefix >= size || length >= size - prefix) return -1;
+    memcpy(out, log_path, prefix);
+    memcpy(out + prefix, name, length + 1U);
+    return 0;
+}
+
 static int open_log_path(
     const char *path,
     const struct asteriskd_log_file_backend *backend,
