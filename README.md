@@ -35,7 +35,7 @@ cycle while keeping the supervisor available for configured service actions;
 `watch` writes an initial response and then JSON event lines until the final
 event or disconnect. CLI usage errors write only to stderr and exit 64.
 
-Automatic Wi-Fi and schedule actions in TPROXY, TUN2SOCKS and BPF2SOCKS
+Automatic Wi-Fi, schedule, and lock screen actions in TPROXY, TUN2SOCKS and BPF2SOCKS
 keep the core alive after the first start. A stop action publishes `paused`
 after removing traffic rules and suspending network reconciliation. TUN2SOCKS
 also keeps its tunnel helper and interface; BPF2SOCKS stops its helper after
@@ -83,9 +83,33 @@ helper PIDs, matcher status, daemon-rule generation/categories, IPv4/IPv6
 readiness, and a sanitized error. Private iptables names, BPF pin paths, argv,
 environment, and configuration content are never exposed.
 
-## Configuration v3
+## Native lock screen control
 
-The configuration is strict UTF-8 JSON (`schemaVersion: 3`) with a maximum size
+Android 13+ can enable `serviceControl.keyguard`: `enabled`, `lockStart`,
+`lockStop`, `unlockStart`, and `unlockStop`. Start/stop for the same event are
+mutually exclusive. Initial state establishes a baseline; duplicate state
+notifications do not trigger actions. This follows Keyguard showing/dismissed
+state, not display power or credential-storage unlock.
+
+The native supervisor loads `libbinder_ndk` only when this control is enabled,
+registers a WindowManager listener, and adds the Binder fd to its existing
+blocking reactor. There is no Java helper, timer-based state polling, or extra
+listener thread. Transaction constants are resolved once from the device's
+`framework.jar`; missing DEX/constants or unavailable platform symbols produce
+an explicit startup error instead of guessing method numbers. Binder death is
+fatal to this event source; the supervisor cleans up and requires a fresh start.
+Normal shutdown unregisters the listener. This is a private platform Binder
+interface, not a public NDK lock-screen API. Registration and baseline query
+are not atomic in the platform API; transitions during that short initial
+window cannot be given an exact event boundary.
+
+Android builds link `libdl` and `libz`; `libbinder_ndk` is loaded dynamically so
+older Android devices retain their existing runtime support. The application
+hides this control and publishes it disabled below API 33.
+
+## Configuration v4
+
+The configuration is strict UTF-8 JSON (`schemaVersion: 4`) with a maximum size
 of 8 MiB. Every object is closed: unknown, duplicate, or missing keys are
 invalid, including keys whose value is nullable. Validation completes before
 the logger, state, socket, child, or external network effects are created.

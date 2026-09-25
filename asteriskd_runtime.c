@@ -1,4 +1,5 @@
 #include "asteriskd.h"
+#include "asteriskd_keyguard.h"
 #include "asteriskd_compat.h"
 
 #include <errno.h>
@@ -181,7 +182,8 @@ static unsigned runtime_dispatch_priority(enum asteriskd_poll_source_kind kind) 
         case ASTERISKD_POLL_NETWORK:
         case ASTERISKD_POLL_TC_NETLINK:
         case ASTERISKD_POLL_SERVICE_TIMER:
-        case ASTERISKD_POLL_WIFI: return 4U;
+        case ASTERISKD_POLL_WIFI:
+        case ASTERISKD_POLL_KEYGUARD: return 4U;
         default: return UINT_MAX;
     }
 }
@@ -1071,6 +1073,7 @@ struct asteriskd_system_supervisor {
     bool service_timer_fd_owned;
     struct asteriskd_wifi_monitor wifi_monitor;
     bool wifi_monitor_opened;
+    struct asteriskd_keyguard_monitor *keyguard_monitor;
     struct asteriskd_service_control_runtime service_control;
     bool service_running;
     bool shutdown_requested;
@@ -1079,6 +1082,8 @@ struct asteriskd_system_supervisor {
     bool service_resume_requested;
     struct asteriskd_effect_journal volatile_effects;
     bool stop_requested;
+    bool automatic_stop_pending;
+    bool manual_stop_pending;
     bool stopping_children;
     struct asteriskd_process_spec core_spec;
     struct asteriskd_child_process core_process;
@@ -1234,21 +1239,43 @@ static void system_runtime_min_deadline(
 
 static void system_service_apply_action(
     struct asteriskd_system_supervisor *system, enum asteriskd_service_action action) {
+    if ((system->shutdown_requested || system->manual_stop_pending) &&
+        (action == ASTERISKD_SERVICE_ACTION_START || action == ASTERISKD_SERVICE_ACTION_STOP)) return;
     if (system->runtime != NULL && system->runtime->supervising &&
+        !system->runtime->lifecycle.stopped &&
+        !atomic_load_explicit(&system->runtime->lifecycle.stop_was_requested, memory_order_acquire) &&
         !asteriskd_mode_core_managed(system->loaded_config.config.mode) &&
         (action == ASTERISKD_SERVICE_ACTION_START || action == ASTERISKD_SERVICE_ACTION_STOP)) {
         system->service_pause_requested = action == ASTERISKD_SERVICE_ACTION_STOP;
         system->service_resume_requested = action == ASTERISKD_SERVICE_ACTION_START;
         return;
     }
-    if (action == ASTERISKD_SERVICE_ACTION_START && !system->service_running) {
-        system->service_start_requested = true;
-    } else if (action == ASTERISKD_SERVICE_ACTION_STOP && system->service_running) {
-        system->stop_requested = true;
+    if (action == ASTERISKD_SERVICE_ACTION_START) {
+        bool stopping = system->runtime && atomic_load_explicit(
+            &system->runtime->lifecycle.stop_was_requested, memory_order_acquire);
+        if (!system->shutdown_requested && (!system->service_running ||
+                (stopping && system->automatic_stop_pending))) {
+            system->service_start_requested = true;
+        } else if (!system->shutdown_requested && !stopping) {
+            system->stop_requested = false;
+            system->automatic_stop_pending = false;
+        }
+    } else if (action == ASTERISKD_SERVICE_ACTION_STOP) {
+        system->service_start_requested = false;
+        if (system->service_running) {
+            system->stop_requested = true;
+            system->automatic_stop_pending = true;
+        }
     } else if (action == ASTERISKD_SERVICE_ACTION_SHUTDOWN) {
         system->shutdown_requested = true;
         if (system->service_running) system->stop_requested = true;
     }
+}
+
+static void system_service_keyguard_changed(void *context, bool locked, bool baseline) {
+    struct asteriskd_system_supervisor *system = context;
+    system_service_apply_action(system,
+        asteriskd_service_control_on_keyguard(&system->service_control, locked, baseline));
 }
 
 static void system_service_take_actions(struct asteriskd_system_supervisor *system,
@@ -1345,6 +1372,9 @@ static int system_runtime_prepare(
     if (system->wifi_monitor_opened &&
         system_runtime_add_source(builder, asteriskd_wifi_monitor_fd(&system->wifi_monitor), POLLIN,
             ASTERISKD_POLL_WIFI, 0U, 1U) != 0) return -1;
+    if (system->keyguard_monitor &&
+        system_runtime_add_source(builder, asteriskd_keyguard_fd(system->keyguard_monitor), POLLIN,
+            ASTERISKD_POLL_KEYGUARD, 0U, 1U) != 0) return -1;
     uint64_t wifi_deadline = 0U;
     if (system->wifi_monitor_opened &&
         asteriskd_wifi_monitor_next_deadline(&system->wifi_monitor, &wifi_deadline)) {
@@ -1669,6 +1699,12 @@ static int system_runtime_dispatch(void *opaque, const struct asteriskd_poll_sou
             system_runtime_fatal(delta, ASTERISKD_COMPONENT_RUNTIME,
                 "service schedule dispatch failed");
         }
+    } else if (source->kind == ASTERISKD_POLL_KEYGUARD) {
+        if ((ready & (POLLERR | POLLHUP | POLLNVAL)) ||
+            asteriskd_keyguard_dispatch(system->keyguard_monitor) != 0) {
+            system_runtime_fatal(delta, ASTERISKD_COMPONENT_RUNTIME,
+                "lock screen event source lost; restart service control to reconnect");
+        }
     } else if (source->kind == ASTERISKD_POLL_WIFI) {
         if (system_service_wifi_dispatch(system) != 0) {
             system_runtime_fatal(delta, ASTERISKD_COMPONENT_NETWORK,
@@ -1744,12 +1780,16 @@ static int system_runtime_request_stop(void *opaque) {
     struct asteriskd_system_supervisor *system = opaque;
     if (!system->runtime->supervising) return 1;
     system->stop_requested = true;
+    system->automatic_stop_pending = false;
+    system->manual_stop_pending = true;
+    system->service_start_requested = false;
     return 0;
 }
 
 static int system_runtime_request_shutdown(void *opaque) {
     struct asteriskd_system_supervisor *system = opaque;
     system->shutdown_requested = true;
+    system->service_start_requested = false;
     if (system->runtime->supervising) {
         system->stop_requested = true;
     }
@@ -1784,6 +1824,10 @@ static int system_effect_event(void *opaque, enum asteriskd_control_event_type t
     if (has_details != (details != NULL) || system_runtime_clock(system, &now) != 0) return -1;
     if (type == ASTERISKD_CONTROL_EVENT_RUNNING || type == ASTERISKD_CONTROL_EVENT_PAUSED) {
         system->service_running = type == ASTERISKD_CONTROL_EVENT_RUNNING;
+    } else if (type == ASTERISKD_CONTROL_EVENT_STOPPED) {
+        // Once STOPPED is visible, a new automatic edge may start a new cycle.
+        system->service_running = false;
+        system->manual_stop_pending = false;
     }
     return asteriskd_control_server_publish_event(
         system->control, type, snapshot, details,
@@ -6400,6 +6444,8 @@ static void system_runtime_cleanup(struct asteriskd_system_supervisor *system) {
     }
     system->service_timer_fd = -1;
     system->service_timer_fd_owned = false;
+    asteriskd_keyguard_close(system->keyguard_monitor);
+    system->keyguard_monitor = NULL;
     if (system->wifi_monitor_opened) asteriskd_wifi_monitor_close(&system->wifi_monitor);
     system->wifi_monitor_opened = false;
     if (system->runtime != NULL) asteriskd_runtime_destroy(system->runtime);
@@ -6572,6 +6618,17 @@ static int system_runtime_run(const char *config_path, bool initial_start,
                 &system.service_control, transition, &identity);
         }
     }
+    if (service->enabled && service->keyguard.enabled &&
+        asteriskd_keyguard_open(&system.keyguard_monitor, system_service_keyguard_changed,
+            &system, error, sizeof(error)) != 0) {
+        (void)close(listener);
+        *has_early_result = true;
+        (void)system_start_result(early_result, ASTERISKD_CONTROL_RESULT_START_FAILED,
+            error, NULL);
+        system_runtime_cleanup(&system);
+        (void)sigprocmask(SIG_SETMASK, &previous, NULL);
+        return 1;
+    }
     if ((service->enabled && service->schedule.enabled && !system.service_timer_fd_owned) ||
         (service->enabled && service->wifi.enabled && !system.wifi_monitor_opened) ||
         system_service_timer_arm(&system) != 0) {
@@ -6640,7 +6697,9 @@ static int system_runtime_run(const char *config_path, bool initial_start,
                 system.runtime, &system.loaded_config.config,
                 &system.state, &system.live, &effects);
             system.service_running = false;
-            asteriskd_service_control_set_service_running(&system.service_control, false);
+            system.manual_stop_pending = false;
+            asteriskd_service_control_set_service_running(
+                &system.service_control, system.service_start_requested);
             system_runtime_finish_control_stop(&system);
             if (cycle_status != 0) {
                 if (cycle_failure_requires_shutdown(

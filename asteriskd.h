@@ -13,7 +13,7 @@
 
 struct asteriskd_resource_operation;
 
-#define ASTERISKD_CONFIG_VERSION 3U
+#define ASTERISKD_CONFIG_VERSION 4U
 #define ASTERISKD_MAX_JSON_SIZE (8U * 1024U * 1024U)
 #define ASTERISKD_JSON_MAX_TOKENS 262144U
 #define ASTERISKD_JSON_MAX_DEPTH 64U
@@ -194,15 +194,22 @@ struct asteriskd_wifi_control_config {
     struct asteriskd_wifi_rule_config disconnect_stop;
 };
 
+struct asteriskd_keyguard_control_config {
+    bool enabled, lock_start, lock_stop, unlock_start, unlock_stop;
+};
+
 struct asteriskd_service_control_config {
     bool enabled;
     struct asteriskd_schedule_control_config schedule;
     struct asteriskd_wifi_control_config wifi;
+    struct asteriskd_keyguard_control_config keyguard;
 };
 
 struct asteriskd_service_control_runtime {
     const struct asteriskd_service_control_config *config;
     struct asteriskd_wifi_identity previous_wifi;
+    bool keyguard_baseline_established;
+    bool keyguard_locked;
     bool wifi_baseline_established;
     bool wifi_connected;
     bool desired_running;
@@ -214,6 +221,8 @@ void asteriskd_service_control_init(
     const struct asteriskd_service_control_config *, bool, time_t);
 void asteriskd_service_control_set_service_running(
     struct asteriskd_service_control_runtime *, bool);
+enum asteriskd_service_action asteriskd_service_control_on_keyguard(
+    struct asteriskd_service_control_runtime *, bool locked, bool baseline);
 bool asteriskd_wifi_rule_matches(
     const struct asteriskd_wifi_rule_config *,
     const struct asteriskd_wifi_identity *);
@@ -1569,6 +1578,7 @@ enum asteriskd_poll_source_kind {
     ASTERISKD_POLL_TC_NETLINK,
     ASTERISKD_POLL_SERVICE_TIMER,
     ASTERISKD_POLL_WIFI,
+    ASTERISKD_POLL_KEYGUARD,
     ASTERISKD_POLL_SOURCE_KIND_COUNT,
 };
 

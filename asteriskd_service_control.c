@@ -93,6 +93,22 @@ static enum asteriskd_service_action asteriskd_service_control_apply(
     return action;
 }
 
+enum asteriskd_service_action asteriskd_service_control_on_keyguard(
+    struct asteriskd_service_control_runtime *runtime, bool locked, bool baseline) {
+    if (runtime == NULL) return ASTERISKD_SERVICE_ACTION_NONE;
+    bool changed = runtime->keyguard_baseline_established && runtime->keyguard_locked != locked;
+    runtime->keyguard_baseline_established = true;
+    runtime->keyguard_locked = locked;
+    if (baseline || !changed || !runtime->config || !runtime->config->enabled ||
+        !runtime->config->keyguard.enabled) return ASTERISKD_SERVICE_ACTION_NONE;
+    const struct asteriskd_keyguard_control_config *rule = &runtime->config->keyguard;
+    if (locked ? rule->lock_stop : rule->unlock_stop)
+        return asteriskd_service_control_apply(runtime, ASTERISKD_SERVICE_ACTION_STOP);
+    if (locked ? rule->lock_start : rule->unlock_start)
+        return asteriskd_service_control_apply(runtime, ASTERISKD_SERVICE_ACTION_START);
+    return ASTERISKD_SERVICE_ACTION_NONE;
+}
+
 static enum asteriskd_service_action asteriskd_service_control_rules(
     struct asteriskd_service_control_runtime *runtime,
     const struct asteriskd_wifi_rule_config *start,

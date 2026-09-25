@@ -790,18 +790,34 @@ static int parse_wifi_control(
     return 0;
 }
 
+static int parse_keyguard_control(const struct asteriskd_json_document *document,
+    size_t object, struct asteriskd_keyguard_control_config *keyguard) {
+    static const char *const names[] = {"enabled", "lockStart", "lockStop", "unlockStart", "unlockStop"};
+    size_t values[5];
+    if (object_fields(document, object, names, 5U, values) != 0 ||
+        parse_bool(document, values[0], &keyguard->enabled) != 0 ||
+        parse_bool(document, values[1], &keyguard->lock_start) != 0 ||
+        parse_bool(document, values[2], &keyguard->lock_stop) != 0 ||
+        parse_bool(document, values[3], &keyguard->unlock_start) != 0 ||
+        parse_bool(document, values[4], &keyguard->unlock_stop) != 0 ||
+        (keyguard->lock_start && keyguard->lock_stop) ||
+        (keyguard->unlock_start && keyguard->unlock_stop)) return -1;
+    return 0;
+}
+
 static int parse_service_control(
     const struct asteriskd_json_document *document,
     size_t object,
-    struct asteriskd_service_control_config *service_control) {
-    static const char *const names[] = {"enabled", "schedule", "wifi"};
-    size_t values[3];
-    if (object_fields(document, object, names, 3U, values) != 0 ||
+    struct asteriskd_service_control_config *service_control, uint32_t schema) {
+    static const char *const names[] = {"enabled", "schedule", "wifi", "keyguard"};
+    size_t values[4];
+    if (object_fields(document, object, names, schema >= 4U ? 4U : 3U, values) != 0 ||
         parse_bool(document, values[0], &service_control->enabled) != 0 ||
         parse_schedule_control(
             document, values[1], service_control->enabled,
             &service_control->schedule) != 0 ||
-        parse_wifi_control(document, values[2], &service_control->wifi) != 0) {
+        parse_wifi_control(document, values[2], &service_control->wifi) != 0 ||
+        (schema >= 4U && parse_keyguard_control(document, values[3], &service_control->keyguard) != 0)) {
         return -1;
     }
     return 0;
@@ -1003,7 +1019,7 @@ int asteriskd_config_parse(
     if (document.tokens[0].type != ASTERISKD_JSON_OBJECT ||
         find_field(&document, 0U, "schemaVersion", &schema_token) != 0 ||
         parse_u32(&document, schema_token, &schema) != 0 ||
-        (schema != 2U && schema != ASTERISKD_CONFIG_VERSION) ||
+        (schema != 2U && schema != 3U && schema != ASTERISKD_CONFIG_VERSION) ||
         (schema == 2U
             ? object_fields(&document, 0U, root_names_v2, 13U, values)
             : object_fields(&document, 0U, root_names_v3, 14U, values)) != 0 ||
@@ -1024,8 +1040,8 @@ int asteriskd_config_parse(
     if (result == 0) result = parse_mode_options(&document, values[10], config);
     if (result == 0) result = parse_matcher(&document, values[11], config);
     if (result == 0) result = parse_helper(&document, values[12], config);
-    if (result == 0 && schema == 3U) {
-        result = parse_service_control(&document, values[13], &config->service_control);
+    if (result == 0 && schema >= 3U) {
+        result = parse_service_control(&document, values[13], &config->service_control, schema);
     }
     if (result == ASTERISKD_CONFIG_NO_MEMORY) goto no_memory;
     if (result != 0 || validate_cross_fields(config) != 0) goto invalid;
