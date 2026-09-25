@@ -243,6 +243,8 @@ done:
 
 static void runtime_delta_merge(
     struct asteriskd_runtime_delta *target, const struct asteriskd_runtime_delta *source) {
+    const uint32_t service_actions = ASTERISKD_DELTA_SERVICE_PAUSE | ASTERISKD_DELTA_SERVICE_RESUME;
+    if ((source->flags & service_actions) != 0U) target->flags &= ~service_actions;
     target->flags |= source->flags;
     if (target->stop_reason == ASTERISKD_LIFECYCLE_REASON_NONE &&
         source->stop_reason != ASTERISKD_LIFECYCLE_REASON_NONE) {
@@ -545,7 +547,8 @@ int asteriskd_runtime_accept_delta(
     struct asteriskd_runtime *runtime, const struct asteriskd_runtime_delta *delta) {
     const uint32_t known = ASTERISKD_DELTA_STOP_REQUESTED | ASTERISKD_DELTA_CHILD_EXITED |
         ASTERISKD_DELTA_NETWORK_CHANGED | ASTERISKD_DELTA_RECONCILE_DUE |
-        ASTERISKD_DELTA_RULES_CHANGED | ASTERISKD_DELTA_FATAL;
+        ASTERISKD_DELTA_RULES_CHANGED | ASTERISKD_DELTA_FATAL |
+        ASTERISKD_DELTA_SERVICE_PAUSE | ASTERISKD_DELTA_SERVICE_RESUME;
     if (runtime == NULL || delta == NULL || (delta->flags & ~known) != 0U ||
         (((delta->flags & ASTERISKD_DELTA_STOP_REQUESTED) != 0U) !=
             (delta->stop_reason != ASTERISKD_LIFECYCLE_REASON_NONE)) ||
@@ -597,6 +600,23 @@ static int runtime_process_delta(
     }
     if (terminal.flags != 0U) return asteriskd_runtime_accept_delta(runtime, &terminal);
 
+    if ((delta->flags & ASTERISKD_DELTA_SERVICE_PAUSE) != 0U &&
+        runtime->state->phase == ASTERISKD_PHASE_RUNNING) {
+        if (runtime_set_phase(runtime, ASTERISKD_PHASE_STOPPING) != 0 ||
+            asteriskd_lifecycle_pause(&runtime->lifecycle,
+                runtime->config->mode == ASTERISKD_MODE_BPF2SOCKS) != 0 ||
+            runtime_set_phase(runtime, ASTERISKD_PHASE_PAUSED) != 0 ||
+            runtime_publish_event(runtime, ASTERISKD_CONTROL_EVENT_PAUSED) != 0) return ASTERISKD_CONFIG_IO;
+    } else if ((delta->flags & ASTERISKD_DELTA_SERVICE_RESUME) != 0U &&
+        runtime->state->phase == ASTERISKD_PHASE_PAUSED) {
+        if (runtime_set_phase(runtime, ASTERISKD_PHASE_STARTING) != 0 ||
+            runtime_publish_event(runtime, ASTERISKD_CONTROL_EVENT_STARTING) != 0 ||
+            asteriskd_lifecycle_resume(&runtime->lifecycle) != 0) return ASTERISKD_CONFIG_IO;
+    }
+    /* A suspended cycle must never reinstall traffic rules through a queued
+     * network reconciliation. Reopening the network on resume takes a fresh snapshot. */
+    if (runtime->state->phase == ASTERISKD_PHASE_PAUSED) return 0;
+
     if ((delta->flags & ASTERISKD_DELTA_NETWORK_CHANGED) != 0U &&
         runtime->effects->network_immediate(runtime->effects->context) != 0) {
         return ASTERISKD_CONFIG_IO;
@@ -624,7 +644,8 @@ static int runtime_process_deferred_delta(
     struct asteriskd_runtime *runtime, bool *processed) {
     if (runtime == NULL || processed == NULL) return ASTERISKD_CONFIG_INVALID;
     const uint32_t dynamic = ASTERISKD_DELTA_NETWORK_CHANGED |
-        ASTERISKD_DELTA_RECONCILE_DUE | ASTERISKD_DELTA_RULES_CHANGED;
+        ASTERISKD_DELTA_RECONCILE_DUE | ASTERISKD_DELTA_RULES_CHANGED |
+        ASTERISKD_DELTA_SERVICE_PAUSE | ASTERISKD_DELTA_SERVICE_RESUME;
     *processed = (runtime->pending_delta.flags & dynamic) != 0U;
     if (!*processed) return 0;
     struct asteriskd_runtime_delta delta;
@@ -1054,6 +1075,8 @@ struct asteriskd_system_supervisor {
     bool service_running;
     bool shutdown_requested;
     bool service_start_requested;
+    bool service_pause_requested;
+    bool service_resume_requested;
     struct asteriskd_effect_journal volatile_effects;
     bool stop_requested;
     bool stopping_children;
@@ -1211,6 +1234,13 @@ static void system_runtime_min_deadline(
 
 static void system_service_apply_action(
     struct asteriskd_system_supervisor *system, enum asteriskd_service_action action) {
+    if (system->runtime != NULL && system->runtime->supervising &&
+        !asteriskd_mode_core_managed(system->loaded_config.config.mode) &&
+        (action == ASTERISKD_SERVICE_ACTION_START || action == ASTERISKD_SERVICE_ACTION_STOP)) {
+        system->service_pause_requested = action == ASTERISKD_SERVICE_ACTION_STOP;
+        system->service_resume_requested = action == ASTERISKD_SERVICE_ACTION_START;
+        return;
+    }
     if (action == ASTERISKD_SERVICE_ACTION_START && !system->service_running) {
         system->service_start_requested = true;
     } else if (action == ASTERISKD_SERVICE_ACTION_STOP && system->service_running) {
@@ -1219,6 +1249,17 @@ static void system_service_apply_action(
         system->shutdown_requested = true;
         if (system->service_running) system->stop_requested = true;
     }
+}
+
+static void system_service_take_actions(struct asteriskd_system_supervisor *system,
+    struct asteriskd_runtime_delta *delta) {
+    if (system->service_pause_requested || system->service_resume_requested) {
+        delta->flags &= ~(ASTERISKD_DELTA_SERVICE_PAUSE | ASTERISKD_DELTA_SERVICE_RESUME);
+    }
+    if (system->service_pause_requested) delta->flags |= ASTERISKD_DELTA_SERVICE_PAUSE;
+    if (system->service_resume_requested) delta->flags |= ASTERISKD_DELTA_SERVICE_RESUME;
+    system->service_pause_requested = false;
+    system->service_resume_requested = false;
 }
 
 static int system_service_timer_arm(struct asteriskd_system_supervisor *system) {
@@ -1486,7 +1527,7 @@ static int system_runtime_dispatch_signal(
         if (count != (ssize_t)sizeof(info)) return -1;
         if (info.ssi_signo == SIGTERM || info.ssi_signo == SIGINT) {
             system->shutdown_requested = true;
-            if (system->service_running &&
+            if (system->runtime->supervising &&
                 (delta->flags & ASTERISKD_DELTA_STOP_REQUESTED) == 0U) {
                 delta->flags |= ASTERISKD_DELTA_STOP_REQUESTED;
                 delta->stop_reason = info.ssi_signo == SIGTERM
@@ -1634,6 +1675,7 @@ static int system_runtime_dispatch(void *opaque, const struct asteriskd_poll_sou
                 "WiFi event dispatch failed");
         }
     }
+    system_service_take_actions(system, delta);
     if (system->stop_requested &&
         (delta->flags & ASTERISKD_DELTA_STOP_REQUESTED) == 0U) {
         system->stop_requested = false;
@@ -1677,6 +1719,7 @@ static int system_runtime_expire(
         system_runtime_fatal(delta, ASTERISKD_COMPONENT_NETWORK,
             "WiFi association reconcile failed");
     }
+    system_service_take_actions(system, delta);
     return 0;
 }
 
@@ -1699,7 +1742,7 @@ static int system_runtime_snapshot(
 
 static int system_runtime_request_stop(void *opaque) {
     struct asteriskd_system_supervisor *system = opaque;
-    if (!system->service_running) return 1;
+    if (!system->runtime->supervising) return 1;
     system->stop_requested = true;
     return 0;
 }
@@ -1707,7 +1750,7 @@ static int system_runtime_request_stop(void *opaque) {
 static int system_runtime_request_shutdown(void *opaque) {
     struct asteriskd_system_supervisor *system = opaque;
     system->shutdown_requested = true;
-    if (system->service_running) {
+    if (system->runtime->supervising) {
         system->stop_requested = true;
     }
     return 0;
@@ -1739,6 +1782,9 @@ static int system_effect_event(void *opaque, enum asteriskd_control_event_type t
     struct asteriskd_system_supervisor *system = opaque;
     int64_t now = 0;
     if (has_details != (details != NULL) || system_runtime_clock(system, &now) != 0) return -1;
+    if (type == ASTERISKD_CONTROL_EVENT_RUNNING || type == ASTERISKD_CONTROL_EVENT_PAUSED) {
+        system->service_running = type == ASTERISKD_CONTROL_EVENT_RUNNING;
+    }
     return asteriskd_control_server_publish_event(
         system->control, type, snapshot, details,
         runtime_event_is_final(type), (uint64_t)now);
@@ -1933,6 +1979,10 @@ static int system_tun_compatibility_cleanup(struct asteriskd_system_supervisor *
 static int system_start_helper_process(
     struct asteriskd_system_supervisor *system, struct asteriskd_child_identity *identity) {
     char error[256U];
+    system->helper_reaped = false;
+    system->helper_identity_ready = false;
+    memset(&system->helper_identity, 0, sizeof(system->helper_identity));
+    memset(&system->helper_exit, 0, sizeof(system->helper_exit));
     if (!system->helper_launch_ready && asteriskd_helper_launch_prepare(
             &system->loaded_config.config, (const char *const *)environ,
             asteriskd_system_anonymous_file_backend(), &system->helper_launch,
@@ -4836,6 +4886,7 @@ static int system_effect_start_matcher(void *opaque) {
 static int system_effect_start_helper(
     void *opaque, struct asteriskd_child_identity *identity) {
     struct asteriskd_system_supervisor *system = opaque;
+    system->cleanup_in_progress = false;
     if (identity == NULL) return -1;
     if (system->loaded_config.config.helper.type == ASTERISKD_HELPER_HEV_SOCKS5_TUNNEL) {
         if (system_tun_compatibility_prepare(system) != 0) return -1;
@@ -4872,6 +4923,7 @@ static int system_effect_start_helper(
 
 static int system_effect_open_network(void *opaque) {
     struct asteriskd_system_supervisor *system = opaque;
+    system->cleanup_in_progress = false;
     char error[128U];
     if (asteriskd_network_open(&system->loaded_config.config,
             asteriskd_system_network_backend(), &system->network,
@@ -6032,14 +6084,14 @@ static bool system_stop_done(void *opaque) {
 }
 
 static int system_effect_stop_children(
-    struct asteriskd_system_supervisor *system, bool include_helper) {
+    struct asteriskd_system_supervisor *system, bool include_core, bool include_helper) {
     const struct asteriskd_child_identity *core =
-        system->core_spawned && !system->core_reaped ? &system->core_identity : NULL;
+        include_core && system->core_spawned && !system->core_reaped ? &system->core_identity : NULL;
     const struct asteriskd_child_identity *helper = include_helper &&
         system->helper_spawned && !system->helper_reaped ? &system->helper_identity : NULL;
     if (core == NULL && helper == NULL) {
         if (include_helper) asteriskd_child_process_close(&system->helper_process);
-        asteriskd_child_process_close(&system->core_process);
+        if (include_core) asteriskd_child_process_close(&system->core_process);
         return 0;
     }
     if ((core != NULL && !system->core_identity_ready) ||
@@ -6071,14 +6123,25 @@ static int system_effect_stop_children(
         if (core != NULL) system->core_reaped = true;
         if (helper != NULL) system->helper_reaped = true;
     }
+    /* The coordinator consumes SIGCHLD while it waits. Reap retained children
+     * as soon as that wait ends, including on kernels without pidfd support. */
+    struct asteriskd_runtime_delta delta;
+    asteriskd_runtime_delta_init(&delta);
+    if (system_runtime_reap_children(system, &delta) != 0 ||
+        system_accept_pump_delta(system, &delta) != 0) return -1;
     if (include_helper) asteriskd_child_process_close(&system->helper_process);
-    asteriskd_child_process_close(&system->core_process);
+    if (include_core) asteriskd_child_process_close(&system->core_process);
     return system->stop_result == ASTERISKD_STOP_COMPLETE && !killed ? 0 : -1;
 }
 
 static int system_effect_stop_helper(void *opaque) {
     struct asteriskd_system_supervisor *system = opaque;
-    int stopped = system_effect_stop_children(opaque, true);
+    int stopped = system_effect_stop_children(opaque, false, true);
+    if (stopped == 0 && system->helper_launch_ready) {
+        stopped = asteriskd_helper_launch_destroy(
+            asteriskd_system_anonymous_file_backend(), &system->helper_launch);
+        system->helper_launch_ready = false;
+    }
     int cleaned = system_tun_compatibility_cleanup(system);
     char error[128U];
     int pins_cleaned = system->loaded_config.config.helper.type == ASTERISKD_HELPER_BPF2SOCKS
@@ -6097,7 +6160,7 @@ static int system_effect_stop_matcher(void *opaque) {
 }
 
 static int system_effect_stop_core(void *opaque) {
-    return system_effect_stop_children(opaque, false);
+    return system_effect_stop_children(opaque, true, false);
 }
 
 static int system_effect_quiesce(void *opaque) {

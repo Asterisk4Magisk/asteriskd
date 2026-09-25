@@ -33,11 +33,11 @@ static const char *const control_result_names[] = {
 };
 static const char *const control_event_names[] = {
     "starting", "running", "rules-changed", "stopping", "stopped", "core-exited",
-    "helper-failed", "failed",
+    "helper-failed", "failed", "paused",
 };
 static const char *const control_phase_names[] = {
     "validating", "acquiring", "starting", "applying-rules",
-    "running", "stopping", "stopped", "failed",
+    "running", "stopping", "stopped", "failed", "paused",
 };
 static const char *const control_owner_names[] = {"asteriskng", "asteriskbox", "asteriskmeta"};
 static const char *const control_core_names[] = {"xray", "sing-box", "mihomo"};
@@ -570,6 +570,11 @@ bool asteriskd_control_snapshot_valid(const struct asteriskd_control_snapshot *s
         return false;
     }
     if (snapshot->phase == ASTERISKD_PHASE_FAILED && !snapshot->has_error) return false;
+    if (snapshot->phase == ASTERISKD_PHASE_PAUSED &&
+        (asteriskd_mode_core_managed(snapshot->mode) || !snapshot->has_core_pid ||
+         snapshot->has_error || snapshot->rules.active ||
+         snapshot->has_helper_pid != (snapshot->mode == ASTERISKD_MODE_TUN2SOCKS) ||
+         (snapshot->matcher_configured && !snapshot->matcher_active))) return false;
     if (asteriskd_mode_core_managed(snapshot->mode) &&
         (snapshot->rules.active || snapshot->rules.generation != 0U || snapshot->rules.categories != 0U ||
          snapshot->matcher_configured || snapshot->matcher_active ||

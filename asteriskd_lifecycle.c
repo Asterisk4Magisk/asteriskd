@@ -160,6 +160,48 @@ int asteriskd_lifecycle_stop(struct asteriskd_lifecycle *lifecycle) {
     return remains ? ASTERISKD_LIFECYCLE_STOP_FAILED : 0;
 }
 
+/* Keep the owned core, matcher and (for TUN2SOCKS) tunnel alive between
+ * automatic service-control triggers. Cleanup obligations stay attached to
+ * this lifecycle so an explicit stop or a failure still tears everything down. */
+int asteriskd_lifecycle_pause(struct asteriskd_lifecycle *lifecycle, bool pause_helper) {
+    if (lifecycle == NULL || lifecycle->backend == NULL || lifecycle->starting ||
+        lifecycle->stopped || lifecycle->options.core_managed_traffic) return ASTERISKD_CONFIG_INVALID;
+    const struct asteriskd_lifecycle_backend *backend = lifecycle->backend;
+    void *context = lifecycle->backend_context;
+    if (lifecycle->traffic_may_be_active) {
+        if (backend->quiesce_traffic(context) != 0) return ASTERISKD_LIFECYCLE_STOP_FAILED;
+        lifecycle->traffic_may_be_active = false;
+    }
+    try_inverse(lifecycle, &lifecycle->rules, backend->remove_rules);
+    if (lifecycle->rules.cleanup_required) return ASTERISKD_LIFECYCLE_STOP_FAILED;
+    try_inverse(lifecycle, &lifecycle->network, backend->close_network);
+    if (lifecycle->network.cleanup_required) return ASTERISKD_LIFECYCLE_STOP_FAILED;
+    if (pause_helper) {
+        try_inverse(lifecycle, &lifecycle->helper, backend->stop_helper);
+        if (lifecycle->helper.cleanup_required) return ASTERISKD_LIFECYCLE_STOP_FAILED;
+    }
+    return 0;
+}
+
+int asteriskd_lifecycle_resume(struct asteriskd_lifecycle *lifecycle) {
+    if (lifecycle == NULL || lifecycle->backend == NULL || lifecycle->starting ||
+        lifecycle->stopped || !lifecycle->core.succeeded || lifecycle->rules.cleanup_required ||
+        lifecycle->options.core_managed_traffic) return ASTERISKD_CONFIG_INVALID;
+    const struct asteriskd_lifecycle_backend *backend = lifecycle->backend;
+    int result = 0;
+    if (lifecycle->options.has_helper && !lifecycle->helper.cleanup_required) {
+        result = call_effect(lifecycle, &lifecycle->helper, "start_helper", backend->start_helper);
+        if (result == 0) result = call_observer(lifecycle, "wait_helper", backend->wait_helper);
+    }
+    if (result == 0) result = call_effect(lifecycle, &lifecycle->network, "open_network", backend->open_network);
+    if (result == 0) {
+        lifecycle->traffic_may_be_active = true;
+        result = call_effect(lifecycle, &lifecycle->rules, "apply_rules", backend->apply_rules);
+    }
+    if (result == 0) result = call_observer(lifecycle, "verify", backend->verify);
+    return result;
+}
+
 static bool backend_is_complete(
     const struct asteriskd_lifecycle_backend *backend,
     const struct asteriskd_lifecycle_options *options) {

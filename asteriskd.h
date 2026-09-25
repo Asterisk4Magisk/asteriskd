@@ -837,6 +837,8 @@ int asteriskd_lifecycle_start(
     void *,
     const struct asteriskd_lifecycle_options *);
 int asteriskd_lifecycle_stop(struct asteriskd_lifecycle *);
+int asteriskd_lifecycle_pause(struct asteriskd_lifecycle *, bool pause_helper);
+int asteriskd_lifecycle_resume(struct asteriskd_lifecycle *);
 int asteriskd_lifecycle_request_stop(
     struct asteriskd_lifecycle *,
     enum asteriskd_lifecycle_reason);
@@ -851,6 +853,7 @@ enum asteriskd_phase {
     ASTERISKD_PHASE_STOPPING,
     ASTERISKD_PHASE_STOPPED,
     ASTERISKD_PHASE_FAILED,
+    ASTERISKD_PHASE_PAUSED,
     ASTERISKD_PHASE_COUNT,
 };
 
@@ -1602,6 +1605,8 @@ enum asteriskd_runtime_delta_flag {
     ASTERISKD_DELTA_RECONCILE_DUE = UINT32_C(1) << 3,
     ASTERISKD_DELTA_RULES_CHANGED = UINT32_C(1) << 4,
     ASTERISKD_DELTA_FATAL = UINT32_C(1) << 5,
+    ASTERISKD_DELTA_SERVICE_PAUSE = UINT32_C(1) << 6,
+    ASTERISKD_DELTA_SERVICE_RESUME = UINT32_C(1) << 7,
 };
 
 struct asteriskd_runtime_delta {
@@ -1825,6 +1830,7 @@ enum asteriskd_control_event_type {
     ASTERISKD_CONTROL_EVENT_CORE_EXITED,
     ASTERISKD_CONTROL_EVENT_HELPER_FAILED,
     ASTERISKD_CONTROL_EVENT_FAILED,
+    ASTERISKD_CONTROL_EVENT_PAUSED,
     ASTERISKD_CONTROL_EVENT_TYPE_COUNT,
 };
 

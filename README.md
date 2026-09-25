@@ -12,7 +12,8 @@ owned effects are cleaned in reverse order, and a non-resident supervisor exits
 nonzero. A clean explicit stop succeeds only after telemetry reaches `stopped`.
 
 The source root is build-system agnostic. The Android parent project compiles
-every top-level `.c` file as one PIE executable; `tests/` is host-only.
+every top-level `.c` file as one PIE executable; standalone regression drivers
+under `tests/` are excluded from application builds.
 
 ## CLI
 
@@ -33,6 +34,17 @@ cycle while keeping the supervisor available for configured service actions;
 `monitor` launches it idle and waits for configured service-control actions.
 `watch` writes an initial response and then JSON event lines until the final
 event or disconnect. CLI usage errors write only to stderr and exit 64.
+
+Automatic Wi-Fi and schedule actions in TPROXY, TUN2SOCKS and BPF2SOCKS
+keep the core alive after the first start. A stop action publishes `paused`
+after removing traffic rules and suspending network reconciliation. TUN2SOCKS
+also keeps its tunnel helper and interface; BPF2SOCKS stops its helper after
+detaching owned TC traffic entry, and starts a new helper on resume. Matcher
+state is retained. Resume publishes `running` after traffic verification.
+The `paused` event is not a terminal watch event, and snapshots retain the
+live core PID while reporting inactive rules and network readiness.
+Explicit `stop` and `shutdown` always perform full cleanup, including from
+`paused`. TUN and eBPF modes keep their existing full-cycle automatic control.
 
 `start` and `monitor` open and verify the config-parent directory themselves.
 They do not accept inherited publication descriptors or acquire a filesystem
