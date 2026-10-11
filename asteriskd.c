@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0
 
 #include "asteriskd.h"
+#include "asteriskd_dns.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -30,6 +31,13 @@ static enum asteriskd_control_client_result system_control_client(
     (void)context;
     return asteriskd_control_client_run(
         method, request_id, sink, sink_context, response);
+}
+
+static enum asteriskd_control_client_result system_control_request(void *context,
+    const struct asteriskd_control_request *request, asteriskd_control_line_sink sink,
+    void *sink_context, struct asteriskd_control_response *response) {
+    (void)context;
+    return asteriskd_control_request_run(request, sink, sink_context, response);
 }
 
 static int system_prepare_session(void) {
@@ -125,6 +133,7 @@ static int system_write_stderr(void *context, const char *bytes, size_t length) 
 
 static const struct asteriskd_cli_backend system_cli_backend = {
     .effective_uid = system_effective_uid,
+    .control_request = system_control_request,
     .control_client = system_control_client,
     .run_start = system_run_start,
     .run_monitor = system_run_monitor,
@@ -133,6 +142,8 @@ static const struct asteriskd_cli_backend system_cli_backend = {
 };
 
 int asteriskd_cli_main(int argc, const char *const *argv) {
+    if (argc == 2 && argv && argv[1] && strcmp(argv[1], "enhancement-info") == 0)
+        return asteriskd_dns_info();
     return asteriskd_cli_main_with_backend(argc, argv, &system_cli_backend, NULL);
 }
 

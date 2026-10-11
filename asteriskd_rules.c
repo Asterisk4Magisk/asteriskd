@@ -79,7 +79,7 @@ static int transaction_add_hook(struct asteriskd_traffic_hook_group *group,
     struct asteriskd_traffic_hook *hook = &group->hooks[group->hook_count++];
     hook->builtin_chain = builtin;
     hook->insert_at_head = insert_at_head;
-    hook->udp_destination_port_53 = udp53;
+    hook->dns_destination_protocol = udp53 ? ASTERISKD_DNS_UDP : ASTERISKD_DNS_NONE;
     hook->verdict = verdict;
     if (verdict == ASTERISKD_HOOK_JUMP) {
         return transaction_copy_text(hook->jump_target, sizeof(hook->jump_target), target);
@@ -139,7 +139,21 @@ int asteriskd_rule_transaction_plan_build(
         result = ASTERISKD_CONFIG_INVALID;
     }
     if (result != 0) return result;
-    if (config->mode == ASTERISKD_MODE_BPF2SOCKS && config->enable_ipv6) {
+    // Explicit Android network selections have priority 13000. Only an
+    // intercepted DNS packet, classified in OUTPUT after forced bypasses, may
+    // override that route; ordinary traffic retains the existing priority.
+    if ((config->mode == ASTERISKD_MODE_TPROXY || config->mode == ASTERISKD_MODE_TUN2SOCKS) &&
+        (config->dns_enhancement || config->enable_local_dns)) {
+        size_t original_count=plan->route_count;
+        for(size_t i=0;i<original_count;i++) if(plan->routes[i].kind==ASTERISKD_ROUTE_EFFECT_IP_RULE) {
+            if(plan->route_count>=ASTERISKD_RULE_TRANSACTION_MAX_ROUTES)return ASTERISKD_CONFIG_INVALID;
+            struct asteriskd_route_effect *rule=&plan->routes[plan->route_count++];
+            *rule=plan->routes[i];rule->priority=ASTERISKD_DNS_ROUTE_RULE_PRIORITY;
+            rule->mark=ASTERISKD_DNS_PROXY_ROUTE_MARK;rule->mark_mask=ASTERISKD_DNS_MARK_MASK;
+            rule->ip_rule_id=config->mode==ASTERISKD_MODE_TPROXY?ASTERISKD_IP_RULE_DNS_TPROXY:ASTERISKD_IP_RULE_DNS_TUNNEL;
+        }
+    }
+    if (config->mode == ASTERISKD_MODE_BPF2SOCKS && (config->enable_ipv6 || config->enable_local_dns)) {
         if (plan->route_count >= ASTERISKD_RULE_TRANSACTION_MAX_ROUTES) {
             return ASTERISKD_CONFIG_INVALID;
         }
@@ -244,7 +258,7 @@ int asteriskd_rule_plan_build(
         if (rule_plan_copy_tunnel(plan, tunnel) != 0) return ASTERISKD_CONFIG_INVALID;
     } else if (config->mode != ASTERISKD_MODE_BPF2SOCKS) {
         return ASTERISKD_CONFIG_INVALID;
-    } else if (config->enable_ipv6) {
+    } else if (config->enable_ipv6 || config->enable_local_dns) {
         plan->has_token_ipv6_route = true;
         (void)memcpy(plan->token_ipv6_prefix, "fd7a:7374:6572:6973::/64",
             sizeof("fd7a:7374:6572:6973::/64"));

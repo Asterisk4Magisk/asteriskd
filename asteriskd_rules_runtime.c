@@ -121,7 +121,8 @@ int asteriskd_ip_rule_output_classify(
 
 static bool route_suffix_valid(
     const struct output_token *tokens, size_t count, size_t offset,
-    const char *table_decimal, uint32_t table) {
+    const char *table_decimal, uint32_t table, bool allow_loopback_source,
+    bool require_loopback_source) {
     unsigned seen = 0U;
     while (offset < count) {
         unsigned bit = 0U;
@@ -149,6 +150,10 @@ static bool route_suffix_valid(
                 if (!output_token_equals(&tokens[offset + 1U], "low") &&
                     !output_token_equals(&tokens[offset + 1U], "medium") &&
                     !output_token_equals(&tokens[offset + 1U], "high")) return false;
+            } else if (output_token_equals(&tokens[offset], "src")) {
+                bit = 1U << 7U;
+                if (!allow_loopback_source ||
+                    !output_token_equals(&tokens[offset + 1U], "127.0.0.1")) return false;
             } else if (output_token_equals(&tokens[offset], "table")) {
                 bit = 1U << 6U;
                 if (!output_token_route_table(
@@ -161,7 +166,7 @@ static bool route_suffix_valid(
         if ((seen & bit) != 0U) return false;
         seen |= bit;
     }
-    return true;
+    return !require_loopback_source || (seen & (1U << 7U)) != 0U;
 }
 
 int asteriskd_ip_route_output_classify(
@@ -208,7 +213,12 @@ int asteriskd_ip_route_output_classify(
                 output_token_equals(&tokens[offset], effect->interface_name);
             ++offset;
             owned = owned && route_suffix_valid(
-                tokens, count, offset, table, effect->table);
+                tokens, count, offset, table, effect->table,
+                effect->family == ASTERISKD_IP_FAMILY_IPV4 && effect->local_route &&
+                    effect->table == ASTERISKD_TPROXY_TABLE &&
+                    strcmp(effect->destination, "default") == 0 &&
+                    strcmp(effect->interface_name, "lo") == 0,
+                effect->loopback_source);
             if (!owned || matches > 1U) {
                 *state = ASTERISKD_RULES_SLOT_FOREIGN;
                 return 0;
@@ -287,11 +297,13 @@ size_t asteriskd_xtables_hook_arguments(
     const struct asteriskd_traffic_hook *hook, const char **arguments) {
     if (hook == NULL || arguments == NULL) return 0U;
     size_t count = 0U;
-    if (hook->udp_destination_port_53) {
+    if (hook->dns_destination_protocol != ASTERISKD_DNS_NONE) {
+        if (hook->dns_destination_protocol != ASTERISKD_DNS_TCP && hook->dns_destination_protocol != ASTERISKD_DNS_UDP) return 0U;
+        const char *protocol = hook->dns_destination_protocol == ASTERISKD_DNS_TCP ? "tcp" : "udp";
         arguments[count++] = "-p";
-        arguments[count++] = "udp";
+        arguments[count++] = protocol;
         arguments[count++] = "-m";
-        arguments[count++] = "udp";
+        arguments[count++] = protocol;
         arguments[count++] = "--dport";
         arguments[count++] = "53";
     }
@@ -303,7 +315,7 @@ size_t asteriskd_xtables_hook_arguments(
     } else if (hook->verdict == ASTERISKD_HOOK_REJECT) {
         arguments[count++] = "REJECT";
         arguments[count++] = "--reject-with";
-        arguments[count++] = "icmp6-port-unreachable";
+        arguments[count++] = hook->dns_destination_protocol == ASTERISKD_DNS_TCP ? "tcp-reset" : "icmp6-port-unreachable";
     } else {
         return 0U;
     }

@@ -1,4 +1,5 @@
 #include "asteriskd.h"
+#include "bpf_cgroup_owned.h"
 #include "asteriskd_keyguard.h"
 #include "asteriskd_compat.h"
 
@@ -22,6 +23,7 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <sys/syscall.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/signalfd.h>
@@ -179,6 +181,7 @@ static unsigned runtime_dispatch_priority(enum asteriskd_poll_source_kind kind) 
         case ASTERISKD_POLL_PROCESS_PIDFD: return 2U;
         case ASTERISKD_POLL_CONTROL_LISTENER:
         case ASTERISKD_POLL_CONTROL_CLIENT: return 3U;
+        case ASTERISKD_POLL_DNS:
         case ASTERISKD_POLL_NETWORK:
         case ASTERISKD_POLL_TC_NETLINK:
         case ASTERISKD_POLL_SERVICE_TIMER:
@@ -1081,6 +1084,13 @@ struct asteriskd_system_supervisor {
     bool service_pause_requested;
     bool service_resume_requested;
     struct asteriskd_effect_journal volatile_effects;
+    uint64_t dns_instance, dns_cycle, dns_generation;
+    struct asteriskd_dns_client dns;
+    uint64_t dns_last_boot, dns_last_mono, dns_hot_deadline, dns_startup_deadline;
+    uint64_t dns_hot_completed_generation;
+    bool dns_regenerating;
+    int dns_hot_stage, dns_hot_result;
+    struct asteriskd_control_request dns_hot_request;
     bool stop_requested;
     bool automatic_stop_pending;
     bool manual_stop_pending;
@@ -1176,6 +1186,13 @@ static uint64_t system_verified_pin_id(
 static const struct asteriskd_b2s_verified_pin *system_b2s_verified_pin(
     const struct asteriskd_system_supervisor *, enum asteriskd_pin_id);
 static int system_tc_netlink_dispatch(struct asteriskd_system_supervisor *, short);
+
+static int system_dns_tick(struct asteriskd_system_supervisor *, struct asteriskd_runtime_delta *);
+static int system_dns_prepare(struct asteriskd_system_supervisor *);
+static int system_dns_exchange(struct asteriskd_system_supervisor *, uint16_t);
+static int system_dns_withdraw(struct asteriskd_system_supervisor *);
+static int system_dns_activate(struct asteriskd_system_supervisor *, uint64_t);
+static int system_runtime_request_dns(void *, const struct asteriskd_control_request *, bool);
 
 static int system_runtime_clock(void *opaque, int64_t *milliseconds) {
     (void)opaque;
@@ -1364,6 +1381,19 @@ static int system_service_wifi_reconcile(
 static int system_runtime_prepare(
     void *opaque, struct asteriskd_poll_builder *builder, struct asteriskd_deadline *deadline) {
     struct asteriskd_system_supervisor *system = opaque;
+    if (system->dns.snapshot.required) {
+        int64_t dns_now = 0;
+        if (system_runtime_clock(system, &dns_now) != 0) return -1;
+        uint64_t boot = asteriskd_dns_boottime();
+        uint64_t next = boot + 1000U;
+        if (system->dns.pending) next = system->dns.deadline;
+        else if (system->dns.snapshot.phase == DNS_ACTIVE) next = system->dns.renew_at;
+        if (system->dns_hot_stage || system->cleanup_in_progress) next = boot + 20U;
+        system_runtime_min_deadline(deadline, (uint64_t)dns_now + (next > boot ? next - boot : 0U));
+        if (system->dns.fd >= 0 && system_runtime_add_source(builder, system->dns.fd,
+            POLLIN | (system->dns.pending && system->dns.tx_offset < system->dns.tx_size ? POLLOUT : 0),
+            ASTERISKD_POLL_DNS, 0U, system->dns.snapshot.generation) != 0) return -1;
+    }
     if (system_runtime_add_source(builder, system->signal_fd, POLLIN,
             ASTERISKD_POLL_SIGNAL, 0U, 1U) != 0) return -1;
     if (system->service_timer_fd_owned &&
@@ -1637,6 +1667,10 @@ static int system_runtime_dispatch_log(struct asteriskd_system_supervisor *syste
 static int system_runtime_dispatch(void *opaque, const struct asteriskd_poll_source *source,
     short ready, struct asteriskd_runtime_delta *delta) {
     struct asteriskd_system_supervisor *system = opaque;
+    if (source->kind == ASTERISKD_POLL_DNS) {
+        if (source->fd != system->dns.fd || source->generation != system->dns.snapshot.generation) return 0;
+        return system_dns_tick(system, delta);
+    }
     if (source->kind >= ASTERISKD_POLL_PROCESS_EXEC_ERROR &&
         source->kind <= ASTERISKD_POLL_PROCESS_PIDFD) {
         struct asteriskd_child_process *process = source->slot == 0U ? &system->core_process :
@@ -1724,6 +1758,7 @@ static int system_runtime_dispatch(void *opaque, const struct asteriskd_poll_sou
 static int system_runtime_expire(
     void *opaque, int64_t now, struct asteriskd_runtime_delta *delta) {
     struct asteriskd_system_supervisor *system = opaque;
+    if (system_dns_tick(system, delta) != 0) return -1;
     if (system->control != NULL &&
         asteriskd_control_server_tick(system->control, (uint64_t)now) != 0) {
         system_runtime_fatal(delta, ASTERISKD_COMPONENT_CONTROL, "control deadline failed");
@@ -2853,10 +2888,25 @@ static int system_append_return_interface(struct asteriskd_system_supervisor *sy
         "-A", chain, arguments, 4U);
 }
 
+static int system_dns_owner_direct(struct asteriskd_system_supervisor *system,
+    enum asteriskd_ip_family family, const char *chain, const char *kind, const char *owner) {
+    if (!system->loaded_config.config.dns_enhancement) return 0;
+    for (unsigned p=0;p<2;++p) {
+        const char *protocol=p?"tcp":"udp";
+        const char *args[]={"-p",protocol,"-m",protocol,"--dport","53",
+            "-m","mark","--mark",ASTERISKD_DNS_PROXY_DECISION_MATCH,
+            "-m","owner",kind,owner,"-j","MARK","--set-xmark",ASTERISKD_DNS_DIRECT_MATCH};
+        if (system_xtables_zero(system,family,ASTERISKD_IP_TABLE_MANGLE,"-A",chain,
+                args,sizeof(args)/sizeof(args[0])) != 0) return -1;
+    }
+    return 0;
+}
+
 static int system_append_uid_return(struct asteriskd_system_supervisor *system,
-    enum asteriskd_ip_family family, const char *chain, uint32_t uid) {
+    enum asteriskd_ip_family family, const char *chain, uint32_t uid, bool forced) {
     char uid_text[16U];
     if (snprintf(uid_text, sizeof(uid_text), "%" PRIu32, uid) <= 0) return -1;
+    if (forced && system_dns_owner_direct(system,family,chain,"--uid-owner",uid_text) != 0) return -1;
     const char *arguments[] = {"-m", "owner", "--uid-owner", uid_text, "-j", "RETURN"};
     return system_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE,
         "-A", chain, arguments, 6U);
@@ -2864,6 +2914,7 @@ static int system_append_uid_return(struct asteriskd_system_supervisor *system,
 
 static int system_append_gid_return(struct asteriskd_system_supervisor *system,
     enum asteriskd_ip_family family, const char *chain) {
+    if (system_dns_owner_direct(system,family,chain,"--gid-owner","3005") != 0) return -1;
     const char *arguments[] = {"-m", "owner", "--gid-owner", "3005", "-j", "RETURN"};
     return system_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE,
         "-A", chain, arguments, 6U);
@@ -2913,7 +2964,7 @@ static int system_append_mark(struct asteriskd_system_supervisor *system,
     arguments[count++] = "-j";
     arguments[count++] = "MARK";
     arguments[count++] = "--set-xmark";
-    arguments[count++] = "0x20000000/0x60000000";
+    arguments[count++] = ASTERISKD_ROUTE_MATCH;
     return system_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE,
         "-A", chain, arguments, count);
 }
@@ -2944,7 +2995,7 @@ static int system_append_tproxy(struct asteriskd_system_supervisor *system,
         arguments[count++] = "-m";
         arguments[count++] = "mark";
         arguments[count++] = "--mark";
-        arguments[count++] = "0x20000000/0x60000000";
+        arguments[count++] = ASTERISKD_ROUTE_MATCH;
     }
     if (bpf_path != NULL) {
         arguments[count++] = "-m";
@@ -2959,22 +3010,50 @@ static int system_append_tproxy(struct asteriskd_system_supervisor *system,
     arguments[count++] = "--on-ip";
     arguments[count++] = family == ASTERISKD_IP_FAMILY_IPV4 ? "0.0.0.0" : "::";
     arguments[count++] = "--tproxy-mark";
-    arguments[count++] = "0x20000000/0x60000000";
+    arguments[count++] = ASTERISKD_ROUTE_MATCH;
     return system_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE,
         "-A", chain, arguments, count);
 }
 
-static int system_append_dns_mark(struct asteriskd_system_supervisor *system,
-    enum asteriskd_ip_family family, const char *chain, bool bypass_core_gid) {
-    const char *plain[] = {"-p", "udp", "-m", "udp", "--dport", "53",
-        "-j", "MARK", "--set-xmark", "0x20000000/0x60000000"};
-    const char *bypass[] = {"-p", "udp", "-m", "owner", "!", "--gid-owner", "3005",
-        "-m", "udp", "--dport", "53", "-j", "MARK", "--set-xmark",
-        "0x20000000/0x60000000"};
+static int system_append_dns_mark_protocol(struct asteriskd_system_supervisor *system,
+    enum asteriskd_ip_family family, const char *chain, bool bypass_core_gid,
+    const char *protocol, bool local_prerouting) {
+    const char *plain[] = {"-p", protocol, "-m", protocol, "--dport", "53",
+        "-j", "MARK", "--set-xmark", ASTERISKD_ROUTE_MATCH};
+    const char *bypass[] = {"-p", protocol, "-m", "owner", "!", "--gid-owner", "3005",
+        "-m", protocol, "--dport", "53", "-j", "MARK", "--set-xmark",
+        ASTERISKD_DNS_PROXY_ROUTE_MATCH};
+    const char *local[] = {"-i", "lo", "-p", protocol, "-m", protocol, "--dport", "53",
+        "-m", "mark", "--mark", ASTERISKD_ROUTE_MATCH,
+        "-j", "MARK", "--set-xmark", ASTERISKD_ROUTE_MATCH};
+    if (local_prerouting) return system_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE,
+        "-A", chain, local, sizeof(local) / sizeof(local[0]));
     return system_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE,
         "-A", chain, bypass_core_gid ? bypass : plain,
         bypass_core_gid ? sizeof(bypass) / sizeof(bypass[0]) :
             sizeof(plain) / sizeof(plain[0]));
+}
+
+static int system_append_dns_mark(struct asteriskd_system_supervisor *system,
+    enum asteriskd_ip_family family, const char *chain, bool bypass_core_gid) {
+    bool prerouting = strstr(chain, "PREROUTING") != NULL;
+    return system_append_dns_mark_protocol(system, family, chain, bypass_core_gid, "udp", false) == 0 &&
+        system_append_dns_mark_protocol(system, family, chain, bypass_core_gid, "tcp", prerouting) == 0 ? 0 : -1;
+}
+
+static int system_append_established_tcp6_dns(struct asteriskd_system_supervisor *system,
+    enum asteriskd_ip_family family, const char *chain) {
+    if (family != ASTERISKD_IP_FAMILY_IPV6) return 0;
+    // The SYN already created a request socket under the original DNS tuple.
+    // Let TCP receive later packets directly: old IPv6 kernels leave the
+    // request's no_srccheck unset, so TPROXY can drop its completing ACK.
+    // Require a tuple socket: older kernels keep requests only on the listener.
+    const char *arguments[] = {"-i", "lo", "-p", "tcp", "-m", "tcp", "--dport", "53",
+        "!", "--tcp-flags", "FIN,SYN,RST,ACK", "SYN",
+        "-m", "mark", "--mark", ASTERISKD_ROUTE_MATCH,
+        "-m", "conntrack", "--ctstate", "ESTABLISHED", "-m", "socket", "-j", "RETURN"};
+    return system_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE,
+        "-A", chain, arguments, sizeof(arguments) / sizeof(arguments[0]));
 }
 
 static int system_append_dns_tproxy(struct asteriskd_system_supervisor *system,
@@ -2985,9 +3064,17 @@ static int system_append_dns_tproxy(struct asteriskd_system_supervisor *system,
     const char *arguments[] = {"-p", "udp", "-m", "udp", "--dport", "53",
         "-j", "TPROXY", "--on-port", port, "--on-ip",
         family == ASTERISKD_IP_FAMILY_IPV4 ? "0.0.0.0" : "::",
-        "--tproxy-mark", "0x20000000/0x60000000"};
+        "--tproxy-mark", ASTERISKD_ROUTE_MATCH};
+    if (system_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE,
+            "-A", chain, arguments, sizeof(arguments) / sizeof(arguments[0])) != 0) return -1;
+    if (system_append_established_tcp6_dns(system, family, chain) != 0) return -1;
+    const char *tcp[] = {"-i", "lo", "-p", "tcp", "-m", "tcp", "--dport", "53",
+        "-m", "mark", "--mark", ASTERISKD_ROUTE_MATCH,
+        "-j", "TPROXY", "--on-port", port, "--on-ip",
+        family == ASTERISKD_IP_FAMILY_IPV4 ? "0.0.0.0" : "::",
+        "--tproxy-mark", ASTERISKD_ROUTE_MATCH};
     return system_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE,
-        "-A", chain, arguments, sizeof(arguments) / sizeof(arguments[0]));
+        "-A", chain, tcp, sizeof(tcp) / sizeof(tcp[0]));
 }
 
 static int system_populate_local_chain(struct asteriskd_system_supervisor *system,
@@ -3028,7 +3115,7 @@ static int system_append_policy_output(struct asteriskd_system_supervisor *syste
     enum asteriskd_ip_family family, const char *chain) {
     const struct asteriskd_config *config = &system->loaded_config.config;
     if (config->matcher.enabled) {
-        if (system_append_gid_return(system, family, chain) != 0) return -1;
+        if (!config->dns_enhancement && system_append_gid_return(system, family, chain) != 0) return -1;
         enum asteriskd_pin_id pin = family == ASTERISKD_IP_FAMILY_IPV4
             ? ASTERISKD_PIN_MATCHER_OUTPUT_V4 : ASTERISKD_PIN_MATCHER_OUTPUT_V6;
         const char *path = system_pin_path(system, pin);
@@ -3036,7 +3123,7 @@ static int system_append_policy_output(struct asteriskd_system_supervisor *syste
             system_append_mark(system, family, chain, "tcp", NULL, NULL, NULL, path) == 0 &&
             system_append_mark(system, family, chain, "udp", NULL, NULL, NULL, path) == 0 ? 0 : -1;
     }
-    if (system_append_gid_return(system, family, chain) != 0) return -1;
+    if (!config->dns_enhancement && system_append_gid_return(system, family, chain) != 0) return -1;
     if (config->app_policy_mode == ASTERISKD_APP_POLICY_WHITELIST) {
         for (size_t index = 0U; index < config->uid_count + 2U; ++index) {
             uint32_t uid = index < config->uid_count ? config->uids[index] :
@@ -3054,16 +3141,75 @@ static int system_append_policy_output(struct asteriskd_system_supervisor *syste
         system_append_mark(system, family, chain, "udp", NULL, NULL, NULL, NULL) == 0 ? 0 : -1;
 }
 
+/* Resolver decisions terminate before ordinary application routing. */
+static int system_dns_output_rule(struct asteriskd_system_supervisor *s,
+    enum asteriskd_ip_family family, const char *chain, const char *protocol,
+    const char *mark, const char *uid, bool select) {
+    const char *args[20]; size_t n=0;
+    args[n++]="-p"; args[n++]=protocol; args[n++]="-m"; args[n++]=protocol;
+    args[n++]="--dport"; args[n++]="53";
+    if(mark) { args[n++]="-m"; args[n++]="mark"; args[n++]="--mark"; args[n++]=mark; }
+    if(uid) { args[n++]="-m"; args[n++]="owner"; args[n++]="--uid-owner"; args[n++]=uid; }
+    args[n++]="-j"; args[n++]=select?"MARK":"RETURN";
+    if(select) { args[n++]="--set-xmark"; args[n++]=ASTERISKD_ROUTE_MATCH; }
+    return system_xtables_zero(s,family,ASTERISKD_IP_TABLE_MANGLE,"-A",chain,args,n);
+}
+
+static int system_enhanced_dns_output(struct asteriskd_system_supervisor *s,
+    enum asteriskd_ip_family family, const char *chain) {
+    for(unsigned p=0;p<2;++p) {
+        const char *protocol=p?"tcp":"udp";
+        // The module already supplied the final proxy or direct mark.
+        if (system_dns_output_rule(s, family, chain, protocol,
+                ASTERISKD_DNS_CLASSIFIED_MATCH, NULL, false) != 0) return -1;
+        // AID_DNS_TETHER retains UDP-only DNS forcing, after explicit marks and forced bypasses.
+        if (!p && (system_dns_output_rule(s,family,chain,protocol,NULL,"1052",true)!=0 ||
+            system_dns_output_rule(s,family,chain,protocol,NULL,"1052",false)!=0)) return -1;
+        // All unmarked DNS falls through to the existing UID/CIDR policy.
+    }
+    return 0;
+}
+
+static int system_enhanced_dns_prerouting(struct asteriskd_system_supervisor *s,
+    enum asteriskd_ip_family family, const char *chain, bool tproxy) {
+    const struct asteriskd_config *c=&s->loaded_config.config;
+    char port[8]; snprintf(port,sizeof(port),"%u",c->transparent_port);
+    for(unsigned p=0;p<2;++p) {
+        const char *protocol=p?"tcp":"udp";
+        if(system_dns_output_rule(s,family,chain,protocol,ASTERISKD_DNS_DIRECT_MATCH,NULL,false)!=0) return -1;
+        if (tproxy && p && system_append_established_tcp6_dns(s, family, chain) != 0) return -1;
+        const char *args[]={"-i","lo","-p",protocol,"-m",protocol,"--dport","53","-m","mark","--mark",
+            ASTERISKD_ROUTE_MATCH,"-j","TPROXY","--on-port",port,"--on-ip",
+            family==ASTERISKD_IP_FAMILY_IPV4?"0.0.0.0":"::","--tproxy-mark",ASTERISKD_ROUTE_MATCH};
+        if(tproxy && system_xtables_zero(s,family,ASTERISKD_IP_TABLE_MANGLE,"-A",chain,args,sizeof(args)/sizeof(args[0]))!=0) return -1;
+        const char *local[]={"-i","lo","-p",protocol,"-m",protocol,"--dport","53","-j","RETURN"};
+        if(system_xtables_zero(s,family,ASTERISKD_IP_TABLE_MANGLE,"-A",chain,local,sizeof(local)/sizeof(local[0]))!=0) return -1;
+    }
+    // Preserve the existing hotspot UDP-only scope; local unmarked queries already returned.
+    for(size_t i=0;i<c->hotspot_interface_prefix_count;++i) {
+        const char *args[20]={"-i",c->hotspot_interface_prefixes[i],"-p","udp","-m","udp","--dport","53","-j"};
+        size_t n=9;
+        if(tproxy) { args[n++]="TPROXY"; args[n++]="--on-port"; args[n++]=port;
+            args[n++]="--on-ip"; args[n++]=family==ASTERISKD_IP_FAMILY_IPV4?"0.0.0.0":"::";
+            args[n++]="--tproxy-mark"; args[n++]=ASTERISKD_ROUTE_MATCH;
+        } else { args[n++]="MARK"; args[n++]="--set-xmark"; args[n++]=ASTERISKD_ROUTE_MATCH; }
+        if(system_xtables_zero(s,family,ASTERISKD_IP_TABLE_MANGLE,"-A",chain,args,n)!=0) return -1;
+    }
+    return 0;
+}
+
 static int system_populate_common_output_prefix(
     struct asteriskd_system_supervisor *system, enum asteriskd_ip_family family,
     const char *chain, const char *local_begin, const char *local_end) {
     const struct asteriskd_config *config = &system->loaded_config.config;
+    if (config->dns_enhancement && system_append_gid_return(system, family, chain) != 0) return -1;
     if (system_append_ipsec_udp_bypass(system, family, chain) != 0) return -1;
     for (size_t remaining = config->bypass_uid_count; remaining > 0U; --remaining) {
         if (system_append_uid_return(system, family, chain,
-                config->bypass_uids[remaining - 1U]) != 0) return -1;
+                config->bypass_uids[remaining - 1U], true) != 0) return -1;
     }
-    if (config->enable_local_dns && system_append_dns_mark(system, family, chain, true) != 0) {
+    if (config->dns_enhancement && system_enhanced_dns_output(system, family, chain) != 0) return -1;
+    if (config->enable_local_dns && !config->dns_enhancement && system_append_dns_mark(system, family, chain, true) != 0) {
         return -1;
     }
     if (system_append_local_bypass_interval(
@@ -3086,7 +3232,8 @@ static int system_populate_tproxy_prerouting(
     struct asteriskd_system_supervisor *system, enum asteriskd_ip_family family,
     const char *chain, const char *local_begin, const char *local_end) {
     const struct asteriskd_config *config = &system->loaded_config.config;
-    if (config->enable_local_dns && system_append_dns_tproxy(system, family, chain) != 0) return -1;
+    if (config->dns_enhancement && system_enhanced_dns_prerouting(system, family, chain, true) != 0) return -1;
+    if (config->enable_local_dns && !config->dns_enhancement && system_append_dns_tproxy(system, family, chain) != 0) return -1;
     if (family == ASTERISKD_IP_FAMILY_IPV6 && !config->enable_ipv6) return 0;
     if (system_append_ipsec_udp_bypass(system, family, chain) != 0) return -1;
     if (system_append_local_bypass_interval(
@@ -3140,14 +3287,19 @@ static int system_populate_tproxy_output(
     const char *chain, const char *local_begin, const char *local_end) {
     const struct asteriskd_config *config = &system->loaded_config.config;
     if (family == ASTERISKD_IP_FAMILY_IPV6 && !config->enable_ipv6) {
-        return config->enable_local_dns ? system_append_dns_mark(system, family, chain, true) : 0;
+        if (!config->dns_enhancement && !config->enable_local_dns) return 0;
+        if (system_append_gid_return(system, family, chain) != 0) return -1;
+        for (size_t i=0;i<config->bypass_uid_count;++i)
+            if (system_append_uid_return(system,family,chain,config->bypass_uids[i],true) != 0) return -1;
+        if (!config->dns_enhancement) return system_append_dns_mark(system, family, chain, true);
+        return system_enhanced_dns_output(system, family, chain);
     }
     if (system_populate_common_output_prefix(
             system, family, chain, local_begin, local_end) != 0) return -1;
     if (!config->matcher.enabled && config->app_policy_mode == ASTERISKD_APP_POLICY_BLACKLIST) {
         for (size_t remaining = config->uid_count; remaining > 0U; --remaining) {
             if (system_append_uid_return(system, family, chain,
-                    config->uids[remaining - 1U]) != 0) return -1;
+                    config->uids[remaining - 1U], false) != 0) return -1;
         }
     }
     for (size_t index = 0U; index < config->ignored_interface_count; ++index) {
@@ -3161,7 +3313,8 @@ static int system_populate_tun_prerouting(
     struct asteriskd_system_supervisor *system, enum asteriskd_ip_family family,
     const char *chain, const char *local_begin, const char *local_end) {
     const struct asteriskd_config *config = &system->loaded_config.config;
-    if (config->enable_local_dns && system_append_dns_mark(system, family, chain, false) != 0) {
+    if (config->dns_enhancement && system_enhanced_dns_prerouting(system, family, chain, false) != 0) return -1;
+    if (config->enable_local_dns && !config->dns_enhancement && system_append_dns_mark(system, family, chain, false) != 0) {
         return -1;
     }
     if (family == ASTERISKD_IP_FAMILY_IPV6 && !config->enable_ipv6) return 0;
@@ -3201,14 +3354,19 @@ static int system_populate_tun_output(
     const struct asteriskd_config *config = &system->loaded_config.config;
     const char *tunnel = config->helper.value.hev.tunnel_name;
     if (family == ASTERISKD_IP_FAMILY_IPV6 && !config->enable_ipv6) {
-        return config->enable_local_dns ? system_append_dns_mark(system, family, chain, true) : 0;
+        if (!config->dns_enhancement && !config->enable_local_dns) return 0;
+        if (system_append_gid_return(system, family, chain) != 0) return -1;
+        for (size_t i=0;i<config->bypass_uid_count;++i)
+            if (system_append_uid_return(system,family,chain,config->bypass_uids[i],true) != 0) return -1;
+        if (!config->dns_enhancement) return system_append_dns_mark(system, family, chain, true);
+        return system_enhanced_dns_output(system, family, chain);
     }
     if (system_populate_common_output_prefix(
             system, family, chain, local_begin, local_end) != 0) return -1;
     if (!config->matcher.enabled && config->app_policy_mode == ASTERISKD_APP_POLICY_BLACKLIST) {
         for (size_t remaining = config->uid_count; remaining > 0U; --remaining) {
             if (system_append_uid_return(system, family, chain,
-                    config->uids[remaining - 1U]) != 0) return -1;
+                    config->uids[remaining - 1U], false) != 0) return -1;
         }
     }
     if (system_append_return_interface(system, family, chain, false, tunnel) != 0) return -1;
@@ -3261,10 +3419,18 @@ static int system_populate_private_chain(
             const char *dns_output[] = {
                 "-o", tunnel, "-p", "udp", "-m", "udp", "--dport", "53", "-j", "ACCEPT",
             };
-            return system_xtables_zero(system, family, ASTERISKD_IP_TABLE_FILTER,
+            if (system_xtables_zero(system, family, ASTERISKD_IP_TABLE_FILTER,
                 "-A", chain, dns_only ? dns_input : input, dns_only ? 10U : 4U) == 0 &&
                 system_xtables_zero(system, family, ASTERISKD_IP_TABLE_FILTER,
-                    "-A", chain, dns_only ? dns_output : output, dns_only ? 10U : 4U) == 0 ? 0 : -1;
+                    "-A", chain, dns_only ? dns_output : output, dns_only ? 10U : 4U) == 0) {
+                if (!dns_only) return 0;
+                const char *tcp_input[] = {"-i", tunnel, "-p", "tcp", "-m", "tcp", "--sport", "53", "-j", "ACCEPT"};
+                const char *tcp_output[] = {"-o", tunnel, "-p", "tcp", "-m", "tcp", "--dport", "53", "-j", "ACCEPT"};
+                return system_xtables_zero(system, family, ASTERISKD_IP_TABLE_FILTER,
+                    "-A", chain, tcp_input, 10U) == 0 && system_xtables_zero(system, family,
+                    ASTERISKD_IP_TABLE_FILTER, "-A", chain, tcp_output, 10U) == 0 ? 0 : -1;
+            }
+            return -1;
         }
         return -1;
     }
@@ -4055,6 +4221,13 @@ static int system_apply_route_effect(struct asteriskd_system_supervisor *system,
                 sizeof(normal) / sizeof(normal[0]));
     }
     if (effect->kind == ASTERISKD_ROUTE_EFFECT_ROUTE) {
+        if (effect->loopback_source) {
+            // Early DNS marks select the local route before IPv4 source selection.
+            const char *arguments[] = {"route", "add", "local", effect->destination,
+                "dev", effect->interface_name, "table", table, "src", "127.0.0.1"};
+            return system_ip_zero(system, effect->family, arguments,
+                sizeof(arguments) / sizeof(arguments[0]));
+        }
         const char *normal[] = {"route", "add", effect->destination,
             "dev", effect->interface_name, "table", table};
         const char *local[] = {"route", "add", "local", effect->destination,
@@ -5421,10 +5594,11 @@ static size_t system_owned_hook_arguments(
     const char **arguments,
     size_t capacity) {
     if (hook == NULL || arguments == NULL) return 0U;
-    if (hook->udp_destination_port_53) {
+    if (hook->dns_destination_protocol != ASTERISKD_DNS_NONE) {
+        if (hook->dns_destination_protocol != ASTERISKD_DNS_TCP && hook->dns_destination_protocol != ASTERISKD_DNS_UDP) return 0U;
         if (capacity < 6U) return 0U;
         arguments[0] = "-p";
-        arguments[1] = "udp";
+        arguments[1] = hook->dns_destination_protocol == ASTERISKD_DNS_TCP ? "tcp" : "udp";
         arguments[2] = "--dport";
         arguments[3] = "53";
         arguments[4] = "-j";
@@ -5713,48 +5887,179 @@ static int system_reconcile_policy_routing(
     return result;
 }
 
-static int system_remove_owned_bpf_tree(const char *path) {
+struct system_owned_bpf_pin {
+    int directory_fd;
+    int object_fd;
+    const char *leaf;
+    const char *program_name;
+    uint32_t program_type;
+    uint32_t map_key_size;
+    uint32_t object_id;
     struct stat status;
+};
 
-    if (lstat(path, &status) != 0) return errno == ENOENT ? 0 : -1;
-    if (!S_ISDIR(status.st_mode)) {
-        return unlink(path) == 0 || errno == ENOENT ? 0 : -1;
-    }
+static bool system_bpf_same_inode(const struct stat *a, const struct stat *b) {
+    return a->st_dev == b->st_dev && a->st_ino == b->st_ino &&
+        a->st_mode == b->st_mode;
+}
 
-    {
-        DIR *directory = opendir(path);
-        struct dirent *entry;
-        int result = 0;
+static int system_bpf_catalog_open(struct system_owned_bpf_pin *pin) {
+    struct stat current;
+    char path[ASTERISKD_MAX_PATH];
+    union bpf_attr attr;
+    int written;
 
-        if (directory == NULL) return -1;
-        while ((entry = readdir(directory)) != NULL) {
-            char child[ASTERISKD_MAX_PATH];
-            int written;
-
-            if (strcmp(entry->d_name, ".") == 0 ||
-                strcmp(entry->d_name, "..") == 0) continue;
-            written = snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
-            if (written <= 0 || (size_t)written >= sizeof(child) ||
-                system_remove_owned_bpf_tree(child) != 0) {
-                result = -1;
-                continue;
+    if (pin->directory_fd < 0) return 0;
+    if (fstatat(pin->directory_fd, pin->leaf, &pin->status,
+            AT_SYMLINK_NOFOLLOW) != 0) return errno == ENOENT ? 0 : -1;
+    if (!S_ISREG(pin->status.st_mode)) { errno = ESTALE; return -1; }
+    written = snprintf(path, sizeof(path), "/proc/self/fd/%d/%s",
+        pin->directory_fd, pin->leaf);
+    if (written <= 0 || (size_t)written >= sizeof(path)) return -1;
+    memset(&attr, 0, sizeof(attr));
+    attr.pathname = (uintptr_t)path;
+    pin->object_fd = asterisk_cgroup_sys(BPF_OBJ_GET, &attr);
+    if (pin->object_fd < 0) return -1;
+    if (pin->map_key_size != 0U) {
+        struct bpf_map_info info;
+        memset(&info, 0, sizeof(info));
+        memset(&attr, 0, sizeof(attr));
+        attr.info.bpf_fd = (uint32_t)pin->object_fd;
+        attr.info.info_len = sizeof(info);
+        attr.info.info = (uintptr_t)&info;
+        if (asterisk_cgroup_sys(BPF_OBJ_GET_INFO_BY_FD, &attr) != 0 ||
+            info.id == 0U || info.type != BPF_MAP_TYPE_LPM_TRIE ||
+            info.key_size != pin->map_key_size || info.value_size != 1U ||
+            info.max_entries != ASTERISKD_BPF_LOCAL_MAP_MAX_ENTRIES ||
+            info.map_flags != BPF_F_NO_PREALLOC) return -1;
+        pin->object_id = info.id;
+    } else {
+        struct bpf_prog_info info;
+        if (asterisk_cgroup_info(pin->object_fd, &info) != 0 ||
+            info.id == 0U || info.type != pin->program_type ||
+            memcmp(info.name, pin->program_name,
+                strlen(pin->program_name) + 1U) != 0) return -1;
+        if (pin->program_type != BPF_PROG_TYPE_CGROUP_SOCK_ADDR) {
+            bool tag_present = false;
+            for (size_t i = 0U; i < sizeof(info.tag); ++i) {
+                if (info.tag[i] != 0U) tag_present = true;
             }
+            if (!tag_present) return -1;
         }
-        if (closedir(directory) != 0) result = -1;
-        if (result != 0) return -1;
+        pin->object_id = info.id;
     }
-    return rmdir(path) == 0 || errno == ENOENT ? 0 : -1;
+    if (fstatat(pin->directory_fd, pin->leaf, &current, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !system_bpf_same_inode(&pin->status, &current)) return -1;
+    return 0;
+}
+
+/* Only the fixed catalog is inspected. Directory FDs prevent a substituted
+ * bpf2socks symlink from redirecting cleanup. Unknown children are never read.
+ * The final ID/inode checks narrow replacement races; unlink and cgroup QUERY
+ * -> DETACH still cannot be made atomic against an unrelated privileged writer. */
+static int system_reconcile_owned_bpf_catalog(const char *path, bool remove) {
+    enum { cgroup_count = sizeof(asterisk_cgroup_programs) /
+        sizeof(asterisk_cgroup_programs[0]), pin_count = ASTERISKD_PIN_COUNT + cgroup_count };
+    struct system_owned_bpf_pin pins[pin_count];
+    struct asteriskd_matcher_pin_plan matcher;
+    struct asteriskd_b2s_pin_plan b2s;
+    struct asteriskd_config config;
+    struct stat root_status, b2s_status, current;
+    int root_fd = -1, b2s_fd = -1, result = -1;
+    char b2s_path[64U];
+
+    memset(pins, 0, sizeof(pins));
+    for (size_t i = 0U; i < pin_count; ++i) pins[i].object_fd = -1;
+    root_fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (root_fd < 0) return errno == ENOENT ? 0 : -1;
+    if (fstat(root_fd, &root_status) != 0) goto done;
+    b2s_fd = openat(root_fd, "bpf2socks",
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (b2s_fd < 0 && errno != ENOENT) goto done;
+    if (b2s_fd >= 0 && fstat(b2s_fd, &b2s_status) != 0) goto done;
+    memset(&config, 0, sizeof(config));
+    config.enable_ipv6 = true;
+    config.matcher.enabled = true;
+    config.mode = ASTERISKD_MODE_BPF2SOCKS;
+    config.helper.type = ASTERISKD_HELPER_BPF2SOCKS;
+    if (asteriskd_matcher_pin_plan_build(&config, &matcher) != 0 ||
+        asteriskd_b2s_pin_plan_build(&config, &b2s) != 0) goto done;
+    for (size_t i = 0U; i < ASTERISKD_PIN_COUNT; ++i) {
+        const char *owned_path = asteriskd_owned_pin_path((enum asteriskd_pin_id)i);
+        const char *leaf = owned_path == NULL ? NULL : strrchr(owned_path, '/');
+        if (leaf == NULL || leaf[1] == '\0') goto done;
+        pins[i].leaf = leaf + 1;
+        pins[i].directory_fd = i < matcher.pin_count ? root_fd : b2s_fd;
+        if (i < matcher.pin_count) {
+            pins[i].program_name = matcher.pins[i].program_name;
+            pins[i].program_type = BPF_PROG_TYPE_SOCKET_FILTER;
+        } else {
+            const struct asteriskd_b2s_pin_expectation *expected =
+                &b2s.pins[i - matcher.pin_count];
+            pins[i].program_name = expected->program_name;
+            pins[i].program_type = BPF_PROG_TYPE_SCHED_CLS;
+            if (!expected->program) pins[i].map_key_size =
+                i == ASTERISKD_PIN_BPF2SOCKS_LOCAL_ADDRESS_V4 ? 8U : 20U;
+        }
+    }
+    for (size_t i = 0U; i < cgroup_count; ++i) {
+        struct system_owned_bpf_pin *pin = &pins[ASTERISKD_PIN_COUNT + i];
+        pin->directory_fd = b2s_fd;
+        pin->leaf = asterisk_cgroup_programs[i].pin;
+        pin->program_name = asterisk_cgroup_programs[i].name;
+        pin->program_type = BPF_PROG_TYPE_CGROUP_SOCK_ADDR;
+    }
+    for (size_t i = 0U; i < pin_count; ++i) {
+        if (!remove) {
+            if (pins[i].directory_fd < 0) continue;
+            if (fstatat(pins[i].directory_fd, pins[i].leaf, &current,
+                    AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT) goto done;
+        } else if (system_bpf_catalog_open(&pins[i]) != 0) goto done;
+    }
+    if (!remove) { result = 0; goto done; }
+    if (b2s_fd >= 0) {
+        if (snprintf(b2s_path, sizeof(b2s_path), "/proc/self/fd/%d", b2s_fd) <= 0 ||
+            asterisk_cgroup_detach_pins("/sys/fs/cgroup", b2s_path) != 0) goto done;
+    }
+    for (size_t i = 0U; i < pin_count; ++i) {
+        if (pins[i].object_fd < 0) continue;
+        struct system_owned_bpf_pin check = pins[i];
+        check.object_fd = -1;
+        int checked = system_bpf_catalog_open(&check);
+        if (check.object_fd >= 0 && close(check.object_fd) != 0) checked = -1;
+        if (checked != 0 || check.object_fd < 0 ||
+            check.object_id != pins[i].object_id ||
+            !system_bpf_same_inode(&check.status, &pins[i].status)) goto done;
+        if (unlinkat(pins[i].directory_fd, pins[i].leaf, 0) != 0) goto done;
+    }
+    if (b2s_fd >= 0) {
+        if (fstatat(root_fd, "bpf2socks", &current, AT_SYMLINK_NOFOLLOW) != 0 ||
+            !system_bpf_same_inode(&current, &b2s_status)) goto done;
+        if (unlinkat(root_fd, "bpf2socks", AT_REMOVEDIR) != 0 &&
+            errno != ENOTEMPTY && errno != EEXIST) goto done;
+    }
+    if (lstat(path, &current) != 0 || !system_bpf_same_inode(&current, &root_status)) goto done;
+    if (rmdir(path) != 0 && errno != ENOTEMPTY && errno != EEXIST) goto done;
+    result = 0;
+done:
+    for (size_t i = 0U; i < pin_count; ++i) {
+        if (pins[i].object_fd >= 0 && close(pins[i].object_fd) != 0) result = -1;
+    }
+    if (b2s_fd >= 0 && close(b2s_fd) != 0) result = -1;
+    if (close(root_fd) != 0) result = -1;
+    return result;
+}
+
+static int system_remove_owned_bpf_tree(const char *path) {
+    return system_reconcile_owned_bpf_catalog(path, true);
 }
 
 static int system_reconcile_bpf_pins(
     struct asteriskd_system_supervisor *system, bool remove) {
     const char *root = asteriskd_owned_resource_catalog()->bpf_root;
-    struct stat status;
-
     (void)system;
-    if (lstat(root, &status) != 0) return errno == ENOENT ? 0 : -1;
-    if (!remove) return -1;
-    return system_remove_owned_bpf_tree(root);
+    return remove ? system_remove_owned_bpf_tree(root)
+        : system_reconcile_owned_bpf_catalog(root, false);
 }
 
 static int system_prepare_owned_tc_identity(
@@ -5987,11 +6292,269 @@ static int system_reconcile_owned_resources(
         system, ASTERISKD_CONTROL_LISTENER_OK, error, error_size);
 }
 
+static bool system_dns_done(void *opaque) {
+    struct asteriskd_system_supervisor *s = opaque;
+    return !s->dns.pending;
+}
+
+static int system_dns_wait(struct asteriskd_system_supervisor *s) {
+    int64_t now = 0;
+    if (system_runtime_clock(s, &now) != 0) return -1;
+    uint64_t timeout = 2100, boot_now = asteriskd_dns_boottime();
+    if (s->dns_startup_deadline) {
+        if (boot_now >= s->dns_startup_deadline) goto expired;
+        if (timeout > s->dns_startup_deadline - boot_now)
+            timeout = s->dns_startup_deadline - boot_now;
+    }
+    struct asteriskd_deadline d = {.armed=true, .monotonic_milliseconds=now+(int64_t)timeout};
+    int pumped = system_pump_condition(s, &d, system_dns_done);
+    if (s->dns_startup_deadline && asteriskd_dns_boottime() >= s->dns_startup_deadline)
+        goto expired;
+    if (pumped != 0 || s->dns.snapshot.phase == DNS_FAILED ||
+        s->dns.snapshot.phase == DNS_UNSUPPORTED) return -1;
+    return 0;
+expired:
+    asteriskd_dns_fail(&s->dns, "DNS startup deadline expired");
+    return -1;
+}
+
+static int system_dns_exchange(struct asteriskd_system_supervisor *s, uint16_t op) {
+    if (s->dns.pending && system_dns_wait(s) != 0) return -1;
+    uint64_t now=asteriskd_dns_boottime();
+    if ((op==3 ? system_dns_activate(s,now) :
+        asteriskd_dns_command(&s->dns, op, &s->loaded_config.config,now)) != 0) {
+        asteriskd_dns_fail(&s->dns, "cannot encode DNS command or UID policy"); return -1;
+    }
+    if (system_dns_wait(s) != 0) return -1;
+    // CACHE_ERROR already withdrew the policy. Startup may drain and retry a
+    // fresh snapshot, but must never report this response as activation.
+    if (op == 3 && s->dns.topology_changed && s->dns.snapshot.phase == DNS_DRAINING)
+        return 1;
+    if (op == 3 && s->dns.snapshot.phase != DNS_ACTIVE) {
+        asteriskd_dns_fail(&s->dns, "DNS topology changed before startup activation");
+        return -1;
+    }
+    return 0;
+}
+
+static uint32_t system_dns_mode_bit(struct asteriskd_system_supervisor *s) {
+    return s->loaded_config.config.mode == ASTERISKD_MODE_TPROXY ? 1U :
+        s->loaded_config.config.mode == ASTERISKD_MODE_TUN2SOCKS ? 2U : 4U;
+}
+
+static int system_dns_begin_generation(struct asteriskd_system_supervisor *s) {
+    s->dns.snapshot.required = true;
+    if (!s->dns_instance || s->dns_generation == UINT64_MAX) {
+        asteriskd_dns_fail(&s->dns, "fresh DNS identity unavailable"); return -1;
+    }
+    if (s->dns_generation < s->loaded_config.config.core_dns_generation)
+        s->dns_generation = s->loaded_config.config.core_dns_generation - 1U;
+    uint64_t generation = ++s->dns_generation;
+    int result;
+    if (s->dns.fd >= 0 && s->dns.suspended && s->dns.snapshot.phase == DNS_INACTIVE && !s->dns.retained) {
+        s->dns.snapshot.cycle_id = s->dns_cycle;
+        s->dns.snapshot.generation = generation;
+        s->dns.snapshot.phase = DNS_PREPARING;
+        s->dns.suspended = false;
+        result = asteriskd_dns_command(&s->dns, 1, NULL, asteriskd_dns_boottime());
+    } else result = asteriskd_dns_begin(&s->dns, s->dns_instance, s->dns_cycle,
+        generation, asteriskd_dns_boottime());
+    s->dns.busy = true;
+    s->live.dns_enhancement = &s->dns.snapshot;
+    s->dns_last_boot = 0; s->dns_last_mono = 0;
+    return result;
+}
+
+static int system_dns_prepare(struct asteriskd_system_supervisor *s) {
+    if (!s->loaded_config.config.dns_enhancement) return 0;
+    if (system_dns_begin_generation(s) != 0 || system_dns_wait(s) != 0) return -1;
+    if (!(s->dns.result & system_dns_mode_bit(s))) {
+        asteriskd_dns_close(&s->dns); s->dns.snapshot.phase = DNS_UNSUPPORTED;
+        snprintf(s->dns.snapshot.reason, sizeof(s->dns.snapshot.reason), "module does not support selected mode");
+        return -1;
+    }
+    return system_dns_exchange(s, 2);
+}
+
+static bool system_dns_expired(void *opaque) {
+    struct asteriskd_system_supervisor *s = opaque;
+    return asteriskd_dns_boottime() >= s->dns.safe_after;
+}
+
+static int system_dns_withdraw(struct asteriskd_system_supervisor *s) {
+    if (!s->dns.snapshot.required || s->dns.snapshot.phase == DNS_DISABLED ||
+        s->dns.snapshot.phase == DNS_UNSUPPORTED) return 0;
+    s->dns.busy = true;
+    if (s->dns.fd >= 0 && !s->dns.suspended && system_dns_exchange(s, 5) == 0) {
+        uint64_t until = asteriskd_dns_boottime() + 5000;
+        while (s->dns.fd >= 0 && asteriskd_dns_boottime() < until) {
+            if (system_dns_exchange(s, 6) != 0) break;
+            if (s->dns.snapshot.phase == DNS_INACTIVE && s->dns.retained == 0) {
+                s->dns.suspended = true; return 0;
+            }
+        }
+    } else if (s->dns.suspended) return 0;
+    // No late activation can outlive this bound, even if the transport died before ACK.
+    asteriskd_dns_close(&s->dns);
+    int64_t now = 0;
+    if (system_runtime_clock(s, &now) != 0) return -1;
+    struct asteriskd_deadline d = {.armed=true, .monotonic_milliseconds=now+5100};
+    if (system_pump_condition(s, &d, system_dns_expired) != 0) return -1;
+    if (s->dns.snapshot.phase != DNS_FAILED) s->dns.snapshot.phase = DNS_INACTIVE;
+    return 0;
+}
+
+static int system_runtime_request_dns(void *opaque, const struct asteriskd_control_request *request, bool poll) {
+    struct asteriskd_system_supervisor *s = opaque;
+    if (poll) {
+        if (request->instance_id != s->dns_hot_request.instance_id || request->cycle_id != s->dns_hot_request.cycle_id ||
+            request->generation != s->dns_hot_request.generation || strcmp(request->request_id, s->dns_hot_request.request_id)) return -1;
+        if (request->method == ASTERISKD_CONTROL_METHOD_DNS_ABORT) {
+            if (s->state.phase == ASTERISKD_PHASE_STOPPED) return 1;
+            if (s->state.phase == ASTERISKD_PHASE_FAILED && !s->runtime->supervising) return -1;
+            return 0;
+        }
+        return s->dns_hot_result;
+    }
+    if (request->method == ASTERISKD_CONTROL_METHOD_DNS_ABORT) {
+        bool current = request->instance_id == s->dns.snapshot.instance_id &&
+            request->cycle_id == s->dns.snapshot.cycle_id && request->generation == s->dns.snapshot.generation;
+        bool operation = (s->dns_hot_stage ||
+            (s->dns_hot_result == 1 && s->dns_hot_request.method == ASTERISKD_CONTROL_METHOD_DNS_RESUME &&
+             s->dns_hot_completed_generation == s->dns.snapshot.generation)) &&
+            request->instance_id == s->dns.snapshot.instance_id && request->cycle_id == s->dns.snapshot.cycle_id &&
+            request->instance_id == s->dns_hot_request.instance_id &&
+            request->cycle_id == s->dns_hot_request.cycle_id && request->generation == s->dns_hot_request.generation;
+        if (!s->loaded_config.config.dns_enhancement || (!current && !operation) || !s->runtime ||
+            !s->runtime->supervising || system_runtime_request_stop(s) != 0) return -1;
+        s->dns_regenerating=false;
+        s->dns_hot_stage = 0; s->dns_hot_result = 0; s->dns_hot_request = *request;
+        s->dns.busy = true;
+        return 0;
+    }
+    if (!s->loaded_config.config.dns_enhancement || s->state.phase != ASTERISKD_PHASE_RUNNING ||
+        s->dns_hot_stage || s->dns.busy || request->instance_id != s->dns.snapshot.instance_id ||
+        request->cycle_id != s->dns.snapshot.cycle_id || request->generation != s->dns.snapshot.generation) return -1;
+    bool resume = request->method == ASTERISKD_CONTROL_METHOD_DNS_RESUME;
+    if ((resume && (!s->dns.suspended || s->dns.snapshot.phase != DNS_INACTIVE)) ||
+        (!resume && s->dns.snapshot.phase != DNS_ACTIVE)) return -1;
+    s->dns_hot_completed_generation = 0;
+    s->dns_regenerating = false;
+    s->dns_hot_request = *request; s->dns_hot_result = 0; s->dns_hot_stage = resume ? 10 : 1;
+    s->dns_hot_deadline = asteriskd_dns_boottime() + 8000;
+    s->dns.busy = true;
+    return 0;
+}
+
+static bool system_dns_consumers_current(struct asteriskd_system_supervisor *s) {
+    return !s->core_reaped && !s->helper_reaped && s->rules_verified &&
+        !s->stop_requested && !s->manual_stop_pending && !s->shutdown_requested &&
+        !s->cleanup_in_progress && (!s->runtime ||
+          (!(s->runtime->pending_delta.flags & (ASTERISKD_DELTA_STOP_REQUESTED |
+            ASTERISKD_DELTA_CHILD_EXITED | ASTERISKD_DELTA_FATAL)) &&
+           !runtime_lifecycle_stop_requested(s->runtime)));
+}
+static int system_dns_activate(struct asteriskd_system_supervisor *s,uint64_t now) {
+    // Activation still requires live consumers and an acknowledged PREPARE.
+    struct asteriskd_runtime_delta delta;asteriskd_runtime_delta_init(&delta);
+    if(system_runtime_reap_children(s,&delta) != 0 || delta.flags) return -1;
+    // A paused/descheduled reactor must not activate with its old tick time.
+    uint64_t current=asteriskd_dns_boottime();if(current>now)now=current;
+    if(!system_dns_consumers_current(s) ||
+        s->dns.snapshot.phase!=DNS_PREPARED) return -1;
+    return asteriskd_dns_command(&s->dns,3,NULL,now);
+}
+static int system_dns_verify_startup(struct asteriskd_system_supervisor *s) {
+    const uint64_t until = s->dns_startup_deadline;
+    do {
+        if (asteriskd_dns_boottime() >= until) break;
+        int activated = system_dns_exchange(s, 3);
+        if (activated <= 0) return activated;
+        asteriskd_log_stderr(ASTERISKD_LOG_LEVEL_INFO, ASTERISKD_COMPONENT_NETWORK,
+            "DNS topology changed during startup; draining and preparing a fresh snapshot");
+        while (asteriskd_dns_boottime() < until) {
+            if (system_dns_exchange(s, 6) != 0) return -1;
+            if (s->dns.snapshot.phase == DNS_INACTIVE && !s->dns.retained) break;
+        }
+        if (asteriskd_dns_boottime() >= until || s->stop_requested ||
+            s->manual_stop_pending || s->shutdown_requested) break;
+        s->dns.suspended = true;
+        s->dns.topology_changed = false;
+        if (system_dns_prepare(s) != 0) return -1;
+    } while (asteriskd_dns_boottime() < until);
+    asteriskd_dns_fail(&s->dns, "DNS startup topology did not stabilize before deadline");
+    return -1;
+}
+
+static int system_dns_tick(struct asteriskd_system_supervisor *s, struct asteriskd_runtime_delta *delta) {
+    if (!s->dns.snapshot.required) return 0;
+    uint64_t now = asteriskd_dns_boottime(); int64_t mono = 0;
+    if (system_runtime_clock(s, &mono) != 0 || !now) return -1;
+    if (s->dns_last_boot && s->dns.snapshot.phase == DNS_ACTIVE &&
+        now - s->dns_last_boot > (uint64_t)mono - s->dns_last_mono + 250U)
+        asteriskd_dns_fail(&s->dns, "suspend detected; fresh generation required");
+    s->dns_last_boot = now; s->dns_last_mono = (uint64_t)mono;
+    if (asteriskd_dns_step(&s->dns, now) != 0 && s->dns.snapshot.phase != DNS_FAILED &&
+        s->dns.snapshot.phase != DNS_UNSUPPORTED) asteriskd_dns_fail(&s->dns, "DNS transport progress failed");
+    if (s->dns.topology_changed && !s->dns_hot_stage && !s->cleanup_in_progress &&
+        s->state.phase == ASTERISKD_PHASE_RUNNING) {
+        s->dns.topology_changed=false; s->dns_regenerating=true;
+        memset(&s->dns_hot_request,0,sizeof(s->dns_hot_request));
+        s->dns_hot_completed_generation=0; s->dns_hot_stage=2;
+        s->dns_hot_result=0; s->dns_hot_deadline=now+8000; s->dns.busy=true;
+    }
+    // Network configuration may change again between PREPARE and ACTIVATE.
+    // The authenticated CACHE_ERROR response has already withdrawn the policy.
+    // Drain and prepare a fresh generation within the original operation budget.
+    if (s->dns.topology_changed && s->dns_hot_stage == 13) {
+        s->dns.topology_changed = false;
+        s->dns_hot_stage = 2;
+    }
+    if (s->dns_hot_stage) {
+        if (now >= s->dns_hot_deadline || s->dns.snapshot.phase == DNS_FAILED || s->dns.snapshot.phase == DNS_UNSUPPORTED) goto hot_failed;
+        if (s->dns.pending) return 0;
+        int stage = s->dns_hot_stage;
+        if (stage == 1) { if (asteriskd_dns_command(&s->dns, 5, NULL, now) != 0) goto hot_failed; s->dns_hot_stage = 2; }
+        else if (stage == 2) { if (asteriskd_dns_command(&s->dns, 6, NULL, now) != 0) goto hot_failed; s->dns_hot_stage = 3; }
+        else if (stage == 3) {
+            if (s->dns.retained || s->dns.snapshot.phase == DNS_DRAINING) { s->dns_hot_stage = 2; return 0; }
+            s->dns.suspended = true; s->dns.topology_changed=false;
+            if (s->dns_regenerating || s->dns_hot_request.method == ASTERISKD_CONTROL_METHOD_DNS_RESUME) s->dns_hot_stage=10;
+            else { s->dns_hot_result = 1; s->dns_hot_stage = 0; s->dns.busy = false; }
+        } else if (stage == 10) {
+            if (s->core_reaped || s->helper_reaped || !s->rules_verified || system_dns_begin_generation(s) != 0) goto hot_failed;
+            s->dns_hot_stage = 11;
+        } else if (stage == 11) {
+            if (!(s->dns.result & system_dns_mode_bit(s)) ||
+                asteriskd_dns_command(&s->dns, 2, &s->loaded_config.config, now) != 0) goto hot_failed;
+            s->dns_hot_stage = 12;
+        } else if (stage == 12) {
+            if (system_dns_activate(s,now) != 0) goto hot_failed;
+            s->dns_hot_stage = 13;
+        } else if (stage == 13) {
+            s->dns_hot_completed_generation = s->dns_regenerating ? 0 : s->dns.snapshot.generation;
+            s->dns_regenerating=false;
+            s->dns_hot_stage = 0; s->dns_hot_result = 1; s->dns.busy = false;
+        }
+        return 0;
+    }
+    if (s->dns.snapshot.phase == DNS_FAILED && !s->dns.busy && !s->cleanup_in_progress)
+        system_runtime_fatal(delta, ASTERISKD_COMPONENT_NETWORK, s->dns.snapshot.reason);
+    return 0;
+hot_failed:
+    s->dns_regenerating=false;
+    asteriskd_dns_fail(&s->dns, "DNS hot transition failed or drain timed out");
+    s->dns_hot_stage = 0; s->dns_hot_result = -1; s->dns.busy = false;
+    system_runtime_fatal(delta, ASTERISKD_COMPONENT_NETWORK, s->dns.snapshot.reason);
+    return 0;
+}
+
 static int system_effect_rules(void *opaque, bool *active,
     uint64_t *generation, uint32_t *categories) {
     struct asteriskd_system_supervisor *system = opaque;
     if (active == NULL || generation == NULL || categories == NULL) return -1;
     system->rules_verified = false;
+    if (system_dns_prepare(system) != 0) return -1;
     if (!system->rules_initialized) system_rules_backend_init(system);
     if (system->network_opened && !system->network.no_op) {
         int64_t now = 0;
@@ -6112,6 +6675,12 @@ static int system_effect_verify(void *opaque) {
         system->loaded_config.config.matcher.enabled, system->matcher_verified,
         system->rules_initialized, system->rules_verified) ? 0 : -1;
     system_clear_local_address_snapshot(system);
+    if (result == 0 && system->loaded_config.config.dns_enhancement) {
+        system->dns_startup_deadline = asteriskd_dns_boottime() + 8000;
+        result = system_dns_verify_startup(system);
+        system->dns_startup_deadline = 0;
+        system->dns.busy = false;
+    }
     return result;
 }
 
@@ -6210,6 +6779,9 @@ static int system_effect_stop_core(void *opaque) {
 static int system_effect_quiesce(void *opaque) {
     struct asteriskd_system_supervisor *system = opaque;
     system->cleanup_in_progress = true;
+    system->dns_regenerating=false;
+    system->dns_hot_stage = 0; system->dns_hot_result = -1;
+    if (system_dns_withdraw(system) != 0) return -1;
     if (asteriskd_mode_core_managed(system->loaded_config.config.mode)) {
         return system_effect_stop_core(opaque);
     }
@@ -6374,6 +6946,7 @@ static void system_child_process_defaults(struct asteriskd_child_process *proces
 }
 
 static void system_runtime_cleanup_cycle(struct asteriskd_system_supervisor *system) {
+    asteriskd_dns_close(&system->dns);
     system_rule_batch_destroy(&system->rule_commands);
     system_rule_snapshot_destroy(&system->rule_snapshot);
     system_tc_netlink_close(system);
@@ -6401,6 +6974,11 @@ static void system_runtime_reset_cycle(struct asteriskd_system_supervisor *syste
     system_runtime_cleanup_cycle(system);
     size_t offset = offsetof(struct asteriskd_system_supervisor, stop_requested);
     memset((unsigned char *)system + offset, 0, sizeof(*system) - offset);
+    asteriskd_dns_init(&system->dns);
+    ++system->dns_cycle;
+    system->dns_hot_completed_generation = 0;
+    system->dns_regenerating = false;
+    system->dns_hot_stage = 0; system->dns_hot_result = -1;
     asteriskd_tun_compat_state_init(&system->tun_compatibility);
     system->tc_netlink_fd = -1;
     system_child_process_defaults(&system->core_process);
@@ -6507,6 +7085,11 @@ static int system_runtime_run(const char *config_path, bool initial_start,
 
     struct asteriskd_system_supervisor system;
     memset(&system, 0, sizeof(system));
+    asteriskd_dns_init(&system.dns);
+    if (syscall(SYS_getrandom, &system.dns_instance, sizeof(system.dns_instance), 0) != sizeof(system.dns_instance))
+        system.dns_instance = 0; // Required enhancement fails closed if a fresh identity is unavailable.
+    system.dns_cycle = 1;
+    system.live.dns_enhancement = &system.dns.snapshot;
     system.signal_fd = -1;
     system.service_timer_fd = -1;
     system.wifi_monitor.fd = -1;
@@ -6644,6 +7227,7 @@ static int system_runtime_run(const char *config_path, bool initial_start,
         .snapshot = system_runtime_snapshot,
         .request_stop = system_runtime_request_stop,
         .request_shutdown = system_runtime_request_shutdown,
+        .request_dns = system_runtime_request_dns,
         .context = &system,
     };
     if (asteriskd_control_server_create(&system.control, listener, &callbacks) != 0) {

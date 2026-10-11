@@ -17,7 +17,7 @@ int asteriskd_b2s_token_route_plan_build(
         }
         return ASTERISKD_CONFIG_INVALID;
     }
-    if (!config->enable_ipv6) return 0;
+    if (!config->enable_ipv6 && !config->enable_local_dns) return 0;
     if (loopback_interface_index == 0U || slot == ASTERISKD_ROUTE_SLOT_FOREIGN) {
         if (error != NULL && error_capacity != 0U) {
             (void)snprintf(error, error_capacity, "%s", slot == ASTERISKD_ROUTE_SLOT_FOREIGN ?

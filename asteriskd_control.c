@@ -26,7 +26,7 @@
 
 #define CONTROL_TOKEN_NONE SIZE_MAX
 
-static const char *const control_method_names[] = {"status", "stop", "shutdown", "watch"};
+static const char *const control_method_names[] = {"status", "stop", "shutdown", "watch", "dns-suspend", "dns-resume", "dns-abort"};
 static const char *const control_result_names[] = {
     "ok", "already_running", "not_running", "permission_denied", "invalid_request",
     "config_invalid", "unsupported_combination", "start_failed", "stop_failed", "internal_error",
@@ -244,12 +244,32 @@ static bool control_cli_config_path_valid(const char *path, size_t *length) {
     return true;
 }
 
+static int control_cli_id(const char *text, uint64_t *value) {
+    if (!text || *text < '1' || *text > '9') return -1;
+    *value = 0;
+    for (; *text; ++text) {
+        if (*text < '0' || *text > '9' || *value > (UINT64_MAX - (unsigned)(*text - '0')) / 10U) return -1;
+        *value = *value * 10U + (unsigned)(*text - '0');
+    }
+    return 0;
+}
+
 int asteriskd_cli_parse(
     int argc,
     const char *const *argv,
     struct asteriskd_cli_invocation *invocation) {
     if (invocation != NULL) memset(invocation, 0, sizeof(*invocation));
     if (invocation == NULL || argv == NULL || argc < 2 || argv[1] == NULL) return -1;
+    if (argc == 8 && (!strcmp(argv[1], "dns-suspend") || !strcmp(argv[1], "dns-resume") || !strcmp(argv[1], "dns-abort"))) {
+        if (!argv[2] || !argv[4] || !argv[6] || strcmp(argv[2], "--instance-id") ||
+            strcmp(argv[4], "--cycle-id") || strcmp(argv[6], "--generation") ||
+            control_cli_id(argv[3], &invocation->instance_id) != 0 ||
+            control_cli_id(argv[5], &invocation->cycle_id) != 0 ||
+            control_cli_id(argv[7], &invocation->generation) != 0) goto invalid;
+        invocation->command = !strcmp(argv[1], "dns-suspend") ? ASTERISKD_CLI_DNS_SUSPEND :
+            !strcmp(argv[1], "dns-resume") ? ASTERISKD_CLI_DNS_RESUME : ASTERISKD_CLI_DNS_ABORT;
+        return 0;
+    }
     if (argc == 2) {
         if (strcmp(argv[1], "status") == 0) invocation->command = ASTERISKD_CLI_STATUS;
         else if (strcmp(argv[1], "stop") == 0) invocation->command = ASTERISKD_CLI_STOP;
@@ -546,6 +566,9 @@ static bool control_error_valid(const struct asteriskd_control_error *error) {
 }
 
 bool asteriskd_control_snapshot_valid(const struct asteriskd_control_snapshot *snapshot) {
+    if (snapshot == NULL || snapshot->dns_enhancement.phase > DNS_FAILED ||
+        snapshot->dns_enhancement.phase < DNS_DISABLED ||
+        memchr(snapshot->dns_enhancement.reason, 0, sizeof(snapshot->dns_enhancement.reason)) == NULL) return false;
     if (snapshot == NULL || snapshot->phase < 0 || snapshot->phase >= ASTERISKD_PHASE_COUNT ||
         !control_combination_valid(snapshot->owner, snapshot->core_type, snapshot->mode) ||
         snapshot->supervisor_pid <= 0 || (snapshot->has_core_pid ? snapshot->core_pid <= 0 : snapshot->core_pid != 0) ||
@@ -639,6 +662,7 @@ int asteriskd_control_snapshot_from_state(
     snapshot->core_type = state->core_type;
     snapshot->mode = state->mode;
     snapshot->supervisor_pid = live->supervisor_pid;
+    if (live->dns_enhancement) snapshot->dns_enhancement = *live->dns_enhancement;
     snapshot->helper_type = control_helper_for_mode(state->mode);
     snapshot->matcher_configured = state->matcher.configured;
     snapshot->matcher_active = state->matcher.active;
@@ -750,6 +774,12 @@ static void control_encode_snapshot(
     control_builder_raw(builder, snapshot->network.ipv6_enabled ? "true" : "false");
     control_builder_raw(builder, ",\"ipv6Ready\":");
     control_builder_raw(builder, snapshot->network.ipv6_ready ? "true" : "false");
+    static const char *const dns_phases[] = {"disabled", "preparing", "prepared", "active", "inactive", "draining", "unsupported", "failed"};
+    const struct asteriskd_dns_snapshot *dns = &snapshot->dns_enhancement;
+    control_builder_format(builder, "},\"dnsEnhancement\":{\"required\":%s,\"phase\":\"%s\",\"instanceId\":\"%" PRIu64 "\",\"cycleId\":\"%" PRIu64 "\",\"generation\":\"%" PRIu64 "\",\"reason\":",
+        dns->required ? "true" : "false", dns_phases[dns->phase], dns->instance_id, dns->cycle_id, dns->generation);
+    if (dns->reason[0]) control_builder_json_string(builder, dns->reason);
+    else control_builder_raw(builder, "null");
     control_builder_raw(builder, "},\"error\":");
     control_encode_error(builder, snapshot->has_error, &snapshot->error);
     control_builder_raw(builder, "}");
@@ -763,11 +793,15 @@ int asteriskd_control_encode_request_line(
     if (request == NULL || out == NULL || out_size == 0U || !control_request_id_valid(request->request_id) ||
         request->method < 0 || request->method >= ASTERISKD_CONTROL_METHOD_COUNT) return -1;
     struct control_builder builder = {.bytes = out, .capacity = out_size};
-    control_builder_raw(&builder, "{\"protocolVersion\":1,\"requestId\":");
+    control_builder_raw(&builder, "{\"protocolVersion\":2,\"requestId\":");
     control_builder_json_string(&builder, request->request_id);
     control_builder_raw(&builder, ",\"method\":");
     control_builder_json_string(&builder, control_method_names[request->method]);
-    control_builder_raw(&builder, ",\"params\":{}}");
+    if (request->method >= ASTERISKD_CONTROL_METHOD_DNS_SUSPEND) {
+        if (!request->instance_id || !request->cycle_id || !request->generation) return -1;
+        control_builder_format(&builder, ",\"params\":{\"instanceId\":\"%" PRIu64 "\",\"cycleId\":\"%" PRIu64 "\",\"generation\":\"%" PRIu64 "\"}}",
+            request->instance_id, request->cycle_id, request->generation);
+    } else control_builder_raw(&builder, ",\"params\":{}}");
     return control_builder_finish(&builder, out_length);
 }
 
@@ -779,7 +813,7 @@ int asteriskd_control_encode_response_line(
     if (response == NULL || out == NULL || out_size == 0U ||
         !control_request_id_valid(response->request_id) || !asteriskd_control_result_valid(&response->result)) return -1;
     struct control_builder builder = {.bytes = out, .capacity = out_size};
-    control_builder_raw(&builder, "{\"protocolVersion\":1,\"requestId\":");
+    control_builder_raw(&builder, "{\"protocolVersion\":2,\"requestId\":");
     control_builder_json_string(&builder, response->request_id);
     control_builder_raw(&builder, ",\"result\":{\"code\":");
     control_builder_json_string(&builder, control_result_names[response->result.code]);
@@ -809,7 +843,7 @@ int asteriskd_control_encode_event_line(
     size_t *out_length) {
     if (out == NULL || out_size == 0U || !control_event_valid(event)) return -1;
     struct control_builder builder = {.bytes = out, .capacity = out_size};
-    control_builder_format(&builder, "{\"protocolVersion\":1,\"event\":{\"sequence\":%" PRIu64 ",\"type\":", event->sequence);
+    control_builder_format(&builder, "{\"protocolVersion\":2,\"event\":{\"sequence\":%" PRIu64 ",\"type\":", event->sequence);
     control_builder_json_string(&builder, control_event_names[event->type]);
     control_builder_raw(&builder, ",\"snapshot\":");
     control_encode_snapshot(&builder, &event->snapshot);
@@ -1115,6 +1149,19 @@ static bool control_token_is_null(const struct asteriskd_json_document *document
     return token < document->token_count && document->tokens[token].type == ASTERISKD_JSON_NULL;
 }
 
+static int control_parse_decimal_id(const struct asteriskd_json_document *document,
+    size_t token, uint64_t *value) {
+    char text[21];
+    if (control_decode_json_string(document, token, text, sizeof(text)) != 0 || !text[0] ||
+        (text[0] == '0' && text[1])) return -1;
+    *value = 0;
+    for (const char *p = text; *p; ++p) {
+        if (*p < '0' || *p > '9' || *value > (UINT64_MAX - (unsigned)(*p - '0')) / 10U) return -1;
+        *value = *value * 10U + (unsigned)(*p - '0');
+    }
+    return 0;
+}
+
 enum asteriskd_control_decode_outcome asteriskd_control_decode_request_payload(
     const char *payload,
     size_t payload_length,
@@ -1156,7 +1203,14 @@ enum asteriskd_control_decode_outcome asteriskd_control_decode_request_payload(
         control_parse_enum(&document, values[2], control_method_names,
             ASTERISKD_CONTROL_METHOD_COUNT, &method) == 0 &&
         values[3] < document.token_count && document.tokens[values[3]].type == ASTERISKD_JSON_OBJECT &&
-        document.tokens[values[3]].child_count == 0U;
+        (method >= ASTERISKD_CONTROL_METHOD_DNS_SUSPEND || document.tokens[values[3]].child_count == 0U);
+    if (valid && method >= ASTERISKD_CONTROL_METHOD_DNS_SUSPEND) {
+        static const char *const ids[] = {"instanceId", "cycleId", "generation"}; size_t id[3];
+        valid = control_object_values(&document, values[3], ids, 3, id) == 0 &&
+            control_parse_decimal_id(&document, id[0], &request->instance_id) == 0 && request->instance_id &&
+            control_parse_decimal_id(&document, id[1], &request->cycle_id) == 0 && request->cycle_id &&
+            control_parse_decimal_id(&document, id[2], &request->generation) == 0 && request->generation;
+    }
     if (valid) request->method = (enum asteriskd_control_method)method;
     asteriskd_json_document_destroy(&document);
     return valid ? ASTERISKD_CONTROL_DECODE_VALID : ASTERISKD_CONTROL_DECODE_INVALID_REQUEST;
@@ -1213,11 +1267,11 @@ static int control_parse_snapshot(
     struct asteriskd_control_snapshot *snapshot) {
     static const char *const names[] = {
         "phase", "owner", "coreType", "mode", "supervisorPid", "corePid", "helperType", "helperPid",
-        "matcherConfigured", "matcherActive", "rules", "network", "error",
+        "matcherConfigured", "matcherActive", "rules", "network", "error", "dnsEnhancement",
     };
     static const char *const rule_names[] = {"active", "generation", "categories"};
     static const char *const network_names[] = {"ipv4Ready", "ipv6Enabled", "ipv6Ready"};
-    size_t values[13];
+    size_t values[14];
     size_t rule_values[3];
     size_t network_values[3];
     int phase;
@@ -1225,7 +1279,7 @@ static int control_parse_snapshot(
     int core;
     int mode;
     memset(snapshot, 0, sizeof(*snapshot));
-    if (control_object_values(document, object, names, 13U, values) != 0 ||
+    if (control_object_values(document, object, names, 14U, values) != 0 ||
         control_parse_enum(document, values[0], control_phase_names, ASTERISKD_PHASE_COUNT, &phase) != 0 ||
         control_parse_enum(document, values[1], control_owner_names, 3U, &owner) != 0 ||
         control_parse_enum(document, values[2], control_core_names, 3U, &core) != 0 ||
@@ -1271,6 +1325,18 @@ static int control_parse_snapshot(
         snapshot->has_error = true;
         if (control_parse_error(document, values[12], &snapshot->error) != 0) return -1;
     }
+    static const char *const dns_names[] = {"required", "phase", "instanceId", "cycleId", "generation", "reason"};
+    static const char *const dns_phases[] = {"disabled", "preparing", "prepared", "active", "inactive", "draining", "unsupported", "failed"};
+    size_t dv[6]; int dp = 0;
+    if (control_object_values(document, values[13], dns_names, 6, dv) != 0 ||
+        control_parse_bool(document, dv[0], &snapshot->dns_enhancement.required) != 0 ||
+        control_parse_enum(document, dv[1], dns_phases, 8, &dp) != 0 ||
+        control_parse_decimal_id(document, dv[2], &snapshot->dns_enhancement.instance_id) != 0 ||
+        control_parse_decimal_id(document, dv[3], &snapshot->dns_enhancement.cycle_id) != 0 ||
+        control_parse_decimal_id(document, dv[4], &snapshot->dns_enhancement.generation) != 0) return -1;
+    snapshot->dns_enhancement.phase = (enum asteriskd_dns_phase)dp;
+    if (!control_token_is_null(document, dv[5]) && control_decode_json_string(document, dv[5],
+        snapshot->dns_enhancement.reason, sizeof(snapshot->dns_enhancement.reason)) != 0) return -1;
     return asteriskd_control_snapshot_valid(snapshot) ? 0 : -1;
 }
 
@@ -1420,14 +1486,16 @@ static enum asteriskd_control_client_result control_client_close_result(
     return result;
 }
 
-enum asteriskd_control_client_result asteriskd_control_client_run_with_backend(
-    enum asteriskd_control_method method,
-    const char *request_id,
+static enum asteriskd_control_client_result control_request_with_backend(
+    const struct asteriskd_control_request *input,
     const struct asteriskd_control_client_backend *backend,
     void *context,
     asteriskd_control_line_sink sink,
     void *sink_context,
     struct asteriskd_control_response *response) {
+    if (input == NULL) return ASTERISKD_CONTROL_CLIENT_PROTOCOL_ERROR;
+    enum asteriskd_control_method method = input->method;
+    const char *request_id = input->request_id;
     if (response != NULL) memset(response, 0, sizeof(*response));
     if (response == NULL || !control_client_backend_complete(backend) ||
         method < 0 || method >= ASTERISKD_CONTROL_METHOD_COUNT ||
@@ -1437,7 +1505,7 @@ enum asteriskd_control_client_result asteriskd_control_client_run_with_backend(
         return ASTERISKD_CONTROL_CLIENT_IO_ERROR;
     }
     uint64_t initial_deadline = control_deadline_after(
-        started, ASTERISKD_CONTROL_REQUEST_TIMEOUT_MILLIS);
+        started, method >= ASTERISKD_CONTROL_METHOD_DNS_SUSPEND ? 10000U : ASTERISKD_CONTROL_REQUEST_TIMEOUT_MILLIS);
     int fd = -1;
     enum asteriskd_control_connect_result connected = backend->connect_abstract(
         context, control_abstract_name, sizeof(control_abstract_name) - 1U, &fd);
@@ -1460,10 +1528,7 @@ enum asteriskd_control_client_result asteriskd_control_client_run_with_backend(
         return control_client_close_result(backend, context, &fd, result, response);
     }
 
-    struct asteriskd_control_request request;
-    memset(&request, 0, sizeof(request));
-    memcpy(request.request_id, request_id, strlen(request_id) + 1U);
-    request.method = method;
+    struct asteriskd_control_request request = *input;
     char request_line[256U];
     size_t request_length = 0U;
     if (asteriskd_control_encode_request_line(
@@ -1745,6 +1810,27 @@ static const struct asteriskd_control_client_backend control_system_client_backe
 };
 #endif
 
+enum asteriskd_control_client_result asteriskd_control_client_run_with_backend(
+    enum asteriskd_control_method method, const char *request_id,
+    const struct asteriskd_control_client_backend *backend, void *context,
+    asteriskd_control_line_sink sink, void *sink_context, struct asteriskd_control_response *response) {
+    struct asteriskd_control_request request = {.method=method};
+    if (!control_request_id_valid(request_id)) return ASTERISKD_CONTROL_CLIENT_PROTOCOL_ERROR;
+    memcpy(request.request_id, request_id, strlen(request_id)+1);
+    return control_request_with_backend(&request, backend, context, sink, sink_context, response);
+}
+
+enum asteriskd_control_client_result asteriskd_control_request_run(
+    const struct asteriskd_control_request *request, asteriskd_control_line_sink sink,
+    void *sink_context, struct asteriskd_control_response *response) {
+#if defined(__linux__) || defined(__ANDROID__)
+    return control_request_with_backend(request, &control_system_client_backend, NULL, sink, sink_context, response);
+#else
+    (void)request; (void)sink; (void)sink_context; (void)response;
+    return ASTERISKD_CONTROL_CLIENT_IO_ERROR;
+#endif
+}
+
 enum asteriskd_control_client_result asteriskd_control_client_run(
     enum asteriskd_control_method method,
     const char *request_id,
@@ -1856,7 +1942,7 @@ static int control_cli_usage(
     void *context) {
     static const char usage[] =
         "usage: asteriskd start|monitor --config ABSOLUTE_PATH | status | stop | shutdown | "
-        "watch [--until-running]\n";
+        "watch [--until-running] | dns-suspend|dns-resume|dns-abort --instance-id ID --cycle-id ID --generation ID\n";
     (void)backend->write_stderr(context, usage, sizeof(usage) - 1U);
     return 64;
 }
@@ -1915,6 +2001,27 @@ static int control_cli_run_control(
             ? "control request timed out" : "control request failed");
 }
 
+static int control_cli_run_dns(const struct asteriskd_cli_backend *backend, void *context,
+    const struct asteriskd_cli_invocation *invocation) {
+    struct asteriskd_control_request request = {
+        .method = invocation->command == ASTERISKD_CLI_DNS_SUSPEND ? ASTERISKD_CONTROL_METHOD_DNS_SUSPEND :
+            invocation->command == ASTERISKD_CLI_DNS_RESUME ? ASTERISKD_CONTROL_METHOD_DNS_RESUME : ASTERISKD_CONTROL_METHOD_DNS_ABORT,
+        .instance_id=invocation->instance_id, .cycle_id=invocation->cycle_id, .generation=invocation->generation};
+    snprintf(request.request_id, sizeof(request.request_id), "%s", control_method_names[request.method]);
+    struct control_cli_sink sink = {.backend=backend, .context=context};
+    struct asteriskd_control_response response = {0};
+    enum asteriskd_control_client_result result = backend->control_request ?
+        backend->control_request(context, &request, control_cli_line_sink, &sink, &response) : ASTERISKD_CONTROL_CLIENT_IO_ERROR;
+    if (result == ASTERISKD_CONTROL_CLIENT_OK) {
+        int code = asteriskd_control_result_exit_code(response.result.code);
+        asteriskd_control_response_destroy(&response); return code;
+    }
+    asteriskd_control_response_destroy(&response);
+    return control_cli_write_response(backend, context, request.request_id,
+        result == ASTERISKD_CONTROL_CLIENT_ABSENT ? ASTERISKD_CONTROL_RESULT_NOT_RUNNING : ASTERISKD_CONTROL_RESULT_INTERNAL_ERROR,
+        NULL, "DNS control request failed");
+}
+
 int asteriskd_cli_main_with_backend(
     int argc,
     const char *const *argv,
@@ -1930,11 +2037,16 @@ int asteriskd_cli_main_with_backend(
             invocation.command == ASTERISKD_CLI_MONITOR ? "monitor" :
             invocation.command == ASTERISKD_CLI_STATUS ? "status" :
             invocation.command == ASTERISKD_CLI_STOP ? "stop" :
-            invocation.command == ASTERISKD_CLI_SHUTDOWN ? "shutdown" : "watch";
+            invocation.command == ASTERISKD_CLI_SHUTDOWN ? "shutdown" :
+            invocation.command == ASTERISKD_CLI_DNS_SUSPEND ? "dns-suspend" :
+            invocation.command == ASTERISKD_CLI_DNS_RESUME ? "dns-resume" :
+            invocation.command == ASTERISKD_CLI_DNS_ABORT ? "dns-abort" : "watch";
         return control_cli_write_response(
             backend, context, request_id, ASTERISKD_CONTROL_RESULT_PERMISSION_DENIED,
             NULL, "root permission required");
     }
+    if (invocation.command == ASTERISKD_CLI_DNS_SUSPEND || invocation.command == ASTERISKD_CLI_DNS_RESUME || invocation.command == ASTERISKD_CLI_DNS_ABORT)
+        return control_cli_run_dns(backend, context, &invocation);
     if (invocation.command == ASTERISKD_CLI_STATUS) {
         return control_cli_run_control(
             backend, context, ASTERISKD_CONTROL_METHOD_STATUS, "status", false);
@@ -1985,6 +2097,8 @@ struct control_server_client {
     bool request_processed;
     bool watch;
     bool pending_stop;
+    bool pending_dns;
+    struct asteriskd_control_request dns_request;
     bool close_after_flush;
     size_t watch_initial_remaining;
     char request_id[ASTERISKD_CONTROL_MAX_REQUEST_ID + 1U];
@@ -2180,6 +2294,18 @@ static int control_server_process_request(
         if (control_server_queue_response(
                 server, client, ASTERISKD_CONTROL_RESULT_INVALID_REQUEST,
                 NULL, "invalid request", now, true) != 0) {
+            control_server_client_close(server, client);
+        }
+        return 0;
+    }
+    if (request.method >= ASTERISKD_CONTROL_METHOD_DNS_SUSPEND) {
+        if (server->callbacks.request_dns != NULL &&
+            server->callbacks.request_dns(server->callbacks.context, &request, false) == 0) {
+            if (request.method == ASTERISKD_CONTROL_METHOD_DNS_ABORT) client->pending_stop = true;
+            else { client->pending_dns = true; client->dns_request = request; }
+        } else if (control_server_queue_response(server, client,
+                ASTERISKD_CONTROL_RESULT_INVALID_REQUEST, NULL,
+                "stale identity or DNS transition unavailable", now, true) != 0) {
             control_server_client_close(server, client);
         }
         return 0;
@@ -2505,6 +2631,21 @@ int asteriskd_control_server_tick(
     for (size_t index = 0U; index < ASTERISKD_CONTROL_MAX_CLIENTS; ++index) {
         struct control_server_client *client = &server->clients[index];
         if (!client->active) continue;
+        if (client->pending_dns) {
+            int result = server->callbacks.request_dns(server->callbacks.context, &client->dns_request, true);
+            if (result != 0) {
+                struct asteriskd_control_snapshot snapshot;
+                bool has = control_server_snapshot(server, &snapshot) == 0;
+                client->pending_dns = false;
+                client->request_deadline = control_deadline_after(now, ASTERISKD_CONTROL_REQUEST_TIMEOUT_MILLIS);
+                if (control_server_queue_response(server, client, result > 0 ? ASTERISKD_CONTROL_RESULT_OK :
+                    ASTERISKD_CONTROL_RESULT_INTERNAL_ERROR, has ? &snapshot : NULL,
+                    result > 0 ? NULL : "DNS transition failed; enhancement remains withdrawn", now, true) != 0)
+                    control_server_client_close(server, client);
+                if (has) asteriskd_control_snapshot_destroy(&snapshot);
+            }
+        }
+
         bool request_deadline_active = !client->request_processed ||
             (client->watch && client->watch_initial_remaining != 0U) ||
             (!client->watch && !client->pending_stop && client->output_length != 0U);
@@ -2553,7 +2694,9 @@ int asteriskd_control_server_publish_event(
     server->sequence = event.sequence;
     for (size_t index = 0U; index < ASTERISKD_CONTROL_MAX_CLIENTS; ++index) {
         struct control_server_client *client = &server->clients[index];
-        if (!client->active || !client->watch) continue;
+        // A terminal frame seals this stream, including while its output is
+        // still queued. Runtime cleanup can publish later STOPPING/STOPPED.
+        if (!client->active || !client->watch || client->close_after_flush) continue;
         if (control_server_enqueue(
                 server, client, line, line_length, now) != 0) {
             control_server_client_close(server, client);

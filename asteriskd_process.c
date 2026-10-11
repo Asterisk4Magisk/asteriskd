@@ -15,6 +15,7 @@
 #include <string.h>
 
 #if defined(__linux__)
+#include <dirent.h>
 #include <fcntl.h>
 #include <grp.h>
 #include <linux/memfd.h>
@@ -1299,18 +1300,45 @@ static int system_context_child_alive(
     return 0;
 }
 
-/* Match the port marker anywhere in the TCP table. */
-static bool process_listener_file_matches(const char *path, uint16_t port) {
-    char marker[8U];
-    int length = snprintf(marker, sizeof(marker), ":%04X ", (unsigned)port);
-    if (length <= 0 || (size_t)length >= sizeof(marker)) return false;
+static bool process_owns_socket(int pid, uint64_t inode) {
+    char path[64U], expected[64U];
+    if (inode == 0U || system_proc_path(path, sizeof(path), pid, "fd") != 0) return false;
+    int length = snprintf(expected, sizeof(expected), "socket:[%" PRIu64 "]", inode);
+    if (length <= 0 || (size_t)length >= sizeof(expected)) return false;
+    DIR *directory = opendir(path);
+    if (directory == NULL) return false;
+    bool found = false;
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        char target[64U];
+        ssize_t size = readlinkat(dirfd(directory), entry->d_name, target, sizeof(target));
+        if (size == length && memcmp(target, expected, (size_t)length) == 0) {
+            found = true;
+            break;
+        }
+    }
+    (void)closedir(directory);
+    return found;
+}
+
+static bool process_listener_file_matches(const char *path, uint16_t port, int pid) {
     FILE *file = fopen(path, "re");
     if (file == NULL) return false;
     char *line = NULL;
     size_t capacity = 0U;
     bool matched = false;
     while (getline(&line, &capacity, file) >= 0) {
-        if (strstr(line, marker) != NULL) matched = true;
+        char address[33U];
+        unsigned local_port = 0U, state = 0U;
+        uint64_t inode = 0U;
+        // /proc/<pid>/net/tcp describes the network namespace, not PID-owned
+        // sockets. Require a local LISTEN entry and verify its FD owner.
+        if (sscanf(line, "%*u: %32[0-9A-Fa-f]:%x %*32[0-9A-Fa-f]:%*x %x %*s %*s %*s %*u %*u %" SCNu64,
+                address, &local_port, &state, &inode) == 4 &&
+            local_port == port && state == 0x0AU && process_owns_socket(pid, inode)) {
+            matched = true;
+        }
     }
     bool complete = feof(file) != 0 && ferror(file) == 0;
     free(line);
@@ -1329,7 +1357,7 @@ static int system_context_listener_ready(
     for (size_t index = 0U; index < sizeof(tables) / sizeof(tables[0]); ++index) {
         char path[64U];
         if (system_proc_path(path, sizeof(path), pid, tables[index]) != 0) return -1;
-        if (process_listener_file_matches(path, port)) {
+        if (process_listener_file_matches(path, port, pid)) {
             *ready = true;
             break;
         }

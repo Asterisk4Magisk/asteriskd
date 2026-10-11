@@ -5,6 +5,8 @@
 #define ASTERISKD_H
 
 #include <stdbool.h>
+#include "asteriskd_dns.h"
+#include "asteriskd_marks.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -13,7 +15,7 @@
 
 struct asteriskd_resource_operation;
 
-#define ASTERISKD_CONFIG_VERSION 4U
+#define ASTERISKD_CONFIG_VERSION 5U
 #define ASTERISKD_MAX_JSON_SIZE (8U * 1024U * 1024U)
 #define ASTERISKD_JSON_MAX_TOKENS 262144U
 #define ASTERISKD_JSON_MAX_DEPTH 64U
@@ -50,7 +52,7 @@ struct asteriskd_resource_operation;
 #define ASTERISKD_LOG_MAX_BUFFERED_PER_CHILD 65536U
 #define ASTERISKD_LOG_PARTIAL_TIMEOUT_MILLIS 2000U
 #define ASTERISKD_LOG_REDACTION "[REDACTED]"
-#define ASTERISKD_CONTROL_PROTOCOL_VERSION 1U
+#define ASTERISKD_CONTROL_PROTOCOL_VERSION 2U
 #define ASTERISKD_CONTROL_MAX_PAYLOAD 65536U
 #define ASTERISKD_CONTROL_REQUEST_TIMEOUT_MILLIS 2000U
 #define ASTERISKD_CONTROL_MAX_REQUEST_ID 64U
@@ -75,8 +77,7 @@ struct asteriskd_resource_operation;
     ASTERISKD_ANONYMOUS_SEAL_SEAL)
 #define ASTERISKD_IPTABLES_WAIT_SECONDS 100U
 #define ASTERISKD_ROUTE_RULE_PRIORITY 14599U
-#define ASTERISKD_PRIMARY_MARK UINT32_C(0x20000000)
-#define ASTERISKD_MARK_MASK UINT32_C(0x60000000)
+#define ASTERISKD_DNS_ROUTE_RULE_PRIORITY 12999U
 #define ASTERISKD_TPROXY_TABLE 160U
 #define ASTERISKD_TUN_TABLE 168U
 #define ASTERISKD_RULE_PLAN_MAX_OPERATIONS 32U
@@ -386,6 +387,8 @@ struct asteriskd_config {
     bool enable_ipv6;
     bool disable_system_ipv6;
     bool enable_local_dns;
+    bool dns_enhancement;
+    uint64_t core_dns_generation;
     bool enable_fake_dns;
     bool has_fake_dns_ipv4_pool;
     char fake_dns_ipv4_pool[ASTERISKD_MAX_CIDR];
@@ -1147,6 +1150,8 @@ enum asteriskd_ip_rule_id {
     ASTERISKD_IP_RULE_TPROXY,
     ASTERISKD_IP_RULE_TUNNEL,
     ASTERISKD_IP_RULE_TOKEN,
+    ASTERISKD_IP_RULE_DNS_TPROXY,
+    ASTERISKD_IP_RULE_DNS_TUNNEL,
     ASTERISKD_IP_RULE_COUNT,
 };
 
@@ -1175,11 +1180,17 @@ struct asteriskd_owned_chain {
     const char *name;
 };
 
+enum asteriskd_dns_transport {
+    ASTERISKD_DNS_NONE = 0,
+    ASTERISKD_DNS_TCP = 6,
+    ASTERISKD_DNS_UDP = 17,
+};
+
 struct asteriskd_owned_hook {
     enum asteriskd_ip_family family;
     enum asteriskd_ip_table table;
     const char *builtin_chain;
-    bool udp_destination_port_53;
+    enum asteriskd_dns_transport dns_destination_protocol;
     const char *target;
 };
 
@@ -1450,7 +1461,7 @@ struct asteriskd_private_chain_group {
 struct asteriskd_traffic_hook {
     enum asteriskd_builtin_chain builtin_chain;
     bool insert_at_head;
-    bool udp_destination_port_53;
+    enum asteriskd_dns_transport dns_destination_protocol;
     enum asteriskd_hook_verdict verdict;
     char jump_target[ASTERISKD_MAX_CHAIN_NAME];
 };
@@ -1479,6 +1490,7 @@ struct asteriskd_route_effect {
     uint32_t mark_mask;
     bool invert_from_all;
     bool local_route;
+    bool loopback_source;
     enum asteriskd_ip_rule_id ip_rule_id;
     enum asteriskd_route_id route_id;
     char destination[ASTERISKD_MAX_CIDR];
@@ -1579,6 +1591,7 @@ enum asteriskd_poll_source_kind {
     ASTERISKD_POLL_SERVICE_TIMER,
     ASTERISKD_POLL_WIFI,
     ASTERISKD_POLL_KEYGUARD,
+    ASTERISKD_POLL_DNS,
     ASTERISKD_POLL_SOURCE_KIND_COUNT,
 };
 
@@ -1814,6 +1827,9 @@ enum asteriskd_control_method {
     ASTERISKD_CONTROL_METHOD_STOP,
     ASTERISKD_CONTROL_METHOD_SHUTDOWN,
     ASTERISKD_CONTROL_METHOD_WATCH,
+    ASTERISKD_CONTROL_METHOD_DNS_SUSPEND,
+    ASTERISKD_CONTROL_METHOD_DNS_RESUME,
+    ASTERISKD_CONTROL_METHOD_DNS_ABORT,
     ASTERISKD_CONTROL_METHOD_COUNT,
 };
 
@@ -1853,6 +1869,7 @@ enum asteriskd_control_decode_outcome {
 struct asteriskd_control_request {
     char request_id[ASTERISKD_CONTROL_MAX_REQUEST_ID + 1U];
     enum asteriskd_control_method method;
+    uint64_t instance_id, cycle_id, generation;
 };
 
 struct asteriskd_control_error {
@@ -1879,6 +1896,7 @@ struct asteriskd_control_network {
 };
 
 struct asteriskd_control_snapshot {
+    struct asteriskd_dns_snapshot dns_enhancement;
     enum asteriskd_phase phase;
     enum asteriskd_owner owner;
     enum asteriskd_core_type core_type;
@@ -1898,6 +1916,7 @@ struct asteriskd_control_snapshot {
 };
 
 struct asteriskd_control_live_context {
+    const struct asteriskd_dns_snapshot *dns_enhancement;
     int supervisor_pid;
     bool ipv6_enabled;
 };
@@ -2046,11 +2065,15 @@ enum asteriskd_cli_command {
     ASTERISKD_CLI_STOP,
     ASTERISKD_CLI_SHUTDOWN,
     ASTERISKD_CLI_WATCH,
+    ASTERISKD_CLI_DNS_SUSPEND,
+    ASTERISKD_CLI_DNS_RESUME,
+    ASTERISKD_CLI_DNS_ABORT,
 };
 
 struct asteriskd_cli_invocation {
     enum asteriskd_cli_command command;
     bool watch_until_running;
+    uint64_t instance_id, cycle_id, generation;
     char path[ASTERISKD_MAX_PATH];
 };
 
@@ -2107,7 +2130,12 @@ enum asteriskd_control_client_result asteriskd_control_client_run(
     enum asteriskd_control_method, const char *,
     asteriskd_control_line_sink, void *, struct asteriskd_control_response *);
 
+enum asteriskd_control_client_result asteriskd_control_request_run(
+    const struct asteriskd_control_request *, asteriskd_control_line_sink, void *, struct asteriskd_control_response *);
+
 struct asteriskd_cli_backend {
+    enum asteriskd_control_client_result (*control_request)(void *,
+        const struct asteriskd_control_request *, asteriskd_control_line_sink, void *, struct asteriskd_control_response *);
     uint32_t (*effective_uid)(void *);
     enum asteriskd_control_client_result (*control_client)(
         void *, enum asteriskd_control_method, const char *,
@@ -2135,6 +2163,7 @@ struct asteriskd_control_callbacks {
     int (*snapshot)(void *, struct asteriskd_control_snapshot *);
     int (*request_stop)(void *);
     int (*request_shutdown)(void *);
+    int (*request_dns)(void *, const struct asteriskd_control_request *, bool);
     void *context;
 };
 

@@ -12,8 +12,7 @@ owned effects are cleaned in reverse order, and a non-resident supervisor exits
 nonzero. A clean explicit stop succeeds only after telemetry reaches `stopped`.
 
 The source root is build-system agnostic. The Android parent project compiles
-every top-level `.c` file as one PIE executable; standalone regression drivers
-under `tests/` are excluded from application builds.
+every top-level `.c` file as one PIE executable.
 
 ## CLI
 
@@ -204,6 +203,38 @@ the exact AGE secret before persistence.
 The only persistent runtime artifacts are the app-published core config and
 `asteriskd.json`, daemon-owned telemetry file `asteriskd.state`, app-owned
 `startup.sh` when boot is enabled, and the single app-level `asteriskd.log`.
+
+## Application-list DNS routing
+
+With application-list enhancement enabled, the module classifies system resolver
+requests by their original application UID and isolates the selected resolver
+cache. The daemon consumes explicit proxy/direct marks before ordinary routing;
+unmarked DNS, including resolver-owned sockets, follows ordinary traffic policy.
+The DNS-specific OUTPUT rules do not
+expand the application UID list.
+
+`asteriskd_marks.h` defines the numeric marks and their xtables match strings.
+The classified bit is reserved for enhancement DNS decisions. The module sets
+proxy mark `0x21000000` before the first route lookup. OUTPUT returns both proxy
+and direct decisions through one classified-bit rule per protocol. The fixed
+resolver classifier has four rules per address family; core and forced-bypass
+owner guards remain separate. Enhanced IPv4 TPROXY gives its existing local
+route preferred source `127.0.0.1`; startup verifies that source before activation.
+Stateless cleanup recognizes both owned route forms. Ordinary routing with
+enhancement disabled retains its original route without a preferred source.
+
+Application-owned TCP/UDP 53 sockets use the existing application traffic policy,
+including UID selection, CIDR and interface bypasses, matcher decisions, and the
+IPv6 switch. They do not receive a separate DNS classification or an exemption
+from address bypasses. Marked system DNS retains its dedicated routing path even
+when ordinary IPv6 proxying is disabled. Core identity bypasses and the existing
+hotspot DNS policy remain in effect. Disabling system IPv6 also disables its
+DNS transport; this differs from disabling ordinary IPv6 proxying.
+
+Startup and resume verify consumers, installed rules, and the module
+PREPARE/ACTIVATE exchange. They do not send synthetic DNS queries or inject
+probe answers into core configurations. A changed network snapshot is drained
+and prepared again within a bounded startup window. The legacy mode is unchanged.
 
 ## Verification and device boundary
 

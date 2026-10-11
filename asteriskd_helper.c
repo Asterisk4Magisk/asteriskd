@@ -379,6 +379,7 @@ int asteriskd_helper_process_spec(
             asteriskd_process_argument_add(spec, "/proc/self/fd/3") != 0 ||
             asteriskd_process_argument_add(spec, "--pid") != 0 ||
             asteriskd_process_argument_add(spec, "/dev/null") != 0) goto invalid;
+        if (config->dns_enhancement && asteriskd_process_argument_add(spec, "--dns-enhancement") != 0) goto invalid;
         if (config->direct_cidrs != NULL) {
             if (helper_add_fd(spec, direct_ipv4_fd, 4) != 0 ||
                 helper_add_fd(spec, direct_ipv6_fd, 5) != 0) goto invalid;
