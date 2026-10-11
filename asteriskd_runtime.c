@@ -1086,7 +1086,7 @@ struct asteriskd_system_supervisor {
     struct asteriskd_effect_journal volatile_effects;
     uint64_t dns_instance, dns_cycle, dns_generation;
     struct asteriskd_dns_client dns;
-    uint64_t dns_last_boot, dns_last_mono, dns_hot_deadline, dns_startup_deadline;
+    uint64_t dns_hot_deadline, dns_startup_deadline;
     uint64_t dns_hot_completed_generation;
     bool dns_regenerating;
     int dns_hot_stage, dns_hot_result;
@@ -1384,12 +1384,13 @@ static int system_runtime_prepare(
     if (system->dns.snapshot.required) {
         int64_t dns_now = 0;
         if (system_runtime_clock(system, &dns_now) != 0) return -1;
-        uint64_t boot = asteriskd_dns_boottime();
-        uint64_t next = boot + 1000U;
+        uint64_t dns_time = asteriskd_dns_monotime();
+        uint64_t next = 0;
         if (system->dns.pending) next = system->dns.deadline;
-        else if (system->dns.snapshot.phase == DNS_ACTIVE) next = system->dns.renew_at;
-        if (system->dns_hot_stage || system->cleanup_in_progress) next = boot + 20U;
-        system_runtime_min_deadline(deadline, (uint64_t)dns_now + (next > boot ? next - boot : 0U));
+        else if (system->dns.fd >= 0 && system->dns.snapshot.phase == DNS_ACTIVE &&
+            system->dns.network_changed && !system->dns.busy && !system->dns.rx_size) next = dns_time;
+        if (system->dns_hot_stage || system->cleanup_in_progress) next = dns_time + 20U;
+        if (next) system_runtime_min_deadline(deadline, (uint64_t)dns_now + (next > dns_time ? next - dns_time : 0U));
         if (system->dns.fd >= 0 && system_runtime_add_source(builder, system->dns.fd,
             POLLIN | (system->dns.pending && system->dns.tx_offset < system->dns.tx_size ? POLLOUT : 0),
             ASTERISKD_POLL_DNS, 0U, system->dns.snapshot.generation) != 0) return -1;
@@ -6300,7 +6301,7 @@ static bool system_dns_done(void *opaque) {
 static int system_dns_wait(struct asteriskd_system_supervisor *s) {
     int64_t now = 0;
     if (system_runtime_clock(s, &now) != 0) return -1;
-    uint64_t timeout = 2100, boot_now = asteriskd_dns_boottime();
+    uint64_t timeout = 2100, boot_now = asteriskd_dns_monotime();
     if (s->dns_startup_deadline) {
         if (boot_now >= s->dns_startup_deadline) goto expired;
         if (timeout > s->dns_startup_deadline - boot_now)
@@ -6308,7 +6309,7 @@ static int system_dns_wait(struct asteriskd_system_supervisor *s) {
     }
     struct asteriskd_deadline d = {.armed=true, .monotonic_milliseconds=now+(int64_t)timeout};
     int pumped = system_pump_condition(s, &d, system_dns_done);
-    if (s->dns_startup_deadline && asteriskd_dns_boottime() >= s->dns_startup_deadline)
+    if (s->dns_startup_deadline && asteriskd_dns_monotime() >= s->dns_startup_deadline)
         goto expired;
     if (pumped != 0 || s->dns.snapshot.phase == DNS_FAILED ||
         s->dns.snapshot.phase == DNS_UNSUPPORTED) return -1;
@@ -6320,7 +6321,7 @@ expired:
 
 static int system_dns_exchange(struct asteriskd_system_supervisor *s, uint16_t op) {
     if (s->dns.pending && system_dns_wait(s) != 0) return -1;
-    uint64_t now=asteriskd_dns_boottime();
+    uint64_t now=asteriskd_dns_monotime();
     if ((op==3 ? system_dns_activate(s,now) :
         asteriskd_dns_command(&s->dns, op, &s->loaded_config.config,now)) != 0) {
         asteriskd_dns_fail(&s->dns, "cannot encode DNS command or UID policy"); return -1;
@@ -6356,12 +6357,11 @@ static int system_dns_begin_generation(struct asteriskd_system_supervisor *s) {
         s->dns.snapshot.generation = generation;
         s->dns.snapshot.phase = DNS_PREPARING;
         s->dns.suspended = false;
-        result = asteriskd_dns_command(&s->dns, 1, NULL, asteriskd_dns_boottime());
+        result = asteriskd_dns_command(&s->dns, 1, NULL, asteriskd_dns_monotime());
     } else result = asteriskd_dns_begin(&s->dns, s->dns_instance, s->dns_cycle,
-        generation, asteriskd_dns_boottime());
+        generation, asteriskd_dns_monotime());
     s->dns.busy = true;
     s->live.dns_enhancement = &s->dns.snapshot;
-    s->dns_last_boot = 0; s->dns_last_mono = 0;
     return result;
 }
 
@@ -6376,30 +6376,22 @@ static int system_dns_prepare(struct asteriskd_system_supervisor *s) {
     return system_dns_exchange(s, 2);
 }
 
-static bool system_dns_expired(void *opaque) {
-    struct asteriskd_system_supervisor *s = opaque;
-    return asteriskd_dns_boottime() >= s->dns.safe_after;
-}
-
 static int system_dns_withdraw(struct asteriskd_system_supervisor *s) {
     if (!s->dns.snapshot.required || s->dns.snapshot.phase == DNS_DISABLED ||
         s->dns.snapshot.phase == DNS_UNSUPPORTED) return 0;
     s->dns.busy = true;
     if (s->dns.fd >= 0 && !s->dns.suspended && system_dns_exchange(s, 5) == 0) {
-        uint64_t until = asteriskd_dns_boottime() + 5000;
-        while (s->dns.fd >= 0 && asteriskd_dns_boottime() < until) {
+        uint64_t until = asteriskd_dns_monotime() + 5000;
+        while (s->dns.fd >= 0 && asteriskd_dns_monotime() < until) {
             if (system_dns_exchange(s, 6) != 0) break;
             if (s->dns.snapshot.phase == DNS_INACTIVE && s->dns.retained == 0) {
                 s->dns.suspended = true; return 0;
             }
         }
     } else if (s->dns.suspended) return 0;
-    // No late activation can outlive this bound, even if the transport died before ACK.
+    // Closing the owner connection requests withdrawal. A blocked companion
+    // may process it later; teardown does not promise a timed revocation.
     asteriskd_dns_close(&s->dns);
-    int64_t now = 0;
-    if (system_runtime_clock(s, &now) != 0) return -1;
-    struct asteriskd_deadline d = {.armed=true, .monotonic_milliseconds=now+5100};
-    if (system_pump_condition(s, &d, system_dns_expired) != 0) return -1;
     if (s->dns.snapshot.phase != DNS_FAILED) s->dns.snapshot.phase = DNS_INACTIVE;
     return 0;
 }
@@ -6441,7 +6433,7 @@ static int system_runtime_request_dns(void *opaque, const struct asteriskd_contr
     s->dns_hot_completed_generation = 0;
     s->dns_regenerating = false;
     s->dns_hot_request = *request; s->dns_hot_result = 0; s->dns_hot_stage = resume ? 10 : 1;
-    s->dns_hot_deadline = asteriskd_dns_boottime() + 8000;
+    s->dns_hot_deadline = asteriskd_dns_monotime() + 8000;
     s->dns.busy = true;
     return 0;
 }
@@ -6459,7 +6451,7 @@ static int system_dns_activate(struct asteriskd_system_supervisor *s,uint64_t no
     struct asteriskd_runtime_delta delta;asteriskd_runtime_delta_init(&delta);
     if(system_runtime_reap_children(s,&delta) != 0 || delta.flags) return -1;
     // A paused/descheduled reactor must not activate with its old tick time.
-    uint64_t current=asteriskd_dns_boottime();if(current>now)now=current;
+    uint64_t current=asteriskd_dns_monotime();if(current>now)now=current;
     if(!system_dns_consumers_current(s) ||
         s->dns.snapshot.phase!=DNS_PREPARED) return -1;
     return asteriskd_dns_command(&s->dns,3,NULL,now);
@@ -6467,33 +6459,29 @@ static int system_dns_activate(struct asteriskd_system_supervisor *s,uint64_t no
 static int system_dns_verify_startup(struct asteriskd_system_supervisor *s) {
     const uint64_t until = s->dns_startup_deadline;
     do {
-        if (asteriskd_dns_boottime() >= until) break;
+        if (asteriskd_dns_monotime() >= until) break;
         int activated = system_dns_exchange(s, 3);
         if (activated <= 0) return activated;
         asteriskd_log_stderr(ASTERISKD_LOG_LEVEL_INFO, ASTERISKD_COMPONENT_NETWORK,
             "DNS topology changed during startup; draining and preparing a fresh snapshot");
-        while (asteriskd_dns_boottime() < until) {
+        while (asteriskd_dns_monotime() < until) {
             if (system_dns_exchange(s, 6) != 0) return -1;
             if (s->dns.snapshot.phase == DNS_INACTIVE && !s->dns.retained) break;
         }
-        if (asteriskd_dns_boottime() >= until || s->stop_requested ||
+        if (asteriskd_dns_monotime() >= until || s->stop_requested ||
             s->manual_stop_pending || s->shutdown_requested) break;
         s->dns.suspended = true;
         s->dns.topology_changed = false;
         if (system_dns_prepare(s) != 0) return -1;
-    } while (asteriskd_dns_boottime() < until);
+    } while (asteriskd_dns_monotime() < until);
     asteriskd_dns_fail(&s->dns, "DNS startup topology did not stabilize before deadline");
     return -1;
 }
 
 static int system_dns_tick(struct asteriskd_system_supervisor *s, struct asteriskd_runtime_delta *delta) {
     if (!s->dns.snapshot.required) return 0;
-    uint64_t now = asteriskd_dns_boottime(); int64_t mono = 0;
-    if (system_runtime_clock(s, &mono) != 0 || !now) return -1;
-    if (s->dns_last_boot && s->dns.snapshot.phase == DNS_ACTIVE &&
-        now - s->dns_last_boot > (uint64_t)mono - s->dns_last_mono + 250U)
-        asteriskd_dns_fail(&s->dns, "suspend detected; fresh generation required");
-    s->dns_last_boot = now; s->dns_last_mono = (uint64_t)mono;
+    uint64_t now = asteriskd_dns_monotime();
+    if (!now) return -1;
     if (asteriskd_dns_step(&s->dns, now) != 0 && s->dns.snapshot.phase != DNS_FAILED &&
         s->dns.snapshot.phase != DNS_UNSUPPORTED) asteriskd_dns_fail(&s->dns, "DNS transport progress failed");
     if (s->dns.topology_changed && !s->dns_hot_stage && !s->cleanup_in_progress &&
@@ -6676,7 +6664,7 @@ static int system_effect_verify(void *opaque) {
         system->rules_initialized, system->rules_verified) ? 0 : -1;
     system_clear_local_address_snapshot(system);
     if (result == 0 && system->loaded_config.config.dns_enhancement) {
-        system->dns_startup_deadline = asteriskd_dns_boottime() + 8000;
+        system->dns_startup_deadline = asteriskd_dns_monotime() + 8000;
         result = system_dns_verify_startup(system);
         system->dns_startup_deadline = 0;
         system->dns.busy = false;

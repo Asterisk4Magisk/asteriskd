@@ -21,8 +21,8 @@ struct asteriskd_dns_client {
     int fd;
     uint32_t request_id, result, retained;
     uint16_t opcode;
-    uint64_t netd, deadline, renew_at, lease_until, safe_after;
-    bool pending, complete, connected, suspended, busy, topology_changed;
+    uint64_t netd, deadline;
+    bool pending, complete, connected, suspended, busy, topology_changed, network_changed;
     unsigned char *tx;
     size_t tx_size, tx_offset, rx_size;
     unsigned char rx[68+32*ASTERISKD_DNS_MAX_ROUTES];
@@ -37,6 +37,6 @@ int asteriskd_dns_command(struct asteriskd_dns_client *, uint16_t,
 int asteriskd_dns_step(struct asteriskd_dns_client *, uint64_t);
 int asteriskd_dns_accept(struct asteriskd_dns_client *, const unsigned char *, size_t, uint64_t);
 void asteriskd_dns_fail(struct asteriskd_dns_client *, const char *);
-uint64_t asteriskd_dns_boottime(void);
+uint64_t asteriskd_dns_monotime(void);
 int asteriskd_dns_info(void);
 #endif
