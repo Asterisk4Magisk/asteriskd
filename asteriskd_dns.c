@@ -94,7 +94,11 @@ int asteriskd_dns_begin(struct asteriskd_dns_client *c,uint64_t instance,uint64_
     const char name[]="\0asterisk.enhance.dns"; memcpy(address.sun_path,name,sizeof(name)-1);
     if(c->fd<0 || (connect(c->fd,(struct sockaddr *)&address,
         offsetof(struct sockaddr_un,sun_path)+sizeof(name)-1)!=0 && errno!=EINPROGRESS)) {
-        asteriskd_dns_fail(c,"companion unavailable"); return -1;
+        int saved_errno = errno;
+        char reason[128];
+        snprintf(reason, sizeof(reason), "companion unavailable: errno=%d (%s)",
+            saved_errno, strerror(saved_errno));
+        asteriskd_dns_fail(c,reason); return -1;
     }
     return asteriskd_dns_command(c,1,NULL,now);
 #else
@@ -117,7 +121,15 @@ int asteriskd_dns_accept(struct asteriskd_dns_client *c,const unsigned char *p,s
             get(b+20,4)!=ASTERISKD_DNS_MARK_MASK || get(b+24,4)!=ASTERISKD_DNS_PROXY_DECISION ||
             get(b+28,4)!=ASTERISKD_DNS_DIRECT_MARK || get(b+32,4)!=2 ||
             get(b+36,4)!=0 || get(b+40,4)!=0) {
-            asteriskd_dns_fail(c,"incompatible companion capabilities"); return -1;
+            char reason[128];
+            snprintf(reason, sizeof(reason),
+                "incompatible capabilities: netd=%s revision=%u flags=0x%x consumer=%u marks=%s reserved=%s",
+                c->netd ? "present" : "missing", (unsigned)get(b+8,4), flags,
+                (unsigned)get(b+32,4),
+                get(b+20,4)==ASTERISKD_DNS_MARK_MASK && get(b+24,4)==ASTERISKD_DNS_PROXY_DECISION &&
+                    get(b+28,4)==ASTERISKD_DNS_DIRECT_MARK ? "ok" : "mismatch",
+                get(b+36,4)==0 && get(b+40,4)==0 ? "ok" : "nonzero");
+            asteriskd_dns_fail(c,reason); return -1;
         }
         c->result=(uint32_t)get(b+16,4); // Supported mode mask, checked before PREPARE.
         if(c->result==0) {
@@ -152,7 +164,10 @@ int asteriskd_dns_accept(struct asteriskd_dns_client *c,const unsigned char *p,s
             c->snapshot.phase=DNS_DRAINING; c->topology_changed=true;
         }
         else if(c->result!=0 || get(p+6,2)!=7) {
-            char reason[80]; snprintf(reason,sizeof(reason),"companion command %u result %u",c->opcode,c->result);
+            static const char *const results[] = {"OK", "INVALID", "UNSUPPORTED", "STALE",
+                "BUSY", "CACHE_ERROR", "DRAINING", "EXHAUSTED", "IO_ERROR"};
+            char reason[128]; snprintf(reason,sizeof(reason),"companion command %u result %u (%s) phase=%u",
+                c->opcode,c->result,c->result<sizeof(results)/sizeof(results[0])?results[c->result]:"UNKNOWN",phase);
             asteriskd_dns_fail(c,reason); return -1;
         } else if(c->opcode==2 && phase==1) c->snapshot.phase=DNS_PREPARED;
         else if((c->opcode==3 || c->opcode==4) && phase==2) {

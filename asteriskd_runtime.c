@@ -6365,15 +6365,32 @@ static int system_dns_begin_generation(struct asteriskd_system_supervisor *s) {
     return result;
 }
 
+static int system_dns_startup_failed(struct asteriskd_system_supervisor *s, const char *stage) {
+    char message[320U];
+    int written = snprintf(message, sizeof(message),
+        "DNS enhancement startup failed: stage=%s phase=%d op=%u result=%" PRIu32 " reason=%s",
+        stage, (int)s->dns.snapshot.phase, (unsigned)s->dns.opcode, s->dns.result,
+        s->dns.snapshot.reason[0] ? s->dns.snapshot.reason : "runtime wait or command setup failed");
+    if (written > 0 && (size_t)written < sizeof(message)) {
+        (void)asteriskd_log_line(&s->logger, ASTERISKD_LOG_LEVEL_ERROR,
+            ASTERISKD_COMPONENT_NETWORK, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+    }
+    return -1;
+}
+
 static int system_dns_prepare(struct asteriskd_system_supervisor *s) {
     if (!s->loaded_config.config.dns_enhancement) return 0;
-    if (system_dns_begin_generation(s) != 0 || system_dns_wait(s) != 0) return -1;
+    if (system_dns_begin_generation(s) != 0) return system_dns_startup_failed(s, "connect");
+    if (system_dns_wait(s) != 0) return system_dns_startup_failed(s, "capabilities");
     if (!(s->dns.result & system_dns_mode_bit(s))) {
         asteriskd_dns_close(&s->dns); s->dns.snapshot.phase = DNS_UNSUPPORTED;
-        snprintf(s->dns.snapshot.reason, sizeof(s->dns.snapshot.reason), "module does not support selected mode");
-        return -1;
+        snprintf(s->dns.snapshot.reason, sizeof(s->dns.snapshot.reason),
+            "module does not support selected mode: supported=0x%" PRIx32 " required=0x%" PRIx32,
+            s->dns.result, system_dns_mode_bit(s));
+        return system_dns_startup_failed(s, "capabilities");
     }
-    return system_dns_exchange(s, 2);
+    if (system_dns_exchange(s, 2) != 0) return system_dns_startup_failed(s, "prepare");
+    return 0;
 }
 
 static int system_dns_withdraw(struct asteriskd_system_supervisor *s) {
