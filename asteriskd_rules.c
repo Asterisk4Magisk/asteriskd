@@ -372,7 +372,7 @@ int asteriskd_packet_model_decide(
     }
     if (input->protocol != ASTERISKD_PACKET_TCP && input->protocol != ASTERISKD_PACKET_UDP) return 0;
     bool forced_ipv6_dns = config->enable_local_dns && !config->disable_system_ipv6 &&
-        input->ipv6 && input->protocol == ASTERISKD_PACKET_UDP && input->destination_port_53;
+        input->ipv6 && input->destination_port_53;
     if (input->ipv6 && !config->enable_ipv6 && !forced_ipv6_dns) return 0;
 
     enum asteriskd_packet_action normal = ASTERISKD_PACKET_NONE;
@@ -381,7 +381,7 @@ int asteriskd_packet_model_decide(
             normal = ASTERISKD_PACKET_RETURN;
         } else if (input->bypass_uid) {
             normal = ASTERISKD_PACKET_RETURN;
-        } else if (config->enable_local_dns && input->protocol == ASTERISKD_PACKET_UDP &&
+        } else if (config->enable_local_dns &&
             input->destination_port_53 && !input->core_gid) {
             normal = ASTERISKD_PACKET_MARK_PRIMARY;
         } else if (input->local_address) {
@@ -399,7 +399,7 @@ int asteriskd_packet_model_decide(
             normal = selected_packet_action(config, input->direction);
         }
     } else {
-        if (config->enable_local_dns && input->protocol == ASTERISKD_PACKET_UDP &&
+        if (config->enable_local_dns &&
             input->destination_port_53) {
             normal = selected_packet_action(config, input->direction);
         } else if (input->local_address) {

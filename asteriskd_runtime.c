@@ -2924,6 +2924,12 @@ static int system_dns_owner_direct(struct asteriskd_system_supervisor *system,
 
 static int system_append_uid_return(struct asteriskd_system_supervisor *system,
     enum asteriskd_ip_family family, const char *chain, uint32_t uid, bool forced) {
+    if (!forced) {
+        // Forced bypass already returned this UID before DNS and ordinary routing.
+        const struct asteriskd_config *config = &system->loaded_config.config;
+        for (size_t i = 0U; i < config->bypass_uid_count; ++i)
+            if (config->bypass_uids[i] == uid) return 0;
+    }
     char uid_text[16U];
     if (snprintf(uid_text, sizeof(uid_text), "%" PRIu32, uid) <= 0) return -1;
     if (forced && system_dns_owner_direct(system,family,chain,"--uid-owner",uid_text) != 0) return -1;
@@ -3037,17 +3043,12 @@ static int system_append_tproxy(struct asteriskd_system_supervisor *system,
 
 static int system_append_dns_mark_protocol(struct asteriskd_system_supervisor *system,
     enum asteriskd_ip_family family, const char *chain, bool bypass_core_gid,
-    const char *protocol, bool local_prerouting) {
+    const char *protocol) {
     const char *plain[] = {"-p", protocol, "-m", protocol, "--dport", "53",
         "-j", "MARK", "--set-xmark", ASTERISKD_ROUTE_MATCH};
     const char *bypass[] = {"-p", protocol, "-m", "owner", "!", "--gid-owner", "3005",
         "-m", protocol, "--dport", "53", "-j", "MARK", "--set-xmark",
         ASTERISKD_DNS_PROXY_ROUTE_MATCH};
-    const char *local[] = {"-i", "lo", "-p", protocol, "-m", protocol, "--dport", "53",
-        "-m", "mark", "--mark", ASTERISKD_ROUTE_MATCH,
-        "-j", "MARK", "--set-xmark", ASTERISKD_ROUTE_MATCH};
-    if (local_prerouting) return system_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE,
-        "-A", chain, local, sizeof(local) / sizeof(local[0]));
     return system_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE,
         "-A", chain, bypass_core_gid ? bypass : plain,
         bypass_core_gid ? sizeof(bypass) / sizeof(bypass[0]) :
@@ -3056,24 +3057,41 @@ static int system_append_dns_mark_protocol(struct asteriskd_system_supervisor *s
 
 static int system_append_dns_mark(struct asteriskd_system_supervisor *system,
     enum asteriskd_ip_family family, const char *chain, bool bypass_core_gid) {
-    bool prerouting = strstr(chain, "PREROUTING") != NULL;
-    return system_append_dns_mark_protocol(system, family, chain, bypass_core_gid, "udp", false) == 0 &&
-        system_append_dns_mark_protocol(system, family, chain, bypass_core_gid, "tcp", prerouting) == 0 ? 0 : -1;
+    return system_append_dns_mark_protocol(system, family, chain, bypass_core_gid, "udp") == 0 &&
+        system_append_dns_mark_protocol(system, family, chain, bypass_core_gid, "tcp") == 0 ? 0 : -1;
 }
 
 static int system_append_established_tcp6_dns(struct asteriskd_system_supervisor *system,
-    enum asteriskd_ip_family family, const char *chain) {
+    enum asteriskd_ip_family family, const char *chain, const char *input_interface,
+    bool require_mark) {
     if (family != ASTERISKD_IP_FAMILY_IPV6) return 0;
     // The SYN already created a request socket under the original DNS tuple.
     // Let TCP receive later packets directly: old IPv6 kernels leave the
     // request's no_srccheck unset, so TPROXY can drop its completing ACK.
     // Require a tuple socket: older kernels keep requests only on the listener.
-    const char *arguments[] = {"-i", "lo", "-p", "tcp", "-m", "tcp", "--dport", "53",
+    const char *match[] = {"-p", "tcp", "-m", "tcp", "--dport", "53",
         "!", "--tcp-flags", "FIN,SYN,RST,ACK", "SYN",
-        "-m", "mark", "--mark", ASTERISKD_ROUTE_MATCH,
-        "-m", "conntrack", "--ctstate", "ESTABLISHED", "-m", "socket", "-j", "RETURN"};
+        "-m", "conntrack", "--ctstate", "ESTABLISHED", "-m", "socket"};
+    const char *arguments[24];
+    size_t count = 0U;
+    if (input_interface != NULL) {
+        arguments[count++] = "-i"; arguments[count++] = input_interface;
+    }
+    memcpy(arguments + count, match, sizeof(match));
+    count += sizeof(match) / sizeof(match[0]);
+    if (require_mark) {
+        arguments[count++] = "-m"; arguments[count++] = "mark";
+        arguments[count++] = "--mark"; arguments[count++] = ASTERISKD_ROUTE_MATCH;
+    } else {
+        // Forwarded DNS has no OUTPUT mark; retain local routing when skipping TPROXY.
+        const char *mark[] = {"-j", "MARK", "--set-xmark", ASTERISKD_ROUTE_MATCH};
+        memcpy(arguments + count, mark, sizeof(mark));
+        if (system_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE,
+                "-A", chain, arguments, count + 4U) != 0) return -1;
+    }
+    arguments[count++] = "-j"; arguments[count++] = "RETURN";
     return system_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE,
-        "-A", chain, arguments, sizeof(arguments) / sizeof(arguments[0]));
+        "-A", chain, arguments, count);
 }
 
 static int system_append_dns_tproxy(struct asteriskd_system_supervisor *system,
@@ -3087,9 +3105,8 @@ static int system_append_dns_tproxy(struct asteriskd_system_supervisor *system,
         "--tproxy-mark", ASTERISKD_ROUTE_MATCH};
     if (system_xtables_zero(system, family, ASTERISKD_IP_TABLE_MANGLE,
             "-A", chain, arguments, sizeof(arguments) / sizeof(arguments[0])) != 0) return -1;
-    if (system_append_established_tcp6_dns(system, family, chain) != 0) return -1;
-    const char *tcp[] = {"-i", "lo", "-p", "tcp", "-m", "tcp", "--dport", "53",
-        "-m", "mark", "--mark", ASTERISKD_ROUTE_MATCH,
+    if (system_append_established_tcp6_dns(system, family, chain, NULL, false) != 0) return -1;
+    const char *tcp[] = {"-p", "tcp", "-m", "tcp", "--dport", "53",
         "-j", "TPROXY", "--on-port", port, "--on-ip",
         family == ASTERISKD_IP_FAMILY_IPV4 ? "0.0.0.0" : "::",
         "--tproxy-mark", ASTERISKD_ROUTE_MATCH};
@@ -3185,9 +3202,9 @@ static int system_enhanced_dns_output(struct asteriskd_system_supervisor *s,
         // The module already supplied the final proxy or direct mark.
         if (system_dns_output_rule(s, family, chain, protocol,
                 ASTERISKD_DNS_CLASSIFIED_MATCH, NULL, false) != 0) return -1;
-        // AID_DNS_TETHER retains UDP-only DNS forcing, after explicit marks and forced bypasses.
-        if (!p && (system_dns_output_rule(s,family,chain,protocol,NULL,"1052",true)!=0 ||
-            system_dns_output_rule(s,family,chain,protocol,NULL,"1052",false)!=0)) return -1;
+        // AID_DNS_TETHER forces both DNS transports after explicit marks and forced bypasses.
+        if (system_dns_output_rule(s,family,chain,protocol,NULL,"1052",true)!=0 ||
+            system_dns_output_rule(s,family,chain,protocol,NULL,"1052",false)!=0) return -1;
         // Application DNS uses the same early route as resolver DNS, but its
         // socket UID selects proxy/direct independently of destination CIDRs.
         if (config->matcher.enabled) {
@@ -3196,20 +3213,20 @@ static int system_enhanced_dns_output(struct asteriskd_system_supervisor *s,
                 "-m", "bpf", "--object-pinned", path, "-j", "MARK", "--set-xmark",
                 ASTERISKD_DNS_PROXY_ROUTE_MATCH};
             if (path == NULL || system_xtables_zero(s, family, ASTERISKD_IP_TABLE_MANGLE,
-                    "-A", chain, select, sizeof(select) / sizeof(select[0])) != 0 ||
-                system_dns_output_rule(s, family, chain, protocol,
-                    ASTERISKD_DNS_PROXY_ROUTE_MATCH, NULL, false) != 0) return -1;
+                    "-A", chain, select, sizeof(select) / sizeof(select[0])) != 0) return -1;
             const char *direct[] = {"-p", protocol, "-m", protocol, "--dport", "53",
+                "-m", "mark", "!", "--mark", ASTERISKD_DNS_PROXY_ROUTE_MATCH,
                 "-j", "MARK", "--set-xmark", ASTERISKD_DNS_DIRECT_MATCH};
             if (system_xtables_zero(s, family, ASTERISKD_IP_TABLE_MANGLE, "-A", chain,
                     direct, sizeof(direct) / sizeof(direct[0])) != 0) return -1;
+            // Direct DNS must not be selected again by ordinary forced-CIDR rules.
+            if (system_dns_output_rule(s, family, chain, protocol, NULL, NULL, false) != 0) return -1;
         } else {
-            const char *jump[] = {"-p", protocol, "-m", protocol, "--dport", "53", "-j", uid_chain};
+            // Goto returns to OUTPUT after UID classification, skipping application routing.
+            const char *jump[] = {"-p", protocol, "-m", protocol, "--dport", "53", "-g", uid_chain};
             if (system_xtables_zero(s, family, ASTERISKD_IP_TABLE_MANGLE, "-A", chain,
                     jump, sizeof(jump) / sizeof(jump[0])) != 0) return -1;
         }
-        // Direct DNS must not be selected again by ordinary forced-CIDR rules.
-        if (system_dns_output_rule(s, family, chain, protocol, NULL, NULL, false) != 0) return -1;
     }
     return 0;
 }
@@ -3217,11 +3234,11 @@ static int system_enhanced_dns_output(struct asteriskd_system_supervisor *s,
 static int system_populate_dns_uid_chain(struct asteriskd_system_supervisor *s,
     enum asteriskd_ip_family family, const char *chain) {
     const struct asteriskd_config *config = &s->loaded_config.config;
-    const char *direct[] = {"-j", "MARK", "--set-xmark", ASTERISKD_DNS_DIRECT_MATCH};
-    if (system_xtables_zero(s, family, ASTERISKD_IP_TABLE_MANGLE, "-A", chain,
-            direct, sizeof(direct) / sizeof(direct[0])) != 0) return -1;
     bool whitelist = config->app_policy_mode == ASTERISKD_APP_POLICY_WHITELIST;
     if (config->app_policy_mode != ASTERISKD_APP_POLICY_GLOBAL) {
+        const char *direct[] = {"-j", "MARK", "--set-xmark", ASTERISKD_DNS_DIRECT_MATCH};
+        if (system_xtables_zero(s, family, ASTERISKD_IP_TABLE_MANGLE, "-A", chain,
+                direct, sizeof(direct) / sizeof(direct[0])) != 0) return -1;
         size_t count = config->uid_count + (whitelist ? 2U : 0U);
         for (size_t i = 0; i < count; ++i) {
             uint32_t uid = i < config->uid_count ? config->uids[i] : i == config->uid_count ? 0U : 1052U;
@@ -3246,7 +3263,7 @@ static int system_enhanced_dns_prerouting(struct asteriskd_system_supervisor *s,
     for(unsigned p=0;p<2;++p) {
         const char *protocol=p?"tcp":"udp";
         if(system_dns_output_rule(s,family,chain,protocol,ASTERISKD_DNS_DIRECT_MATCH,NULL,false)!=0) return -1;
-        if (tproxy && p && system_append_established_tcp6_dns(s, family, chain) != 0) return -1;
+        if (tproxy && p && system_append_established_tcp6_dns(s, family, chain, "lo", true) != 0) return -1;
         const char *args[]={"-i","lo","-p",protocol,"-m",protocol,"--dport","53","-m","mark","--mark",
             ASTERISKD_ROUTE_MATCH,"-j","TPROXY","--on-port",port,"--on-ip",
             family==ASTERISKD_IP_FAMILY_IPV4?"0.0.0.0":"::","--tproxy-mark",ASTERISKD_ROUTE_MATCH};
@@ -3254,15 +3271,20 @@ static int system_enhanced_dns_prerouting(struct asteriskd_system_supervisor *s,
         const char *local[]={"-i","lo","-p",protocol,"-m",protocol,"--dport","53","-j","RETURN"};
         if(system_xtables_zero(s,family,ASTERISKD_IP_TABLE_MANGLE,"-A",chain,local,sizeof(local)/sizeof(local[0]))!=0) return -1;
     }
-    // Preserve the existing hotspot UDP-only scope; local unmarked queries already returned.
+    // Hotspot DNS uses both transports; local unmarked queries already returned.
     for(size_t i=0;i<c->hotspot_interface_prefix_count;++i) {
-        const char *args[20]={"-i",c->hotspot_interface_prefixes[i],"-p","udp","-m","udp","--dport","53","-j"};
+      for(unsigned p=0;p<2;++p) {
+        const char *protocol=p?"tcp":"udp";
+        if (tproxy && p && system_append_established_tcp6_dns(s, family, chain,
+                c->hotspot_interface_prefixes[i], false) != 0) return -1;
+        const char *args[20]={"-i",c->hotspot_interface_prefixes[i],"-p",protocol,"-m",protocol,"--dport","53","-j"};
         size_t n=9;
         if(tproxy) { args[n++]="TPROXY"; args[n++]="--on-port"; args[n++]=port;
             args[n++]="--on-ip"; args[n++]=family==ASTERISKD_IP_FAMILY_IPV4?"0.0.0.0":"::";
             args[n++]="--tproxy-mark"; args[n++]=ASTERISKD_ROUTE_MATCH;
         } else { args[n++]="MARK"; args[n++]="--set-xmark"; args[n++]=ASTERISKD_ROUTE_MATCH; }
         if(system_xtables_zero(s,family,ASTERISKD_IP_TABLE_MANGLE,"-A",chain,args,n)!=0) return -1;
+      }
     }
     return 0;
 }
