@@ -1167,6 +1167,7 @@ enum asteriskd_pin_id {
     ASTERISKD_PIN_MATCHER_OUTPUT_V6,
     ASTERISKD_PIN_MATCHER_PREROUTING_V4,
     ASTERISKD_PIN_MATCHER_PREROUTING_V6,
+    ASTERISKD_PIN_MATCHER_DNS_UID,
     ASTERISKD_PIN_BPF2SOCKS_LOCAL_ADDRESS_V4,
     ASTERISKD_PIN_BPF2SOCKS_LOCAL_ADDRESS_V6,
     ASTERISKD_PIN_BPF2SOCKS_TC_INGRESS,
@@ -1262,7 +1263,7 @@ struct asteriskd_matcher_pin_expectation {
 };
 
 struct asteriskd_matcher_pin_plan {
-    struct asteriskd_matcher_pin_expectation pins[4U];
+    struct asteriskd_matcher_pin_expectation pins[5U];
     size_t pin_count;
 };
 
@@ -2477,7 +2478,7 @@ struct asteriskd_matcher_verified_pin {
 };
 
 struct asteriskd_matcher_verification {
-    struct asteriskd_matcher_verified_pin pins[4U];
+    struct asteriskd_matcher_verified_pin pins[5U];
     size_t pin_count;
 };
 

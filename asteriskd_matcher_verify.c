@@ -204,6 +204,7 @@ done:
 static int pin_shape(
     enum asteriskd_pin_id pin_id, bool *output, enum matcher_map_role *direct_role) {
     switch (pin_id) {
+        case ASTERISKD_PIN_MATCHER_DNS_UID:
         case ASTERISKD_PIN_MATCHER_OUTPUT_V4:
             *output = true;
             *direct_role = MATCHER_MAP_DIRECT_V4;
@@ -235,7 +236,7 @@ static int verify_pins(
     if (error != NULL && error_capacity != 0U) error[0] = '\0';
     if (config == NULL || plan == NULL || verification == NULL || !config->matcher.enabled ||
         (allow_absent && (ownership == NULL || ownership->probe == NULL)) ||
-        !backend_valid(backend) || plan->pin_count != (config->enable_ipv6 ? 4U : 2U)) {
+        !backend_valid(backend) || plan->pin_count != (config->enable_ipv6 ? 4U : 2U) + (config->dns_enhancement ? 1U : 0U)) {
         verify_error(error, error_capacity, "invalid matcher verification input");
         return ASTERISKD_CONFIG_INVALID;
     }
@@ -268,7 +269,8 @@ static int verify_pins(
             info.map_count > ASTERISKD_BPF_PROGRAM_MAX_MAPS ||
             (allow_absent && info.object_id != expected_object_id)) goto program_done;
         bool needs_uid = output && config->app_policy_mode != ASTERISKD_APP_POLICY_GLOBAL;
-        bool needs_direct = config->direct_cidrs != NULL;
+        bool needs_direct = config->direct_cidrs != NULL &&
+            plan->pins[index].pin_id != ASTERISKD_PIN_MATCHER_DNS_UID;
         size_t expected_maps = (needs_uid ? 1U : 0U) + (needs_direct ? 1U : 0U);
         if (info.map_count != expected_maps) goto program_done;
         size_t map_index = 0U;

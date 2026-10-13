@@ -123,7 +123,9 @@ int asteriskd_tproxy_rule_transaction_plan_build(
         ASTERISKD_IP_FAMILY_IPV4, ASTERISKD_IP_TABLE_MANGLE, ASTERISKD_CHAIN_LOCAL_BYPASS);
     struct asteriskd_private_chain_group *main4 = add_private_group(plan,
         ASTERISKD_IP_FAMILY_IPV4, ASTERISKD_IP_TABLE_MANGLE, ASTERISKD_CHAIN_TPROXY);
-    if (add_private_name(main4, "ASTERISK_TPROXY_PREROUTING") != 0 ||
+    if ((config->dns_enhancement && !config->matcher.enabled &&
+            add_private_name(main4, "ASTERISK_DNS_UID4") != 0) ||
+        add_private_name(main4, "ASTERISK_TPROXY_PREROUTING") != 0 ||
         add_private_name(main4, "ASTERISK_TPROXY_OUTPUT") != 0 ||
         add_private_name(local4, "ASTERISK_LOCAL4_BEGIN") != 0 ||
         add_private_name(local4, "ASTERISK_LOCAL4_END") != 0 ||
@@ -144,7 +146,9 @@ int asteriskd_tproxy_rule_transaction_plan_build(
         ASTERISKD_IP_FAMILY_IPV6, ASTERISKD_IP_TABLE_MANGLE, ASTERISKD_CHAIN_LOCAL_BYPASS);
     struct asteriskd_private_chain_group *main6 = add_private_group(plan,
         ASTERISKD_IP_FAMILY_IPV6, ASTERISKD_IP_TABLE_MANGLE, ASTERISKD_CHAIN_TPROXY);
-    if (add_private_name(main6, "ASTERISK_TPROXY6_PREROUTING") != 0 ||
+    if ((config->dns_enhancement && !config->matcher.enabled &&
+            add_private_name(main6, "ASTERISK_DNS_UID6") != 0) ||
+        add_private_name(main6, "ASTERISK_TPROXY6_PREROUTING") != 0 ||
         add_private_name(main6, "ASTERISK_TPROXY6_OUTPUT") != 0 ||
         add_private_name(local6, "ASTERISK_LOCAL6_BEGIN") != 0 ||
         add_private_name(local6, "ASTERISK_LOCAL6_END") != 0) return ASTERISKD_CONFIG_INVALID;

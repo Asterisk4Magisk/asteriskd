@@ -3177,6 +3177,9 @@ static int system_dns_output_rule(struct asteriskd_system_supervisor *s,
 
 static int system_enhanced_dns_output(struct asteriskd_system_supervisor *s,
     enum asteriskd_ip_family family, const char *chain) {
+    const struct asteriskd_config *config = &s->loaded_config.config;
+    const char *uid_chain = family == ASTERISKD_IP_FAMILY_IPV4
+        ? "ASTERISK_DNS_UID4" : "ASTERISK_DNS_UID6";
     for(unsigned p=0;p<2;++p) {
         const char *protocol=p?"tcp":"udp";
         // The module already supplied the final proxy or direct mark.
@@ -3185,9 +3188,55 @@ static int system_enhanced_dns_output(struct asteriskd_system_supervisor *s,
         // AID_DNS_TETHER retains UDP-only DNS forcing, after explicit marks and forced bypasses.
         if (!p && (system_dns_output_rule(s,family,chain,protocol,NULL,"1052",true)!=0 ||
             system_dns_output_rule(s,family,chain,protocol,NULL,"1052",false)!=0)) return -1;
-        // All unmarked DNS falls through to the existing UID/CIDR policy.
+        // Application DNS uses the same early route as resolver DNS, but its
+        // socket UID selects proxy/direct independently of destination CIDRs.
+        if (config->matcher.enabled) {
+            const char *path = system_pin_path(s, ASTERISKD_PIN_MATCHER_DNS_UID);
+            const char *select[] = {"-p", protocol, "-m", protocol, "--dport", "53",
+                "-m", "bpf", "--object-pinned", path, "-j", "MARK", "--set-xmark",
+                ASTERISKD_DNS_PROXY_ROUTE_MATCH};
+            if (path == NULL || system_xtables_zero(s, family, ASTERISKD_IP_TABLE_MANGLE,
+                    "-A", chain, select, sizeof(select) / sizeof(select[0])) != 0 ||
+                system_dns_output_rule(s, family, chain, protocol,
+                    ASTERISKD_DNS_PROXY_ROUTE_MATCH, NULL, false) != 0) return -1;
+            const char *direct[] = {"-p", protocol, "-m", protocol, "--dport", "53",
+                "-j", "MARK", "--set-xmark", ASTERISKD_DNS_DIRECT_MATCH};
+            if (system_xtables_zero(s, family, ASTERISKD_IP_TABLE_MANGLE, "-A", chain,
+                    direct, sizeof(direct) / sizeof(direct[0])) != 0) return -1;
+        } else {
+            const char *jump[] = {"-p", protocol, "-m", protocol, "--dport", "53", "-j", uid_chain};
+            if (system_xtables_zero(s, family, ASTERISKD_IP_TABLE_MANGLE, "-A", chain,
+                    jump, sizeof(jump) / sizeof(jump[0])) != 0) return -1;
+        }
+        // Direct DNS must not be selected again by ordinary forced-CIDR rules.
+        if (system_dns_output_rule(s, family, chain, protocol, NULL, NULL, false) != 0) return -1;
     }
     return 0;
+}
+
+static int system_populate_dns_uid_chain(struct asteriskd_system_supervisor *s,
+    enum asteriskd_ip_family family, const char *chain) {
+    const struct asteriskd_config *config = &s->loaded_config.config;
+    const char *direct[] = {"-j", "MARK", "--set-xmark", ASTERISKD_DNS_DIRECT_MATCH};
+    if (system_xtables_zero(s, family, ASTERISKD_IP_TABLE_MANGLE, "-A", chain,
+            direct, sizeof(direct) / sizeof(direct[0])) != 0) return -1;
+    bool whitelist = config->app_policy_mode == ASTERISKD_APP_POLICY_WHITELIST;
+    if (config->app_policy_mode != ASTERISKD_APP_POLICY_GLOBAL) {
+        size_t count = config->uid_count + (whitelist ? 2U : 0U);
+        for (size_t i = 0; i < count; ++i) {
+            uint32_t uid = i < config->uid_count ? config->uids[i] : i == config->uid_count ? 0U : 1052U;
+            char text[16];
+            if (snprintf(text, sizeof(text), "%" PRIu32, uid) <= 0) return -1;
+            const char *args[] = {"-m", "owner", "--uid-owner", text, "-j",
+                whitelist ? "MARK" : "RETURN", "--set-xmark", ASTERISKD_DNS_PROXY_ROUTE_MATCH};
+            if (system_xtables_zero(s, family, ASTERISKD_IP_TABLE_MANGLE, "-A", chain,
+                    args, whitelist ? 8U : 6U) != 0) return -1;
+        }
+    }
+    if (whitelist) return 0;
+    const char *proxy[] = {"-j", "MARK", "--set-xmark", ASTERISKD_DNS_PROXY_ROUTE_MATCH};
+    return system_xtables_zero(s, family, ASTERISKD_IP_TABLE_MANGLE, "-A", chain,
+        proxy, sizeof(proxy) / sizeof(proxy[0]));
 }
 
 static int system_enhanced_dns_prerouting(struct asteriskd_system_supervisor *s,
@@ -3401,6 +3450,8 @@ static int system_populate_private_chain(
     struct asteriskd_system_supervisor *system,
     const struct asteriskd_private_chain_group *group, const char *chain) {
     enum asteriskd_ip_family family = group->family;
+    if (strcmp(chain, "ASTERISK_DNS_UID4") == 0 || strcmp(chain, "ASTERISK_DNS_UID6") == 0)
+        return system_populate_dns_uid_chain(system, family, chain);
     const char *local_begin = family == ASTERISKD_IP_FAMILY_IPV4
         ? "ASTERISK_LOCAL4_BEGIN" : "ASTERISK_LOCAL6_BEGIN";
     const char *local_end = family == ASTERISKD_IP_FAMILY_IPV4
@@ -5103,10 +5154,10 @@ static int system_effect_start_matcher(void *opaque) {
             asteriskd_system_anonymous_file_backend(), &system->matcher_launch,
             error, sizeof(error)) != 0) return -1;
     system->matcher_launch_ready = true;
-    struct asteriskd_resource_operation records[4U];
+    struct asteriskd_resource_operation records[5U];
     size_t count = 0U;
     if (asteriskd_matcher_pin_records_build(
-            &system->matcher_pin_plan, records, 4U, &count) != 0) return -1;
+            &system->matcher_pin_plan, records, 5U, &count) != 0) return -1;
     system->active_pin_batch = system->loaded_config.config.enable_ipv6
         ? ASTERISKD_PIN_BATCH_MATCHER_DUAL_STACK
         : ASTERISKD_PIN_BATCH_MATCHER_IPV4;
@@ -6000,6 +6051,7 @@ static int system_reconcile_owned_bpf_catalog(const char *path, bool remove) {
     memset(&config, 0, sizeof(config));
     config.enable_ipv6 = true;
     config.matcher.enabled = true;
+    config.dns_enhancement = true;
     config.mode = ASTERISKD_MODE_BPF2SOCKS;
     config.helper.type = ASTERISKD_HELPER_BPF2SOCKS;
     if (asteriskd_matcher_pin_plan_build(&config, &matcher) != 0 ||

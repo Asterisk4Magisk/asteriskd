@@ -193,12 +193,13 @@ int asteriskd_matcher_render_documents(
             "\"xtOutputV4ProgramPath\":\"%s/xt_output_v4\","
             "\"xtOutputV6ProgramPath\":\"%s/xt_output_v6\","
             "\"xtPreroutingV4ProgramPath\":\"%s/xt_prerouting_v4\","
-            "\"xtPreroutingV6ProgramPath\":\"%s/xt_prerouting_v6\"}\n",
+            "\"xtPreroutingV6ProgramPath\":\"%s/xt_prerouting_v6\",\"xtDnsUidProgramPath\":\"%s\"}\n",
             config->direct_cidrs != NULL ? "true" : "false",
             config->enable_ipv6 ? "true" : "false",
             config->direct_cidrs != NULL ? "/proc/self/fd/4" : "",
             config->direct_cidrs != NULL ? "/proc/self/fd/5" : "",
-            root, root, root, root);
+            root, root, root, root, config->dns_enhancement
+                ? asteriskd_owned_pin_path(ASTERISKD_PIN_MATCHER_DNS_UID) : "");
         result = writer_take(&writer, &documents->policy);
     }
     if (result == 0 && config->direct_cidrs != NULL) {
@@ -332,12 +333,13 @@ int asteriskd_matcher_pin_plan_build(
     static const enum asteriskd_pin_id ids[] = {
         ASTERISKD_PIN_MATCHER_OUTPUT_V4, ASTERISKD_PIN_MATCHER_OUTPUT_V6,
         ASTERISKD_PIN_MATCHER_PREROUTING_V4, ASTERISKD_PIN_MATCHER_PREROUTING_V6,
+        ASTERISKD_PIN_MATCHER_DNS_UID,
     };
     static const char *const names[] = {
-        "ast_xt_out4", "ast_xt_out6", "ast_xt_pre4", "ast_xt_pre6",
+        "ast_xt_out4", "ast_xt_out6", "ast_xt_pre4", "ast_xt_pre6", "ast_xt_dns_uid",
     };
-    static const size_t ipv4_indices[] = {0U, 2U};
-    size_t count = config->enable_ipv6 ? 4U : 2U;
+    static const size_t ipv4_indices[] = {0U, 2U, 4U};
+    size_t count = (config->enable_ipv6 ? 4U : 2U) + (config->dns_enhancement ? 1U : 0U);
     for (size_t index = 0U; index < count; ++index) {
         size_t source = config->enable_ipv6 ? index : ipv4_indices[index];
         struct asteriskd_matcher_pin_expectation *pin = &plan->pins[index];
@@ -358,7 +360,7 @@ int asteriskd_matcher_pin_records_build(
     size_t capacity, size_t *count) {
     if (count != NULL) *count = 0U;
     if (plan == NULL || records == NULL || count == NULL ||
-        (plan->pin_count != 2U && plan->pin_count != 4U) || capacity < plan->pin_count) {
+        (plan->pin_count < 2U || plan->pin_count > 5U) || capacity < plan->pin_count) {
         return ASTERISKD_CONFIG_INVALID;
     }
     memset(records, 0, capacity * sizeof(*records));

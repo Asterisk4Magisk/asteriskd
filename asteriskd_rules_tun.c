@@ -81,13 +81,16 @@ static int add_family(
     const char *local_begin,
     const char *local_end,
     const char *tunnel,
-    bool dns_only) {
+    bool dns_only, bool dns_uid) {
     struct asteriskd_private_chain_group *local = add_group(plan, family,
         ASTERISKD_IP_TABLE_MANGLE, ASTERISKD_CHAIN_LOCAL_BYPASS);
     struct asteriskd_private_chain_group *mangle = add_group(plan, family,
         ASTERISKD_IP_TABLE_MANGLE, ASTERISKD_CHAIN_ROUTING);
     struct asteriskd_private_chain_group *filter = add_group(plan, family,
         ASTERISKD_IP_TABLE_FILTER, ASTERISKD_CHAIN_ROUTING);
+    // Dependencies first: group cleanup removes names in reverse order.
+    if (dns_uid && add_name(mangle, family == ASTERISKD_IP_FAMILY_IPV4
+            ? "ASTERISK_DNS_UID4" : "ASTERISK_DNS_UID6") != 0) return ASTERISKD_CONFIG_INVALID;
     if (add_name(mangle, prerouting) != 0 || add_name(mangle, output) != 0 ||
         add_name(filter, forward) != 0 || add_name(local, local_begin) != 0 ||
         add_name(local, local_end) != 0) return ASTERISKD_CONFIG_INVALID;
@@ -139,14 +142,16 @@ int asteriskd_tun_rule_transaction_plan_build(
     const char *tunnel = config->helper.value.hev.tunnel_name;
     if (add_family(plan, ASTERISKD_IP_FAMILY_IPV4,
             "ASTERISK_TUN_PREROUTING", "ASTERISK_TUN_OUTPUT", "ASTERISK_TUN_FORWARD",
-            "ASTERISK_LOCAL4_BEGIN", "ASTERISK_LOCAL4_END", tunnel, false) != 0) {
+            "ASTERISK_LOCAL4_BEGIN", "ASTERISK_LOCAL4_END", tunnel, false,
+            config->dns_enhancement && !config->matcher.enabled) != 0) {
         return ASTERISKD_CONFIG_INVALID;
     }
     bool dns_only = !config->enable_ipv6;
     if ((!dns_only || (config->enable_local_dns && !config->disable_system_ipv6)) &&
         add_family(plan, ASTERISKD_IP_FAMILY_IPV6,
             "ASTERISK_TUN6_PREROUTING", "ASTERISK_TUN6_OUTPUT", "ASTERISK_TUN6_FORWARD",
-            "ASTERISK_LOCAL6_BEGIN", "ASTERISK_LOCAL6_END", tunnel, dns_only) != 0) {
+            "ASTERISK_LOCAL6_BEGIN", "ASTERISK_LOCAL6_END", tunnel, dns_only,
+            config->dns_enhancement && !config->matcher.enabled) != 0) {
         return ASTERISKD_CONFIG_INVALID;
     }
     return 0;

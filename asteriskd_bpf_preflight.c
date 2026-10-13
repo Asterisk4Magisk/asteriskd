@@ -53,10 +53,10 @@ int asteriskd_matcher_pin_preflight(
     const struct asteriskd_bpf_pin_ownership_backend *backend,
     char *error,
     size_t error_size) {
-    if (plan == NULL || (plan->pin_count != 2U && plan->pin_count != 4U)) {
+    if (plan == NULL || (plan->pin_count < 2U || plan->pin_count > 5U)) {
         return ASTERISKD_CONFIG_INVALID;
     }
-    const char *paths[4U];
+    const char *paths[5U];
     for (size_t index = 0U; index < plan->pin_count; ++index) paths[index] = plan->pins[index].path;
     return preflight_paths(paths, plan->pin_count, backend, error, error_size);
 }

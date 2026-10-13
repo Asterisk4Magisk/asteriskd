@@ -12,6 +12,8 @@ static const char *const owned_pin_paths[ASTERISKD_PIN_COUNT] = {
         "/sys/fs/bpf/asterisk/xt_prerouting_v4",
     [ASTERISKD_PIN_MATCHER_PREROUTING_V6] =
         "/sys/fs/bpf/asterisk/xt_prerouting_v6",
+    [ASTERISKD_PIN_MATCHER_DNS_UID] =
+        "/sys/fs/bpf/asterisk/xt_dns_uid",
     [ASTERISKD_PIN_BPF2SOCKS_LOCAL_ADDRESS_V4] =
         "/sys/fs/bpf/asterisk/bpf2socks/local_addr_v4",
     [ASTERISKD_PIN_BPF2SOCKS_LOCAL_ADDRESS_V6] =
@@ -30,6 +32,8 @@ static const struct asteriskd_owned_chain owned_chains[] = {
     {ASTERISKD_IP_FAMILY_IPV4, ASTERISKD_IP_TABLE_MANGLE,
         "ASTERISK_LOCAL4_BEGIN"},
     {ASTERISKD_IP_FAMILY_IPV4, ASTERISKD_IP_TABLE_MANGLE,
+        "ASTERISK_DNS_UID4"},
+    {ASTERISKD_IP_FAMILY_IPV4, ASTERISKD_IP_TABLE_MANGLE,
         "ASTERISK_LOCAL4_END"},
     {ASTERISKD_IP_FAMILY_IPV4, ASTERISKD_IP_TABLE_MANGLE,
         "ASTERISK_TUN_PREROUTING"},
@@ -47,6 +51,8 @@ static const struct asteriskd_owned_chain owned_chains[] = {
         "ASTERISK_TPROXY6_OUTPUT"},
     {ASTERISKD_IP_FAMILY_IPV6, ASTERISKD_IP_TABLE_MANGLE,
         "ASTERISK_LOCAL6_BEGIN"},
+    {ASTERISKD_IP_FAMILY_IPV6, ASTERISKD_IP_TABLE_MANGLE,
+        "ASTERISK_DNS_UID6"},
     {ASTERISKD_IP_FAMILY_IPV6, ASTERISKD_IP_TABLE_MANGLE,
         "ASTERISK_LOCAL6_END"},
     {ASTERISKD_IP_FAMILY_IPV6, ASTERISKD_IP_TABLE_MANGLE,
