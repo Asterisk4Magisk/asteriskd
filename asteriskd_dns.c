@@ -73,7 +73,8 @@ int asteriskd_dns_command(struct asteriskd_dns_client *c,uint16_t op,
         size_t d=uid_array(b+48+4*a,config->bypass_uids,config->bypass_uid_count);
         if(d==SIZE_MAX) return -1;
         put(b+28,a,4); put(b+32,d,4); put(b+36,0,4); put(b+40,c->netd,8);
-        body=48+4*(a+d); c->snapshot.phase=DNS_PREPARING; c->route_count=0;
+        body=48+4*(a+d); c->snapshot.phase=DNS_PREPARING; c->route_count=0; c->prepare_retry=false;
+        c->snapshot.reason[0]=0;
     }
     put(c->tx,0x314e4541,4); put(c->tx+4,1,2); put(c->tx+6,op,2);
     put(c->tx+8,body,4); put(c->tx+12,++c->request_id,4);
@@ -114,7 +115,7 @@ int asteriskd_dns_accept(struct asteriskd_dns_client *c,const unsigned char *p,s
         if(n!=88 || get(p+6,2)!=9) goto invalid;
         const unsigned char *b=p+40; uint32_t flags=(uint32_t)get(b+44,4);
         c->netd=get(b,8);
-        if(!c->netd || get(b+8,4)!=5 || (flags&6)!=6 ||
+        if(!c->netd || get(b+8,4)!=7 || (flags&6)!=6 ||
 #if !defined(ASTERISKD_DNS_TEST_PROBE) || ASTERISKD_DNS_TEST_PROBE != 1
             (flags&1) ||
 #endif
@@ -143,7 +144,7 @@ int asteriskd_dns_accept(struct asteriskd_dns_client *c,const unsigned char *p,s
         if(c->opcode==2 && c->result==0 && phase==1 && get(p+6,2)==7) {
             if(n<68) goto invalid;
             size_t count=(size_t)get(p+64,4);
-            if(!count || count>ASTERISKD_DNS_MAX_ROUTES || n!=68+32*count) goto invalid;
+            if(count>ASTERISKD_DNS_MAX_ROUTES || n!=68+32*count || (!count && c->retained)) goto invalid;
             for(size_t i=0;i<count;i++) {
                 const unsigned char *b=p+68+32*i; struct asteriskd_dns_route *r=&c->routes[i];
                 r->netid=(uint32_t)get(b,4);r->mark=(uint32_t)get(b+4,4);
@@ -156,7 +157,25 @@ int asteriskd_dns_accept(struct asteriskd_dns_client *c,const unsigned char *p,s
                 for(size_t j=0;j<i;j++)if(!memcmp(r,&c->routes[j],sizeof(*r)))goto invalid;
             }
             c->route_count=count;
-        } else if(n!=64) goto invalid;
+        } else if(n==80 && c->opcode==2 && c->result==5 && get(p+6,2)==8) {
+            uint32_t stage=(uint32_t)get(p+64,4), detail=(uint32_t)get(p+68,4);
+            int32_t error=(int32_t)(uint32_t)get(p+72,4);
+            uint32_t network=(uint32_t)get(p+76,4);
+            static const char *const stages[]={"unknown","discover","read","reserve","configure","check","routes","release"};
+            static const char *const reasons[]={"unknown","not-ready","changed","private-dns","nat64","invalid-config","backend","capacity"};
+            if(stage>=8 || detail>=8 || (phase!=0 && phase!=3) || c->retained>64) goto invalid;
+            snprintf(c->snapshot.reason,sizeof(c->snapshot.reason),
+                "CACHE_ERROR stage=%s reason=%s error=%d network=%u phase=%u retained=%u",
+                stages[stage],reasons[detail],error,network,phase,c->retained);
+            // Only known transient failures on real networks, with complete cleanup.
+            // Old/unknown errors and isolated-cache read failures remain terminal.
+            c->prepare_retry=phase==0 && c->retained==0 && network<=0xffffU &&
+                ((detail==1 && (stage==1 || stage==2) && (error==0 || error==-ENOENT)) ||
+                 (detail==2 && stage==5 && error==-EAGAIN));
+            c->pending=false; c->complete=true;
+            if(c->prepare_retry) { c->snapshot.phase=DNS_INACTIVE; return 0; }
+            asteriskd_dns_close(c); c->snapshot.phase=DNS_FAILED; return -1;
+        } else if(n!=64 || (c->opcode==2 && c->result==5)) goto invalid;
         if(c->result==6 && c->opcode==6 && phase==3) c->snapshot.phase=DNS_DRAINING;
         else if(c->result==5 && (c->opcode==3 || c->opcode==4) && phase==3 && get(p+6,2)==8) {
             // The module has already withdrawn the old policy. Keep the
@@ -171,7 +190,9 @@ int asteriskd_dns_accept(struct asteriskd_dns_client *c,const unsigned char *p,s
             asteriskd_dns_fail(c,reason); return -1;
         } else if(c->opcode==2 && phase==1) c->snapshot.phase=DNS_PREPARED;
         else if((c->opcode==3 || c->opcode==4) && phase==2) {
-            c->snapshot.phase=DNS_ACTIVE;
+            c->snapshot.phase=c->route_count ? DNS_ACTIVE : DNS_WAITING_NETWORK;
+            snprintf(c->snapshot.reason,sizeof(c->snapshot.reason),"%s",
+                c->route_count ? "" : "waiting for network");
         } else if(c->opcode==5 && (phase==0 || phase==3)) c->snapshot.phase=DNS_INACTIVE;
         else if(c->opcode==6 && phase==0 && c->retained==0) c->snapshot.phase=DNS_INACTIVE;
         else goto invalid;
@@ -193,7 +214,7 @@ int asteriskd_dns_step(struct asteriskd_dns_client *c,uint64_t now) {
         }
         c->connected=true;
     }
-    if(!c->pending && c->snapshot.phase==DNS_ACTIVE && c->network_changed && !c->busy && !c->rx_size) {
+    if(!c->pending && asteriskd_dns_serving(c->snapshot.phase) && c->network_changed && !c->busy && !c->rx_size) {
         c->network_changed=false;
         if(asteriskd_dns_command(c,4,NULL,now)!=0) return -1;
     }

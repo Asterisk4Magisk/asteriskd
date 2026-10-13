@@ -7,7 +7,10 @@
 #include <stdint.h>
 struct asteriskd_config;
 enum asteriskd_dns_phase { DNS_DISABLED, DNS_PREPARING, DNS_PREPARED, DNS_ACTIVE,
-    DNS_INACTIVE, DNS_DRAINING, DNS_UNSUPPORTED, DNS_FAILED };
+    DNS_INACTIVE, DNS_DRAINING, DNS_UNSUPPORTED, DNS_FAILED, DNS_WAITING_NETWORK };
+static inline bool asteriskd_dns_serving(enum asteriskd_dns_phase phase) {
+    return phase == DNS_ACTIVE || phase == DNS_WAITING_NETWORK;
+}
 struct asteriskd_dns_snapshot {
     bool required;
     enum asteriskd_dns_phase phase;
@@ -23,6 +26,7 @@ struct asteriskd_dns_client {
     uint16_t opcode;
     uint64_t netd, deadline;
     bool pending, complete, connected, suspended, busy, topology_changed, network_changed;
+    bool prepare_retry;
     unsigned char *tx;
     size_t tx_size, tx_offset, rx_size;
     unsigned char rx[68+32*ASTERISKD_DNS_MAX_ROUTES];

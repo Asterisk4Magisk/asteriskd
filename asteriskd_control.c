@@ -566,7 +566,7 @@ static bool control_error_valid(const struct asteriskd_control_error *error) {
 }
 
 bool asteriskd_control_snapshot_valid(const struct asteriskd_control_snapshot *snapshot) {
-    if (snapshot == NULL || snapshot->dns_enhancement.phase > DNS_FAILED ||
+    if (snapshot == NULL || snapshot->dns_enhancement.phase > DNS_WAITING_NETWORK ||
         snapshot->dns_enhancement.phase < DNS_DISABLED ||
         memchr(snapshot->dns_enhancement.reason, 0, sizeof(snapshot->dns_enhancement.reason)) == NULL) return false;
     if (snapshot == NULL || snapshot->phase < 0 || snapshot->phase >= ASTERISKD_PHASE_COUNT ||
@@ -774,7 +774,7 @@ static void control_encode_snapshot(
     control_builder_raw(builder, snapshot->network.ipv6_enabled ? "true" : "false");
     control_builder_raw(builder, ",\"ipv6Ready\":");
     control_builder_raw(builder, snapshot->network.ipv6_ready ? "true" : "false");
-    static const char *const dns_phases[] = {"disabled", "preparing", "prepared", "active", "inactive", "draining", "unsupported", "failed"};
+    static const char *const dns_phases[] = {"disabled", "preparing", "prepared", "active", "inactive", "draining", "unsupported", "failed", "waiting-network"};
     const struct asteriskd_dns_snapshot *dns = &snapshot->dns_enhancement;
     control_builder_format(builder, "},\"dnsEnhancement\":{\"required\":%s,\"phase\":\"%s\",\"instanceId\":\"%" PRIu64 "\",\"cycleId\":\"%" PRIu64 "\",\"generation\":\"%" PRIu64 "\",\"reason\":",
         dns->required ? "true" : "false", dns_phases[dns->phase], dns->instance_id, dns->cycle_id, dns->generation);
@@ -1326,11 +1326,11 @@ static int control_parse_snapshot(
         if (control_parse_error(document, values[12], &snapshot->error) != 0) return -1;
     }
     static const char *const dns_names[] = {"required", "phase", "instanceId", "cycleId", "generation", "reason"};
-    static const char *const dns_phases[] = {"disabled", "preparing", "prepared", "active", "inactive", "draining", "unsupported", "failed"};
+    static const char *const dns_phases[] = {"disabled", "preparing", "prepared", "active", "inactive", "draining", "unsupported", "failed", "waiting-network"};
     size_t dv[6]; int dp = 0;
     if (control_object_values(document, values[13], dns_names, 6, dv) != 0 ||
         control_parse_bool(document, dv[0], &snapshot->dns_enhancement.required) != 0 ||
-        control_parse_enum(document, dv[1], dns_phases, 8, &dp) != 0 ||
+        control_parse_enum(document, dv[1], dns_phases, 9, &dp) != 0 ||
         control_parse_decimal_id(document, dv[2], &snapshot->dns_enhancement.instance_id) != 0 ||
         control_parse_decimal_id(document, dv[3], &snapshot->dns_enhancement.cycle_id) != 0 ||
         control_parse_decimal_id(document, dv[4], &snapshot->dns_enhancement.generation) != 0) return -1;
