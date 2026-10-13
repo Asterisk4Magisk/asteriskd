@@ -1169,6 +1169,7 @@ struct asteriskd_system_supervisor {
     struct asteriskd_rules_backend rules_backend;
     bool rules_initialized;
     bool rules_verified;
+    bool rules_reconciling;
     bool local_address_snapshot_active;
     struct asteriskd_address_set local_ipv4_snapshot;
     struct asteriskd_address_set local_ipv6_snapshot;
@@ -1188,6 +1189,7 @@ static const struct asteriskd_b2s_verified_pin *system_b2s_verified_pin(
 static int system_tc_netlink_dispatch(struct asteriskd_system_supervisor *, short);
 
 static int system_dns_tick(struct asteriskd_system_supervisor *, struct asteriskd_runtime_delta *);
+static bool system_dns_waiting_for_rules(struct asteriskd_system_supervisor *);
 static int system_dns_prepare(struct asteriskd_system_supervisor *);
 static int system_dns_exchange(struct asteriskd_system_supervisor *, uint16_t);
 static int system_dns_withdraw(struct asteriskd_system_supervisor *);
@@ -1392,6 +1394,11 @@ static int system_runtime_prepare(
         if (system->dns_hot_stage) {
             if (system->dns.pending) {
                 if (!next || next > system->dns_hot_deadline) next = system->dns_hot_deadline;
+            } else if (system_dns_waiting_for_rules(system)) {
+                // Reconcile pumps this reactor while waiting for subprocesses.
+                // Its completion makes the next prepare runnable; do not spin
+                // inside the nested pump or extend the operation's budget.
+                next = system->dns_hot_deadline;
             } else if (system->dns_hot_stage == 14) {
                 // No periodic retry wakeups: only the socket event or this
                 // operation's absolute timeout can advance network waiting.
@@ -6504,13 +6511,28 @@ static int system_runtime_request_dns(void *opaque, const struct asteriskd_contr
     return 0;
 }
 
-static bool system_dns_consumers_current(struct asteriskd_system_supervisor *s) {
-    return !s->core_reaped && !s->helper_reaped && s->rules_verified &&
+static bool system_dns_consumers_live(struct asteriskd_system_supervisor *s) {
+    return !s->core_reaped && !s->helper_reaped &&
         !s->stop_requested && !s->manual_stop_pending && !s->shutdown_requested &&
         !s->cleanup_in_progress && (!s->runtime ||
           (!(s->runtime->pending_delta.flags & (ASTERISKD_DELTA_STOP_REQUESTED |
             ASTERISKD_DELTA_CHILD_EXITED | ASTERISKD_DELTA_FATAL)) &&
            !runtime_lifecycle_stop_requested(s->runtime)));
+}
+static bool system_dns_consumers_current(struct asteriskd_system_supervisor *s) {
+    return s->rules_verified && system_dns_consumers_live(s);
+}
+static bool system_dns_waiting_for_rules(struct asteriskd_system_supervisor *s) {
+    return (s->dns_hot_stage == 10 || s->dns_hot_stage == 12) &&
+        s->rules_reconciling && !s->rules_verified && system_dns_consumers_live(s);
+}
+static int system_dns_complete(struct asteriskd_system_supervisor *s, int result, uint64_t now) {
+    s->dns_hot_stage = 0;
+    s->dns_hot_result = result;
+    s->dns.busy = false;
+    // Queue the original request's immutable response in this dispatch, before
+    // another request can replace dns_hot_request. Tick does not pump or write.
+    return s->control ? asteriskd_control_server_tick(s->control, now) : 0;
 }
 static int system_dns_activate(struct asteriskd_system_supervisor *s,uint64_t now) {
     // Activation still requires live consumers and an acknowledged PREPARE.
@@ -6574,15 +6596,18 @@ static int system_dns_tick(struct asteriskd_system_supervisor *s, struct asteris
             if (s->dns.retained || s->dns.snapshot.phase == DNS_DRAINING) { s->dns_hot_stage = 2; return 0; }
             s->dns.suspended = true; s->dns.topology_changed=false;
             if (s->dns_regenerating || s->dns_hot_request.method == ASTERISKD_CONTROL_METHOD_DNS_RESUME) s->dns_hot_stage=10;
-            else { s->dns_hot_result = 1; s->dns_hot_stage = 0; s->dns.busy = false; }
+            else return system_dns_complete(s, 1, now);
         } else if (stage == 10) {
-            if (s->core_reaped || s->helper_reaped || !s->rules_verified || system_dns_begin_generation(s) != 0) goto hot_failed;
+            if (system_dns_waiting_for_rules(s)) return 0;
+            if (!system_dns_consumers_current(s) || system_dns_begin_generation(s) != 0) goto hot_failed;
             s->dns_hot_stage = 11;
         } else if (stage == 11) {
             if (!(s->dns.result & system_dns_mode_bit(s)) ||
                 asteriskd_dns_command(&s->dns, 2, &s->loaded_config.config, now) != 0) goto hot_failed;
             s->dns_hot_stage = 12;
         } else if (stage == 12) {
+            if (system_dns_waiting_for_rules(s)) return 0;
+            if (!system_dns_consumers_current(s)) goto hot_failed;
             if (s->dns.prepare_retry) {
                 s->dns_hot_stage = 14;
                 return 0;
@@ -6598,7 +6623,7 @@ static int system_dns_tick(struct asteriskd_system_supervisor *s, struct asteris
         } else if (stage == 13) {
             s->dns_hot_completed_generation = s->dns_regenerating ? 0 : s->dns.snapshot.generation;
             s->dns_regenerating=false;
-            s->dns_hot_stage = 0; s->dns_hot_result = 1; s->dns.busy = false;
+            return system_dns_complete(s, 1, now);
         }
         return 0;
     }
@@ -6611,10 +6636,17 @@ hot_failed:
         s->dns.snapshot.phase == DNS_UNSUPPORTED || s->dns.prepare_retry)) {
         asteriskd_dns_close(&s->dns);
         s->dns.snapshot.phase = DNS_FAILED;
-    } else asteriskd_dns_fail(&s->dns, "DNS hot transition failed or drain timed out");
-    s->dns_hot_stage = 0; s->dns_hot_result = -1; s->dns.busy = false;
+    } else {
+        char reason[192];
+        snprintf(reason, sizeof(reason),
+            "DNS hot transition %s: stage=%d phase=%d rulesVerified=%d reconciling=%d consumersLive=%d",
+            now >= s->dns_hot_deadline ? "timed out" : "failed",
+            s->dns_hot_stage, (int)s->dns.snapshot.phase, s->rules_verified,
+            s->rules_reconciling, system_dns_consumers_live(s));
+        asteriskd_dns_fail(&s->dns, reason);
+    }
     system_runtime_fatal(delta, ASTERISKD_COMPONENT_NETWORK, s->dns.snapshot.reason);
-    return 0;
+    return system_dns_complete(s, -1, now);
 }
 
 static int system_effect_rules(void *opaque, bool *active,
@@ -6682,6 +6714,7 @@ static int system_effect_reconcile(void *opaque, bool *active,
     if (active == NULL || generation == NULL || categories == NULL ||
         !system->rules_initialized) return -1;
     system->rules_verified = false;
+    system->rules_reconciling = true;
     const char *failed_stage = NULL;
     if (system_capture_local_address_snapshot(system) != 0) {
         failed_stage = "local-address-snapshot";
@@ -6708,6 +6741,7 @@ static int system_effect_reconcile(void *opaque, bool *active,
     }
     system_rule_snapshot_destroy(&system->rule_snapshot);
     system_clear_local_address_snapshot(system);
+    system->rules_reconciling = false;
     if (failed_stage != NULL) {
         char message[160U];
         int written = snprintf(message, sizeof(message),
