@@ -1088,7 +1088,7 @@ struct asteriskd_system_supervisor {
     struct asteriskd_dns_client dns;
     uint64_t dns_hot_deadline, dns_startup_deadline;
     uint64_t dns_hot_completed_generation;
-    bool dns_regenerating;
+    bool dns_regenerating, dns_drain_waiting;
     int dns_hot_stage, dns_hot_result;
     struct asteriskd_control_request dns_hot_request;
     bool stop_requested;
@@ -1399,16 +1399,22 @@ static int system_runtime_prepare(
                 // Its completion makes the next prepare runnable; do not spin
                 // inside the nested pump or extend the operation's budget.
                 next = system->dns_hot_deadline;
-            } else if (system->dns_hot_stage == 14) {
-                // No periodic retry wakeups: only the socket event or this
-                // operation's absolute timeout can advance network waiting.
-                next = system->dns.network_changed ? dns_time : system->dns_hot_deadline;
+            } else if (system->dns_hot_stage == 14 ||
+                (system->dns_hot_stage == 2 && system->dns_drain_waiting &&
+                 system->dns.drain_events)) {
+                // No periodic wakeups: only a module event (network change or
+                // release progress) or this operation's absolute timeout can
+                // advance waiting. A disarmed timeout (UINT64_MAX) adds none.
+                next = system->dns.network_changed ? dns_time :
+                    system->dns_hot_deadline == UINT64_MAX ? 0U : system->dns_hot_deadline;
             } else if ((system->dns_hot_stage == 2 || system->dns_hot_stage == 3) &&
                 (system->dns.retained || system->dns.snapshot.phase == DNS_DRAINING)) {
-                next = dns_time + 20U; // Existing bounded resource-drain path.
+                next = dns_time + 20U; // Legacy module without release events.
             } else next = dns_time; // Local state transition, not a periodic timer.
         }
-        if (system->cleanup_in_progress) next = dns_time + 20U;
+        // Bounded to the stopping cycle: a resident supervisor keeps both flags
+        // until the next start, and must not wake every 20 ms while stopped.
+        if (system->cleanup_in_progress && system->service_running) next = dns_time + 20U;
         if (next) system_runtime_min_deadline(deadline, (uint64_t)dns_now + (next > dns_time ? next - dns_time : 0U));
         if (system->dns.fd >= 0 && system_runtime_add_source(builder, system->dns.fd,
             POLLIN | (system->dns.pending && system->dns.tx_offset < system->dns.tx_size ? POLLOUT : 0),
@@ -6431,6 +6437,27 @@ static int system_dns_exchange(struct asteriskd_system_supervisor *s, uint16_t o
     return 0;
 }
 
+static bool system_dns_release_signalled(void *opaque) {
+    struct asteriskd_system_supervisor *s = opaque;
+    return s->dns.network_changed || s->dns.fd < 0;
+}
+
+// Between RELEASE retries, wait for the module's release event through the
+// reactor instead of spinning on requests. Legacy modules keep a 20 ms retry.
+static int system_dns_wait_release(struct asteriskd_system_supervisor *s, uint64_t until) {
+    uint64_t current = asteriskd_dns_monotime();
+    if (current >= until) return -1;
+    uint64_t wait = until - current;
+    if (!s->dns.drain_events && wait > 20U) wait = 20U;
+    int64_t now = 0;
+    if (system_runtime_clock(s, &now) != 0) return -1;
+    struct asteriskd_deadline deadline = {.armed=true, .monotonic_milliseconds=now+(int64_t)wait};
+    if (system_pump_condition(s, &deadline, system_dns_release_signalled) != 0 &&
+        (s->dns.drain_events || asteriskd_dns_monotime() >= until)) return -1;
+    s->dns.network_changed = false;
+    return 0;
+}
+
 static uint32_t system_dns_mode_bit(struct asteriskd_system_supervisor *s) {
     return s->loaded_config.config.mode == ASTERISKD_MODE_TPROXY ? 1U :
         s->loaded_config.config.mode == ASTERISKD_MODE_TUN2SOCKS ? 2U : 4U;
@@ -6477,7 +6504,10 @@ static int system_dns_startup_failed(struct asteriskd_system_supervisor *s, cons
 
 static int system_dns_prepare(struct asteriskd_system_supervisor *s) {
     if (!s->loaded_config.config.dns_enhancement) return 0;
-    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+    bool drain_logged = false;
+    // A previous cycle draining in-flight queries does not consume attempts;
+    // the startup deadline bounds that wait.
+    for (unsigned attempt = 0;;) {
         if (system_dns_begin_generation(s) != 0) return system_dns_startup_failed(s, "connect");
         if (system_dns_wait(s) != 0) return system_dns_startup_failed(s, "capabilities");
         if (!(s->dns.result & system_dns_mode_bit(s))) {
@@ -6489,16 +6519,25 @@ static int system_dns_prepare(struct asteriskd_system_supervisor *s) {
         }
         if (system_dns_exchange(s, 2) != 0) return system_dns_startup_failed(s, "prepare");
         if (!s->dns.prepare_retry) return 0;
-        char message[256];
-        snprintf(message, sizeof(message), "DNS prepare transient failure: attempt=%u %s",
-            attempt + 1, s->dns.snapshot.reason);
-        (void)asteriskd_log_line(&s->logger, ASTERISKD_LOG_LEVEL_WARNING,
-            ASTERISKD_COMPONENT_NETWORK, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
-        if (attempt == 2 || !s->dns_startup_deadline ||
+        const bool draining = s->dns.prepare_draining;
+        if (!draining || !drain_logged) {
+            char message[256];
+            if (draining) snprintf(message, sizeof(message),
+                "DNS prepare waiting for previous cycle to drain: %s", s->dns.snapshot.reason);
+            else snprintf(message, sizeof(message), "DNS prepare transient failure: attempt=%u %s",
+                attempt + 1, s->dns.snapshot.reason);
+            (void)asteriskd_log_line(&s->logger, ASTERISKD_LOG_LEVEL_WARNING,
+                ASTERISKD_COMPONENT_NETWORK, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+            drain_logged = drain_logged || draining;
+        }
+        if ((!draining && ++attempt == 3) || !s->dns_startup_deadline ||
             asteriskd_dns_monotime() >= s->dns_startup_deadline) break;
         // Wait through the reactor, so stop/child exit/control requests remain responsive.
-        // Retry only after a resolver event. The deadline bounds the operation;
-        // it is not a timer for probing whether the network has become ready.
+        // Retry only after a resolver event (network change or drain completion).
+        // The deadline bounds the operation; it is not a timer for probing whether
+        // the network has become ready. Modules without drain events keep the
+        // legacy 20 ms release cadence; PREPARE itself reaps their drained session.
+        const bool legacy_drain = draining && !s->dns.drain_events;
         const uint64_t until = s->dns_startup_deadline;
         while (!s->dns.network_changed && asteriskd_dns_monotime() < until) {
             int64_t now = 0;
@@ -6506,6 +6545,7 @@ static int system_dns_prepare(struct asteriskd_system_supervisor *s) {
             uint64_t current = asteriskd_dns_monotime();
             if (current >= until) break;
             uint64_t remaining = until - current;
+            if (legacy_drain && remaining > 20U) remaining = 20U;
             struct asteriskd_deadline deadline = {.armed=true,
                 .monotonic_milliseconds=now+(int64_t)remaining};
             struct asteriskd_runtime_delta delta;
@@ -6515,9 +6555,12 @@ static int system_dns_prepare(struct asteriskd_system_supervisor *s) {
             if (s->stop_requested || s->manual_stop_pending || s->shutdown_requested ||
                 s->core_reaped || s->helper_reaped)
                 return system_dns_startup_failed(s, "retry-interrupted");
+            if (legacy_drain) break;
         }
         s->dns.network_changed = false;
         if (asteriskd_dns_monotime() >= s->dns_startup_deadline) break;
+        // A drain wait leaves no retained resources of this session.
+        if (draining) s->dns.snapshot.phase = DNS_INACTIVE;
         s->dns.suspended = true;
     }
     return system_dns_startup_failed(s, "prepare-retry-exhausted");
@@ -6534,6 +6577,7 @@ static int system_dns_withdraw(struct asteriskd_system_supervisor *s) {
             if (s->dns.snapshot.phase == DNS_INACTIVE && s->dns.retained == 0) {
                 s->dns.suspended = true; return 0;
             }
+            if (system_dns_wait_release(s, until) != 0) break;
         }
     } else if (s->dns.suspended) return 0;
     // Closing the owner connection requests withdrawal. A blocked companion
@@ -6629,6 +6673,7 @@ static int system_dns_verify_startup(struct asteriskd_system_supervisor *s) {
         while (asteriskd_dns_monotime() < until) {
             if (system_dns_exchange(s, 6) != 0) return -1;
             if (s->dns.snapshot.phase == DNS_INACTIVE && !s->dns.retained) break;
+            if (system_dns_wait_release(s, until) != 0) break;
         }
         if (asteriskd_dns_monotime() >= until || s->stop_requested ||
             s->manual_stop_pending || s->shutdown_requested) break;
@@ -6648,7 +6693,7 @@ static int system_dns_tick(struct asteriskd_system_supervisor *s, struct asteris
         s->dns.snapshot.phase != DNS_UNSUPPORTED) asteriskd_dns_fail(&s->dns, "DNS transport progress failed");
     if (s->dns.topology_changed && !s->dns_hot_stage && !s->cleanup_in_progress &&
         s->state.phase == ASTERISKD_PHASE_RUNNING) {
-        s->dns.topology_changed=false; s->dns_regenerating=true;
+        s->dns.topology_changed=false; s->dns_regenerating=true; s->dns_drain_waiting=false;
         memset(&s->dns_hot_request,0,sizeof(s->dns_hot_request));
         s->dns_hot_completed_generation=0; s->dns_hot_stage=2;
         s->dns_hot_result=0; s->dns_hot_deadline=now+8000; s->dns.busy=true;
@@ -6658,17 +6703,44 @@ static int system_dns_tick(struct asteriskd_system_supervisor *s, struct asteris
     // Drain and prepare a fresh generation within the original operation budget.
     if (s->dns.topology_changed && s->dns_hot_stage == 13) {
         s->dns.topology_changed = false;
-        s->dns_hot_stage = 2;
+        s->dns_hot_stage = 2; s->dns_drain_waiting = false;
     }
     if (s->dns_hot_stage) {
+        if (now >= s->dns_hot_deadline && s->dns_regenerating &&
+            (s->dns_hot_stage == 14 || (s->dns.drain_events &&
+                (s->dns_hot_stage == 2 || s->dns_hot_stage == 3))) &&
+            s->dns.snapshot.phase != DNS_FAILED && s->dns.snapshot.phase != DNS_UNSUPPORTED) {
+            // A network-driven rebuild that only waits for in-flight queries or
+            // the next network event is not a service failure. The policy is
+            // withdrawn (selected queries stay guarded), so keep waiting for
+            // events without any timer instead of stopping the service.
+            s->dns_hot_deadline = UINT64_MAX;
+            (void)asteriskd_log_line(&s->logger, ASTERISKD_LOG_LEVEL_WARNING,
+                ASTERISKD_COMPONENT_NETWORK, ASTERISKD_LOG_EVENT_DIAGNOSTIC,
+                s->dns_hot_stage == 14 ? "DNS rebuild waiting for network event" :
+                    "DNS rebuild waiting for in-flight queries to finish");
+        }
         if (now >= s->dns_hot_deadline || s->dns.snapshot.phase == DNS_FAILED || s->dns.snapshot.phase == DNS_UNSUPPORTED) goto hot_failed;
         if (s->dns.pending) return 0;
         int stage = s->dns_hot_stage;
         if (stage == 1) { if (asteriskd_dns_command(&s->dns, 5, NULL, now) != 0) goto hot_failed; s->dns_hot_stage = 2; }
-        else if (stage == 2) { if (asteriskd_dns_command(&s->dns, 6, NULL, now) != 0) goto hot_failed; s->dns_hot_stage = 3; }
+        else if (stage == 2) {
+            if (s->dns_drain_waiting && s->dns.drain_events) {
+                // RELEASE answered DRAINING; the module reports completion.
+                if (!s->dns.network_changed) return 0;
+                s->dns.network_changed = false;
+            }
+            s->dns_drain_waiting = false;
+            if (asteriskd_dns_command(&s->dns, 6, NULL, now) != 0) goto hot_failed;
+            s->dns_hot_stage = 3;
+        }
         else if (stage == 3) {
-            if (s->dns.retained || s->dns.snapshot.phase == DNS_DRAINING) { s->dns_hot_stage = 2; return 0; }
+            if (s->dns.retained || s->dns.snapshot.phase == DNS_DRAINING) {
+                s->dns_hot_stage = 2; s->dns_drain_waiting = true; return 0;
+            }
             s->dns.suspended = true; s->dns.topology_changed=false;
+            // Waiting may have disarmed the timeout; rebuilding has a fresh budget.
+            if (s->dns_hot_deadline == UINT64_MAX) s->dns_hot_deadline = now + 8000;
             if (s->dns_regenerating || s->dns_hot_request.method == ASTERISKD_CONTROL_METHOD_DNS_RESUME) s->dns_hot_stage=10;
             else return system_dns_complete(s, 1, now);
         } else if (stage == 10) {
@@ -6691,8 +6763,10 @@ static int system_dns_tick(struct asteriskd_system_supervisor *s, struct asteris
         } else if (stage == 14) {
             if (s->dns.network_changed) {
                 s->dns.network_changed = false;
+                if (s->dns.prepare_draining) s->dns.snapshot.phase = DNS_INACTIVE;
                 s->dns.suspended = true;
                 s->dns_hot_stage = 10;
+                if (s->dns_hot_deadline == UINT64_MAX) s->dns_hot_deadline = now + 8000;
             }
         } else if (stage == 13) {
             s->dns_hot_completed_generation = s->dns_regenerating ? 0 : s->dns.snapshot.generation;

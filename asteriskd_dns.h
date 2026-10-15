@@ -27,6 +27,10 @@ struct asteriskd_dns_client {
     uint64_t netd, deadline;
     bool pending, complete, connected, suspended, busy, topology_changed, network_changed;
     bool prepare_retry;
+    // PREPARE answered BUSY while the previous session drains; transient.
+    bool prepare_draining;
+    // Module reports release progress with NETWORK_CHANGED; no drain timer.
+    bool drain_events;
     unsigned char *tx;
     size_t tx_size, tx_offset, rx_size;
     unsigned char rx[68+32*ASTERISKD_DNS_MAX_ROUTES];

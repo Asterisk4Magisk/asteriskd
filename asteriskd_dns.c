@@ -74,6 +74,7 @@ int asteriskd_dns_command(struct asteriskd_dns_client *c,uint16_t op,
         if(d==SIZE_MAX) return -1;
         put(b+28,a,4); put(b+32,d,4); put(b+36,0,4); put(b+40,c->netd,8);
         body=48+4*(a+d); c->snapshot.phase=DNS_PREPARING; c->route_count=0; c->prepare_retry=false;
+        c->prepare_draining=false;
         c->snapshot.reason[0]=0;
     }
     put(c->tx,0x314e4541,4); put(c->tx+4,1,2); put(c->tx+6,op,2);
@@ -133,6 +134,7 @@ int asteriskd_dns_accept(struct asteriskd_dns_client *c,const unsigned char *p,s
             asteriskd_dns_fail(c,reason); return -1;
         }
         c->result=(uint32_t)get(b+16,4); // Supported mode mask, checked before PREPARE.
+        c->drain_events=(flags&8U)!=0;
         if(c->result==0) {
             asteriskd_dns_close(c); c->snapshot.phase=DNS_UNSUPPORTED;
             snprintf(c->snapshot.reason,sizeof(c->snapshot.reason),"module advertises no supported modes"); return -1;
@@ -171,7 +173,7 @@ int asteriskd_dns_accept(struct asteriskd_dns_client *c,const unsigned char *p,s
             // Old/unknown errors and isolated-cache read failures remain terminal.
             c->prepare_retry=phase==0 && c->retained==0 && network<=0xffffU &&
                 ((detail==1 && (stage==1 || stage==2) && (error==0 || error==-ENOENT)) ||
-                 (detail==2 && stage==5 && error==-EAGAIN));
+                 (detail==2 && (stage==5 || stage==6) && error==-EAGAIN));
             c->pending=false; c->complete=true;
             if(c->prepare_retry) { c->snapshot.phase=DNS_INACTIVE; return 0; }
             asteriskd_dns_close(c); c->snapshot.phase=DNS_FAILED; return -1;
@@ -181,6 +183,14 @@ int asteriskd_dns_accept(struct asteriskd_dns_client *c,const unsigned char *p,s
             // The module has already withdrawn the old policy. Keep the
             // authenticated connection for drain and a fresh network snapshot.
             c->snapshot.phase=DNS_DRAINING; c->topology_changed=true;
+        }
+        else if(c->opcode==2 && c->result==4 && phase==3 && get(p+6,2)==8) {
+            // The previous owner's session is still auto-releasing in-flight
+            // queries. Its caches are not ours; retry PREPARE after the drain event.
+            snprintf(c->snapshot.reason,sizeof(c->snapshot.reason),
+                "previous DNS cycle draining in-flight queries: retained=%u",c->retained);
+            c->retained=0; c->prepare_retry=true; c->prepare_draining=true;
+            c->snapshot.phase=DNS_DRAINING;
         }
         else if(c->result!=0 || get(p+6,2)!=7) {
             static const char *const results[] = {"OK", "INVALID", "UNSUPPORTED", "STALE",
