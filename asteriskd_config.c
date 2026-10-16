@@ -914,7 +914,8 @@ static int parse_bpf(
         parse_port(document, values[3], &bpf->bridge_port) != 0 || copy_string(document, values[4], bpf->socks_host, sizeof(bpf->socks_host)) != 0 || strcmp(bpf->socks_host, "127.0.0.1") != 0 ||
         parse_port(document, values[5], &bpf->socks_port) != 0 || bpf->bridge_port == bpf->socks_port ||
         parse_u32(document, values[6], &bpf->worker_count) != 0 || bpf->worker_count > 256U ||
-        parse_u32(document, values[7], &bpf->tcp_buffer_size) != 0 || bpf->tcp_buffer_size < 4096U || bpf->tcp_buffer_size > 16777216U ||
+        parse_u32(document, values[7], &bpf->tcp_buffer_size) != 0 ||
+        (bpf->tcp_buffer_size != 0U && (bpf->tcp_buffer_size < 4096U || bpf->tcp_buffer_size > 16777216U)) ||
         parse_u32(document, values[8], &bpf->max_tcp_sessions) != 0 || bpf->max_tcp_sessions < 1U || bpf->max_tcp_sessions > 1048576U ||
         parse_u32(document, values[9], &bpf->tcp_connect_timeout_milliseconds) != 0 || bpf->tcp_connect_timeout_milliseconds < 100U || bpf->tcp_connect_timeout_milliseconds > 60000U ||
         parse_u32(document, values[10], &bpf->tcp_idle_timeout_milliseconds) != 0 || bpf->tcp_idle_timeout_milliseconds < 1000U || bpf->tcp_idle_timeout_milliseconds > 86400000U ||
