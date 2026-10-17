@@ -343,7 +343,7 @@ struct asteriskd_bpf_helper_config {
     uint32_t worker_count;
     uint32_t tcp_buffer_size;
     uint32_t max_tcp_sessions;
-    uint32_t tcp_connect_timeout_milliseconds;
+    uint32_t connect_timeout_milliseconds;
     uint32_t tcp_idle_timeout_milliseconds;
     uint32_t udp_socket_buffer_size;
     uint32_t udp_batch_size;

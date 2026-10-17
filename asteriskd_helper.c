@@ -248,10 +248,10 @@ static int render_bpf(const struct asteriskd_config *config, int direct_ipv4_fd,
     writer_json_string(&writer, pin_namespace);
     writer_literal(&writer, ",\"cgroupPath\":\"/sys/fs/cgroup\"");
     writer_format(&writer,
-        ",\"workerCount\":%u,\"tcpBufferSize\":%u,\"maxTcpSessions\":%u,\"tcpConnectTimeoutMilliseconds\":%u"
+        ",\"workerCount\":%u,\"tcpBufferSize\":%u,\"maxTcpSessions\":%u,\"connectTimeoutMilliseconds\":%u"
         ",\"tcpIdleTimeoutMilliseconds\":%u,\"udpSocketBufferSize\":%u,\"udpBatchSize\":%u,\"maxUdpSessions\":%u"
         ",\"maxUdpBindings\":%u,\"udpIdleTimeoutSeconds\":%u,\"maxUdpPendingBytes\":%u,\"dnsTransactionTimeoutMilliseconds\":%u",
-        bpf->worker_count, bpf->tcp_buffer_size, bpf->max_tcp_sessions, bpf->tcp_connect_timeout_milliseconds,
+        bpf->worker_count, bpf->tcp_buffer_size, bpf->max_tcp_sessions, bpf->connect_timeout_milliseconds,
         bpf->tcp_idle_timeout_milliseconds, bpf->udp_socket_buffer_size, bpf->udp_batch_size, bpf->max_udp_sessions,
         bpf->max_udp_bindings, bpf->udp_idle_timeout_seconds, bpf->max_udp_pending_bytes,
         bpf->dns_transaction_timeout_milliseconds);
