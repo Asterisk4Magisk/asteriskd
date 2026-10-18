@@ -409,6 +409,7 @@ int asteriskd_process_identity_read(
         anonymous_error(error, error_size, "invalid process identity input");
         return ASTERISKD_CONFIG_INVALID;
     }
+    const char *reason = "stat-unreadable";
     char stat_text[4096U];
     size_t stat_length = 0U;
     struct process_stat_snapshot first;
@@ -416,17 +417,21 @@ int asteriskd_process_identity_read(
     if (backend->read_stat(
             backend->context, pid, stat_text, sizeof(stat_text) - 1U, &stat_length) != 0 ||
         stat_length >= sizeof(stat_text) ||
-        process_parse_stat(stat_text, stat_length, pid, &first) != 0 ||
-        first.process_group_id != pid || first.session_id != pid) goto mismatch;
+        process_parse_stat(stat_text, stat_length, pid, &first) != 0) goto mismatch;
+    reason = "session-mismatch";
+    if (first.process_group_id != pid || first.session_id != pid) goto mismatch;
+    reason = "exe-unreadable";
     uint64_t device = 0U;
     uint64_t inode = 0U;
     if (backend->read_exe_identity(backend->context, pid, &device, &inode) != 0 ||
         device == 0U || inode == 0U) goto mismatch;
+    reason = "cmdline-unreadable";
     unsigned char cmdline[ASTERISKD_MAX_PROCESS_ARGV * ASTERISKD_MAX_CHILD_ARG + 1U];
     size_t cmdline_length = 0U;
     if (backend->read_cmdline(
             backend->context, pid, cmdline, sizeof(cmdline), &cmdline_length) != 0 ||
         cmdline_length == 0U || cmdline_length >= sizeof(cmdline)) goto mismatch;
+    reason = "cmdline-mismatch";
     size_t offset = 0U;
     for (size_t index = 0U; index < spec->argc; ++index) {
         size_t expected_length = strnlen(spec->argv[index], ASTERISKD_MAX_CHILD_ARG);
@@ -437,6 +442,7 @@ int asteriskd_process_identity_read(
         offset += expected_length + 1U;
     }
     if (offset != cmdline_length) goto mismatch;
+    reason = "stat-changed";
     struct process_stat_snapshot second;
     memset(&second, 0, sizeof(second));
     if (backend->read_stat(
@@ -461,7 +467,9 @@ int asteriskd_process_identity_read(
 
 mismatch:
     memset(identity, 0, sizeof(*identity));
-    anonymous_error(error, error_size, "process identity mismatch");
+    if (error != NULL && error_size != 0U) {
+        (void)snprintf(error, error_size, "process identity mismatch: %s", reason);
+    }
     return ASTERISKD_CONFIG_IO;
 }
 
@@ -656,6 +664,41 @@ int asteriskd_readiness_poll(
     if (ready) return ASTERISKD_READINESS_READY;
     return now_milliseconds >= tracker->deadline_milliseconds ?
         ASTERISKD_READINESS_TIMEOUT : ASTERISKD_READINESS_PENDING;
+}
+
+/* Describe the probe used by asteriskd_readiness_poll for failure diagnostics. */
+int asteriskd_readiness_target_describe(
+    const struct asteriskd_config *config,
+    enum asteriskd_child_role role,
+    char *out,
+    size_t size) {
+    if (out == NULL || size == 0U) return ASTERISKD_CONFIG_INVALID;
+    out[0] = '\0';
+    if (config == NULL || !readiness_role_valid(config, role)) return ASTERISKD_CONFIG_INVALID;
+    int written = -1;
+    if (role == ASTERISKD_CHILD_CORE && config->mode == ASTERISKD_MODE_TPROXY) {
+        written = snprintf(out, size, "tcp-listener:%u", (unsigned)config->transparent_port);
+    } else if (role == ASTERISKD_CHILD_CORE && config->mode == ASTERISKD_MODE_TUN) {
+        written = snprintf(out, size, "interface:%s", config->tunnel_name);
+    } else if (role == ASTERISKD_CHILD_CORE && config->mode == ASTERISKD_MODE_TUN2SOCKS) {
+        written = snprintf(out, size, "tcp-listener:%u",
+            (unsigned)config->helper.value.hev.socks_port);
+    } else if (role == ASTERISKD_CHILD_CORE && config->mode == ASTERISKD_MODE_BPF2SOCKS) {
+        written = snprintf(out, size, "tcp-listener:%u",
+            (unsigned)config->helper.value.bpf.socks_port);
+    } else if (role == ASTERISKD_CHILD_CORE && config->mode == ASTERISKD_MODE_EBPF) {
+        written = snprintf(out, size, "%s", "none");
+    } else if (role == ASTERISKD_CHILD_HELPER && config->mode == ASTERISKD_MODE_TUN2SOCKS) {
+        written = snprintf(out, size, "interface:%s", config->helper.value.hev.tunnel_name);
+    } else if (role == ASTERISKD_CHILD_HELPER && config->mode == ASTERISKD_MODE_BPF2SOCKS) {
+        written = snprintf(out, size, "tcp-listener:%u",
+            (unsigned)config->helper.value.bpf.bridge_port);
+    }
+    if (written < 0 || (size_t)written >= size) {
+        out[0] = '\0';
+        return ASTERISKD_CONFIG_INVALID;
+    }
+    return 0;
 }
 
 void asteriskd_stop_coordinator_init(struct asteriskd_stop_coordinator *coordinator) {

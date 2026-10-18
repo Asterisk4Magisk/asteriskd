@@ -836,6 +836,13 @@ int asteriskd_runtime_supervise(struct asteriskd_runtime *runtime,
         struct asteriskd_runtime_delta startup_failure;
         (void)runtime_start_failure_detail(
             started, runtime->lifecycle.failure_stage, &startup_failure);
+        /* A child exit during startup must keep its status, or the failure
+         * summary is rejected and the cycle ends without a recorded cause. */
+        if (runtime->pending_delta.has_child_exit) {
+            startup_failure.has_child_exit = true;
+            startup_failure.child_role = runtime->pending_delta.child_role;
+            startup_failure.child_exit = runtime->pending_delta.child_exit;
+        }
         int result = runtime_finish(runtime, reason, &startup_failure);
         runtime->supervising = false;
         return result == 0 ? 1 : result;
@@ -1126,6 +1133,7 @@ struct asteriskd_system_supervisor {
     struct asteriskd_b2s_verification b2s_verification;
     bool b2s_plan_ready;
     bool b2s_verified;
+    char b2s_verify_error[128U];
     int tc_netlink_fd;
     uint32_t tc_netlink_port_id;
     bool tc_netlink_fd_owned;
@@ -1151,6 +1159,9 @@ struct asteriskd_system_supervisor {
     bool action_stdout_overflow;
     char action_stdout[65536U];
     size_t action_stdout_length;
+    /* Leading stderr bytes, reported only when an action fails. */
+    char action_stderr[512U];
+    size_t action_stderr_length;
     struct system_rule_command_batch rule_commands;
     struct system_rule_snapshot rule_snapshot;
     bool verify_private_rules;
@@ -1682,6 +1693,12 @@ static int system_runtime_dispatch_log(struct asteriskd_system_supervisor *syste
             system->action_stdout_length += copied;
             if (copied != (size_t)count) system->action_stdout_overflow = true;
         }
+        if (count > 0 && slot == 2U && stream == ASTERISKD_LOG_STREAM_STDERR) {
+            size_t available = sizeof(system->action_stderr) - system->action_stderr_length;
+            size_t copied = (size_t)count < available ? (size_t)count : available;
+            memcpy(&system->action_stderr[system->action_stderr_length], bytes, copied);
+            system->action_stderr_length += copied;
+        }
         if (count < 0) return -1;
         if (count == 0) {
             system_runtime_close_child_fd(fd, owned);
@@ -1890,6 +1907,29 @@ static int system_effect_event(void *opaque, enum asteriskd_control_event_type t
         system->service_running = false;
         system->manual_stop_pending = false;
     }
+    if (details != NULL && (type == ASTERISKD_CONTROL_EVENT_FAILED ||
+            type == ASTERISKD_CONTROL_EVENT_CORE_EXITED ||
+            type == ASTERISKD_CONTROL_EVENT_HELPER_FAILED)) {
+        char exit_text[24U] = "none";
+        if (details->has_exit_code) {
+            (void)snprintf(exit_text, sizeof(exit_text), "%d", details->exit_code);
+        }
+        char signal_text[24U] = "none";
+        if (details->has_signal) {
+            (void)snprintf(signal_text, sizeof(signal_text), "%d", details->signal);
+        }
+        char message[384U];
+        int written = snprintf(message, sizeof(message),
+            "service failed: code=%s exitCode=%s signal=%s message=%.*s",
+            asteriskd_failure_code_name(details->code), exit_text, signal_text,
+            details->message == NULL ? 0 : (int)(details->message_length < 256U
+                ? details->message_length : 256U),
+            details->message == NULL ? "" : details->message);
+        if (written > 0 && (size_t)written < sizeof(message)) {
+            (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
+                details->component, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+        }
+    }
     return asteriskd_control_server_publish_event(
         system->control, type, snapshot, details,
         runtime_event_is_final(type), (uint64_t)now);
@@ -2022,6 +2062,45 @@ static bool system_core_readiness_done(void *opaque) {
     return system->readiness_result != ASTERISKD_READINESS_PENDING;
 }
 
+static void system_log_failure(struct asteriskd_system_supervisor *system,
+    enum asteriskd_component component, const char *message);
+
+static const char *system_readiness_result_name(int result) {
+    switch (result) {
+        case ASTERISKD_READINESS_PENDING: return "pending";
+        case ASTERISKD_READINESS_READY: return "ready";
+        case ASTERISKD_READINESS_TIMEOUT: return "timeout";
+        case ASTERISKD_READINESS_CONFLICT: return "conflict";
+        case ASTERISKD_READINESS_CHILD_LOST: return "child-lost";
+        case ASTERISKD_READINESS_STOP_REQUESTED: return "stop-requested";
+        case ASTERISKD_READINESS_IO: return "io-error";
+        default: return "invalid";
+    }
+}
+
+/* Name the probe target so a readiness failure can be checked on the device. */
+static void system_log_readiness_failure(struct asteriskd_system_supervisor *system,
+    enum asteriskd_child_role role, int result) {
+    if (result == ASTERISKD_READINESS_READY || result == ASTERISKD_READINESS_STOP_REQUESTED) return;
+    char target[96U];
+    if (asteriskd_readiness_target_describe(
+            &system->loaded_config.config, role, target, sizeof(target)) != 0) {
+        (void)snprintf(target, sizeof(target), "%s", "unknown");
+    }
+    char message[256U];
+    int written = snprintf(message, sizeof(message),
+        "%s readiness failed: result=%s mode=%s target=%s timeoutMs=%" PRIu32,
+        role == ASTERISKD_CHILD_CORE ? "core" : "helper",
+        system_readiness_result_name(result),
+        asteriskd_mode_name(system->loaded_config.config.mode), target,
+        system->loaded_config.config.readiness_timeout_milliseconds);
+    if (written > 0 && (size_t)written < sizeof(message)) {
+        system_log_failure(system,
+            role == ASTERISKD_CHILD_CORE ? ASTERISKD_COMPONENT_CORE : ASTERISKD_COMPONENT_HELPER,
+            message);
+    }
+}
+
 static int system_effect_wait_core(void *opaque) {
     struct asteriskd_system_supervisor *system = opaque;
     int64_t now = 0;
@@ -2037,6 +2116,7 @@ static int system_effect_wait_core(void *opaque) {
     int pumped = system_pump_condition_periodic(system, &deadline,
         ASTERISKD_READINESS_POLL_INTERVAL_MILLIS, system_core_readiness_done);
     if (pumped == 0 && system->readiness_result == ASTERISKD_READINESS_READY) return 0;
+    system_log_readiness_failure(system, ASTERISKD_CHILD_CORE, system->readiness_result);
     return system->readiness_result == ASTERISKD_READINESS_TIMEOUT
         ? ASTERISKD_RUNTIME_EFFECT_READINESS_TIMEOUT : -1;
 }
@@ -2171,8 +2251,12 @@ static int system_effect_wait_helper(void *opaque) {
             ASTERISKD_READINESS_POLL_INTERVAL_MILLIS, system_helper_readiness_done);
         if (pumped == 0 && system->helper_readiness_result == ASTERISKD_READINESS_READY) {
             result = 0;
-        } else if (system->helper_readiness_result == ASTERISKD_READINESS_TIMEOUT) {
-            result = ASTERISKD_RUNTIME_EFFECT_READINESS_TIMEOUT;
+        } else {
+            system_log_readiness_failure(
+                system, ASTERISKD_CHILD_HELPER, system->helper_readiness_result);
+            if (system->helper_readiness_result == ASTERISKD_READINESS_TIMEOUT) {
+                result = ASTERISKD_RUNTIME_EFFECT_READINESS_TIMEOUT;
+            }
         }
     }
 
@@ -2306,6 +2390,48 @@ static int system_action_reap_now(struct asteriskd_system_supervisor *system) {
     }
 }
 
+/* Failures during best-effort owned cleanup, or after a stop was requested, are
+ * consequences of another cause; the terminal failure is logged as an error. */
+static void system_log_failure(struct asteriskd_system_supervisor *system,
+    enum asteriskd_component component, const char *message) {
+    if (system == NULL || message == NULL || !system->logger.opened) return;
+    bool secondary = system->owned_cleanup_in_progress ||
+        (system->runtime != NULL && atomic_load_explicit(
+            &system->runtime->lifecycle.stop_was_requested, memory_order_acquire));
+    (void)asteriskd_log_line(&system->logger,
+        secondary ? ASTERISKD_LOG_LEVEL_WARNING : ASTERISKD_LOG_LEVEL_ERROR,
+        component, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+}
+
+/* Collapse captured action stderr into one printable line for diagnostics. */
+static void system_action_stderr_summary(
+    const struct asteriskd_system_supervisor *system, char *out, size_t size) {
+    if (out == NULL || size == 0U) return;
+    size_t used = 0U;
+    bool pending_space = false;
+    for (size_t index = 0U; system != NULL && index < system->action_stderr_length &&
+            used + 1U < size; ++index) {
+        unsigned char byte = (unsigned char)system->action_stderr[index];
+        if (byte == ' ' || byte == '\t' || byte == '\r' || byte == '\n') {
+            pending_space = used != 0U;
+            continue;
+        }
+        if (pending_space) {
+            out[used++] = ' ';
+            pending_space = false;
+            if (used + 1U >= size) break;
+        }
+        out[used++] = byte < 0x21U || byte >= 0x7fU ? '?' : (char)byte;
+    }
+    out[used] = '\0';
+    if (used == 0U) {
+        (void)snprintf(out, size, "%s", "none");
+    } else if (system->action_stderr_length == sizeof(system->action_stderr) &&
+        used + 4U < size) {
+        memcpy(&out[used], "...", 4U);
+    }
+}
+
 static int system_action_run_spec(struct asteriskd_system_supervisor *system,
     const struct asteriskd_process_spec *spec, bool capture_stdout, int *exit_status) {
     if (system->action_spawned || spec == NULL || exit_status == NULL) {
@@ -2337,6 +2463,7 @@ static int system_action_run_spec(struct asteriskd_system_supervisor *system,
     system->action_capture_stdout = capture_stdout;
     system->action_stdout_overflow = false;
     system->action_stdout_length = 0U;
+    system->action_stderr_length = 0U;
     if (asteriskd_process_spawn_system(spec, &system->action_process,
             error, sizeof(error)) != 0) {
         char message[256U];
@@ -2441,17 +2568,18 @@ early_exit:
 
 failed:
     {
-        char message[320U];
+        char stderr_summary[256U];
+        system_action_stderr_summary(system, stderr_summary, sizeof(stderr_summary));
+        char message[640U];
         int written = snprintf(message, sizeof(message),
-            "action execution failed: phase=%s reaped=%d setupComplete=%d setupFatal=%d detail=%s",
+            "action execution failed: phase=%s reaped=%d setupComplete=%d setupFatal=%d "
+            "detail=%s stderr=%s",
             failure_phase, system->action_reaped ? 1 : 0,
             system->action_setup.complete ? 1 : 0,
             system->action_setup.fatal ? 1 : 0,
-            error[0] == '\0' ? "unavailable" : error);
+            error[0] == '\0' ? "unavailable" : error, stderr_summary);
         if (written > 0 && (size_t)written < sizeof(message)) {
-            (void)asteriskd_log_line(&system->logger,
-                system->owned_cleanup_in_progress ? ASTERISKD_LOG_LEVEL_WARNING : ASTERISKD_LOG_LEVEL_ERROR,
-                ASTERISKD_COMPONENT_RUNTIME, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+            system_log_failure(system, ASTERISKD_COMPONENT_RUNTIME, message);
         }
     }
     (void)system_action_cleanup(system, spec);
@@ -2642,13 +2770,30 @@ static int system_rule_batch_flush(
             batch->ip[ASTERISKD_IP_FAMILY_IPV6].bytes,
             batch->ip[ASTERISKD_IP_FAMILY_IPV6].length,
             batch->xtables_after_ip.bytes, batch->xtables_after_ip.length,
-            &document.bytes, &document.length) != 0) return -1;
+            &document.bytes, &document.length) != 0) {
+        system_log_failure(system, ASTERISKD_COMPONENT_RULES,
+            "rule batch commit failed: phase=render");
+        return -1;
+    }
     const char *argv[] = {"sh", "/proc/self/fd/3", NULL};
     int exit_status = -1;
     int result = system_action_run_document(
         system, argv, &document, &exit_status);
     system_text_batch_destroy(&document);
-    return result == 0 && exit_status == 0 ? 0 : -1;
+    if (result == 0 && exit_status == 0) return 0;
+    /* A run failure is already logged by the action runner. */
+    if (result == 0) {
+        char stderr_summary[256U];
+        system_action_stderr_summary(system, stderr_summary, sizeof(stderr_summary));
+        char message[384U];
+        int written = snprintf(message, sizeof(message),
+            "rule batch commit failed: phase=exit exitStatus=%d stderr=%s",
+            exit_status, stderr_summary);
+        if (written > 0 && (size_t)written < sizeof(message)) {
+            system_log_failure(system, ASTERISKD_COMPONENT_RULES, message);
+        }
+    }
+    return -1;
 }
 
 static int system_capability_find(
@@ -2848,13 +2993,18 @@ static int system_xtables_zero(struct asteriskd_system_supervisor *system,
         arguments, argument_count, &exit_status);
     int result = run_result == 0 && exit_status == 0 ? 0 : -1;
     if (result != 0) {
-        char message[256U];
+        const char *table_name = system_table_name(table);
+        char stderr_summary[256U];
+        system_action_stderr_summary(system, stderr_summary, sizeof(stderr_summary));
+        char message[512U];
         int written = snprintf(message, sizeof(message),
-            "xtables command failed: family=%d table=%d operation=%s chain=%s runner=%d exit=%d",
-            (int)family, (int)table, effective_operation, chain, run_result, exit_status);
+            "xtables command failed: family=%s table=%s operation=%s chain=%s runner=%d "
+            "exitStatus=%d stderr=%s",
+            family == ASTERISKD_IP_FAMILY_IPV6 ? "ipv6" : "ipv4",
+            table_name == NULL ? "invalid" : table_name, effective_operation, chain,
+            run_result, exit_status, run_result == 0 ? stderr_summary : "none");
         if (written > 0 && (size_t)written < sizeof(message)) {
-            (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
-                ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+            system_log_failure(system, ASTERISKD_COMPONENT_RULES, message);
         }
     }
     if (result == 0 && system->verify_private_rules) {
@@ -3906,10 +4056,15 @@ static int system_rule_snapshot_capture(
         if (effect->kind == ASTERISKD_ROUTE_EFFECT_ROUTE) routes[effect->family] = true;
     }
     system_rule_snapshot_destroy(&system->rule_snapshot);
+    const char *source = NULL;
+    size_t failed_family = 0U;
+    int exit_status = -1;
     for (size_t family = 0U; family < ASTERISKD_IP_FAMILY_COUNT; ++family) {
+        failed_family = family;
         for (size_t table = 0U; table < ASTERISKD_IP_TABLE_COUNT; ++table) {
             if (!tables[family][table]) continue;
-            int exit_status = -1;
+            source = system_table_name((enum asteriskd_ip_table)table);
+            exit_status = -1;
             if (system_xtables_table(system, (enum asteriskd_ip_family)family,
                     (enum asteriskd_ip_table)table, &exit_status) != 0 ||
                 exit_status != 0 || system_rule_view_capture(system,
@@ -3917,7 +4072,8 @@ static int system_rule_snapshot_capture(
         }
         if (rules[family]) {
             const char *arguments[] = {"rule", "show"};
-            int exit_status = -1;
+            source = "ip-rule";
+            exit_status = -1;
             if (system_ip_command(system, (enum asteriskd_ip_family)family,
                     arguments, 2U, true, &exit_status) != 0 ||
                 exit_status != 0 || system_rule_view_capture(system,
@@ -3925,7 +4081,8 @@ static int system_rule_snapshot_capture(
         }
         if (routes[family]) {
             const char *arguments[] = {"route", "show", "table", "all"};
-            int exit_status = -1;
+            source = "ip-route";
+            exit_status = -1;
             if (system_ip_command(system, (enum asteriskd_ip_family)family,
                     arguments, 4U, true, &exit_status) != 0 ||
                 exit_status != 0 || system_rule_view_capture(system,
@@ -3937,6 +4094,20 @@ static int system_rule_snapshot_capture(
 
 failed:
     system_rule_snapshot_destroy(&system->rule_snapshot);
+    {
+        char stderr_summary[256U];
+        system_action_stderr_summary(system, stderr_summary, sizeof(stderr_summary));
+        char message[384U];
+        int written = snprintf(message, sizeof(message),
+            "rule snapshot capture failed: source=%s family=%s exitStatus=%d "
+            "stdoutOverflow=%d stderr=%s",
+            source == NULL ? "unknown" : source,
+            failed_family == ASTERISKD_IP_FAMILY_IPV6 ? "ipv6" : "ipv4",
+            exit_status, system->action_stdout_overflow ? 1 : 0, stderr_summary);
+        if (written > 0 && (size_t)written < sizeof(message)) {
+            system_log_failure(system, ASTERISKD_COMPONENT_RULES, message);
+        }
+    }
     return -1;
 }
 
@@ -4530,14 +4701,35 @@ static const struct asteriskd_b2s_verified_pin *system_b2s_verified_pin(
 
 static int system_run_matcher_loader(struct asteriskd_system_supervisor *system) {
     int exit_status = -1;
-    char error[256U];
-    if (!system->matcher_launch_ready || !system->matcher_plan_ready ||
-        system_action_run_spec(
-            system, &system->matcher_launch.process, false, &exit_status) != 0 ||
-        exit_status != 0 || asteriskd_matcher_verify(
+    char error[256U] = {0};
+    const char *stage = NULL;
+    if (!system->matcher_launch_ready || !system->matcher_plan_ready) {
+        stage = "prepare";
+    } else if (system_action_run_spec(
+            system, &system->matcher_launch.process, false, &exit_status) != 0) {
+        /* The action runner logs its own failure. */
+        return -1;
+    } else if (exit_status != 0) {
+        stage = "exit";
+    } else if (asteriskd_matcher_verify(
             &system->loaded_config.config, &system->matcher_pin_plan,
             asteriskd_system_bpf_program_backend(), &system->matcher_verification,
-            error, sizeof(error)) != 0) return -1;
+            error, sizeof(error)) != 0) {
+        stage = "verify";
+    }
+    if (stage != NULL) {
+        char stderr_summary[256U];
+        system_action_stderr_summary(system, stderr_summary, sizeof(stderr_summary));
+        char message[640U];
+        int written = snprintf(message, sizeof(message),
+            "matcher loader failed: stage=%s exitStatus=%d detail=%s stderr=%s",
+            stage, exit_status, error[0] == '\0' ? "unavailable" : error,
+            strcmp(stage, "prepare") == 0 ? "none" : stderr_summary);
+        if (written > 0 && (size_t)written < sizeof(message)) {
+            system_log_failure(system, ASTERISKD_COMPONENT_MATCHER, message);
+        }
+        return -1;
+    }
     system->matcher_verified = true;
     return 0;
 }
@@ -4545,11 +4737,10 @@ static int system_run_matcher_loader(struct asteriskd_system_supervisor *system)
 static bool system_b2s_pins_ready(void *opaque) {
     struct asteriskd_system_supervisor *system = opaque;
     if (system->helper_reaped) return true;
-    char error[128U];
     if (asteriskd_b2s_verify(
             &system->loaded_config.config, &system->b2s_pin_plan,
             asteriskd_system_bpf_program_backend(), &system->b2s_verification,
-            error, sizeof(error)) == 0) {
+            system->b2s_verify_error, sizeof(system->b2s_verify_error)) == 0) {
         system->b2s_verified = true;
         return true;
     }
@@ -4565,9 +4756,19 @@ static int system_start_and_verify_b2s(struct asteriskd_system_supervisor *syste
         .monotonic_milliseconds = now +
             (int64_t)system->loaded_config.config.readiness_timeout_milliseconds,
     };
-    return system_pump_condition_periodic(system, &deadline,
+    system->b2s_verify_error[0] = '\0';
+    if (system_pump_condition_periodic(system, &deadline,
             ASTERISKD_READINESS_POLL_INTERVAL_MILLIS, system_b2s_pins_ready) == 0 &&
-        system->b2s_verified && !system->helper_reaped ? 0 : -1;
+        system->b2s_verified && !system->helper_reaped) return 0;
+    char message[256U];
+    int written = snprintf(message, sizeof(message),
+        "bpf2socks pin verification failed: helperReaped=%d timeoutMs=%" PRIu32 " detail=%s",
+        system->helper_reaped ? 1 : 0, system->loaded_config.config.readiness_timeout_milliseconds,
+        system->b2s_verify_error[0] == '\0' ? "unavailable" : system->b2s_verify_error);
+    if (written > 0 && (size_t)written < sizeof(message)) {
+        system_log_failure(system, ASTERISKD_COMPONENT_HELPER, message);
+    }
+    return -1;
 }
 
 static int system_sysctl_open(
@@ -4747,15 +4948,24 @@ static int system_apply_operations(void *opaque, const struct asteriskd_resource
     size_t count, char *error, size_t error_size) {
     struct asteriskd_system_supervisor *system = opaque;
     if (records == NULL || count == 0U) return -1;
+    const char *single_failure = NULL;
+    int single_result = 0;
     if (count == 1U && records[0].kind == ASTERISKD_RESOURCE_OPERATION_SYSCTL) {
-        return system_sysctl_write(&records[0].resource.sysctl,
+        single_result = system_sysctl_write(&records[0].resource.sysctl,
             records[0].resource.sysctl.desired_value);
+        single_failure = "sysctl write failed";
+    } else if (count == 1U && records[0].kind == ASTERISKD_RESOURCE_OPERATION_TC_QDISC) {
+        single_result = system_tc_apply_qdisc(system, &records[0].resource.tc_qdisc);
+        single_failure = "tc qdisc apply failed";
+    } else if (count == 1U && records[0].kind == ASTERISKD_RESOURCE_OPERATION_TC_FILTER) {
+        single_result = system_tc_apply_filter(system, &records[0].resource.tc_filter);
+        single_failure = "tc filter apply failed";
     }
-    if (count == 1U && records[0].kind == ASTERISKD_RESOURCE_OPERATION_TC_QDISC) {
-        return system_tc_apply_qdisc(system, &records[0].resource.tc_qdisc);
-    }
-    if (count == 1U && records[0].kind == ASTERISKD_RESOURCE_OPERATION_TC_FILTER) {
-        return system_tc_apply_filter(system, &records[0].resource.tc_filter);
+    if (single_failure != NULL) {
+        if (single_result != 0 && error != NULL && error_size != 0U) {
+            (void)snprintf(error, error_size, "%s", single_failure);
+        }
+        return single_result;
     }
     bool rule_batch = system_rule_operation_kind(records[0].kind);
     for (size_t index = 0U; rule_batch && index < count; ++index) {
@@ -4766,7 +4976,12 @@ static int system_apply_operations(void *opaque, const struct asteriskd_resource
             kind == ASTERISKD_RESOURCE_OPERATION_ROUTE;
     }
     if (rule_batch) {
-        if (system_rule_batch_begin(&system->rule_commands) != 0) return -1;
+        if (system_rule_batch_begin(&system->rule_commands) != 0) {
+            if (error != NULL && error_size != 0U) {
+                (void)snprintf(error, error_size, "%s", "rule operation batch is already active");
+            }
+            return -1;
+        }
         for (size_t index = 0U; index < count; ++index) {
             const struct asteriskd_resource_operation *record = &records[index];
             int result = -1;
@@ -4792,7 +5007,12 @@ static int system_apply_operations(void *opaque, const struct asteriskd_resource
                 goto rule_batch_failed;
             }
         }
-        if (system_rule_batch_flush(system) != 0) goto rule_batch_failed;
+        if (system_rule_batch_flush(system) != 0) {
+            if (error != NULL && error_size != 0U) {
+                (void)snprintf(error, error_size, "%s", "rule operation batch commit failed");
+            }
+            goto rule_batch_failed;
+        }
         system_rule_batch_destroy(&system->rule_commands);
         system_rule_snapshot_destroy(&system->rule_snapshot);
         system->rule_snapshot.phase = SYSTEM_RULE_SNAPSHOT_NEEDS_VERIFY;
@@ -4829,12 +5049,27 @@ rule_batch_failed:
     if (count == 1U && (records[0].kind == ASTERISKD_RESOURCE_OPERATION_IP_RULE ||
             records[0].kind == ASTERISKD_RESOURCE_OPERATION_ROUTE)) {
         const struct asteriskd_route_effect *effect = system_find_route_effect(system, &records[0]);
-        return effect == NULL ? -1 : system_apply_route_effect(system, effect);
+        if (effect != NULL && system_apply_route_effect(system, effect) == 0) return 0;
+        if (error != NULL && error_size != 0U) {
+            (void)snprintf(error, error_size, "%s",
+                effect == NULL ? "route effect is unknown" : "route effect apply failed");
+        }
+        return -1;
     }
     for (size_t index = 0U; index < count; ++index) {
-        if (records[index].kind != ASTERISKD_RESOURCE_OPERATION_BPF_PIN) return -1;
+        if (records[index].kind != ASTERISKD_RESOURCE_OPERATION_BPF_PIN) {
+            if (error != NULL && error_size != 0U) {
+                (void)snprintf(error, error_size, "%s", "unsupported operation batch");
+            }
+            return -1;
+        }
     }
-    if (!system->pin_batch_active) return -1;
+    if (!system->pin_batch_active) {
+        if (error != NULL && error_size != 0U) {
+            (void)snprintf(error, error_size, "%s", "BPF pin batch is inactive");
+        }
+        return -1;
+    }
     bool matcher_batch = system->active_pin_batch == ASTERISKD_PIN_BATCH_MATCHER_IPV4 ||
         system->active_pin_batch == ASTERISKD_PIN_BATCH_MATCHER_DUAL_STACK;
     bool b2s_batch = system->active_pin_batch == ASTERISKD_PIN_BATCH_BPF2SOCKS_IPV4 ||
@@ -4860,11 +5095,20 @@ static int system_verify_operation(void *opaque,
     if (system_rule_operation_kind(record->kind) &&
         system->rule_snapshot.phase == SYSTEM_RULE_SNAPSHOT_NEEDS_VERIFY &&
         system_rule_snapshot_capture(system, &system->rules_runtime.plan,
-            SYSTEM_RULE_SNAPSHOT_AFTER_APPLY) != 0) return -1;
+            SYSTEM_RULE_SNAPSHOT_AFTER_APPLY) != 0) {
+        if (error != NULL && error_size != 0U) {
+            (void)snprintf(error, error_size, "%s", "post-apply rule snapshot failed");
+        }
+        return -1;
+    }
     if (record->kind == ASTERISKD_RESOURCE_OPERATION_SYSCTL) {
         uint8_t value = 0U;
-        return system_sysctl_read(&record->resource.sysctl, &value) == 0 &&
-            value == record->resource.sysctl.desired_value ? 0 : -1;
+        if (system_sysctl_read(&record->resource.sysctl, &value) == 0 &&
+            value == record->resource.sysctl.desired_value) return 0;
+        if (error != NULL && error_size != 0U) {
+            (void)snprintf(error, error_size, "%s", "sysctl verification failed");
+        }
+        return -1;
     }
     if (record->kind == ASTERISKD_RESOURCE_OPERATION_BPF_PIN) {
         uint64_t object_id = system_verified_pin_id(
@@ -4879,13 +5123,23 @@ static int system_verify_operation(void *opaque,
     }
     if (record->kind == ASTERISKD_RESOURCE_OPERATION_TC_QDISC) {
         bool present = false;
-        return system_tc_probe_qdisc(system, &record->resource.tc_qdisc, &present) == 0 &&
-            present ? 0 : -1;
+        if (system_tc_probe_qdisc(system, &record->resource.tc_qdisc, &present) == 0 &&
+            present) return 0;
+        if (error != NULL && error_size != 0U) {
+            (void)snprintf(error, error_size, "%s", "tc qdisc verification failed");
+        }
+        return -1;
     }
     if (record->kind == ASTERISKD_RESOURCE_OPERATION_TC_FILTER) {
         enum asteriskd_rules_slot_state state = ASTERISKD_RULES_SLOT_FOREIGN;
-        return system_tc_probe_filter(system, &record->resource.tc_filter, &state) == 0 &&
-            state == ASTERISKD_RULES_SLOT_OWNED ? 0 : -1;
+        int probed = system_tc_probe_filter(system, &record->resource.tc_filter, &state);
+        if (probed == 0 && state == ASTERISKD_RULES_SLOT_OWNED) return 0;
+        if (error != NULL && error_size != 0U) {
+            (void)snprintf(error, error_size, "tc filter verification failed: %s",
+                probed != 0 ? "probe-error" :
+                    state == ASTERISKD_RULES_SLOT_ABSENT ? "absent" : "foreign");
+        }
+        return -1;
     }
     if (record->kind == ASTERISKD_RESOURCE_OPERATION_IPTABLES_CHAIN) {
         const struct asteriskd_private_chain_group *group =
@@ -4929,9 +5183,20 @@ static int system_verify_operation(void *opaque,
         record->kind == ASTERISKD_RESOURCE_OPERATION_ROUTE) {
         const struct asteriskd_route_effect *effect = system_find_route_effect(system, record);
         bool present = false;
-        if (effect == NULL || system_probe_route_effect(system, effect, &present) != 0 ||
-            !present) return -1;
-        return 0;
+        int probed = effect == NULL ? -1 : system_probe_route_effect(system, effect, &present);
+        if (probed == 0 && present) return 0;
+        if (error != NULL && error_size != 0U) {
+            (void)snprintf(error, error_size,
+                "%s verification failed: family=%s table=%" PRIu32 " state=%s",
+                record->kind == ASTERISKD_RESOURCE_OPERATION_IP_RULE ? "ip rule" : "route",
+                effect != NULL && effect->family == ASTERISKD_IP_FAMILY_IPV6 ? "ipv6" : "ipv4",
+                effect != NULL ? effect->table : 0U,
+                effect == NULL ? "unknown" : probed != 0 ? "foreign-or-error" : "absent");
+        }
+        return -1;
+    }
+    if (error != NULL && error_size != 0U) {
+        (void)snprintf(error, error_size, "%s", "unsupported operation verification");
     }
     return -1;
 }
@@ -4981,8 +5246,7 @@ static int system_rules_apply_plan(
         "rule transaction failed: result=%d records=%zu detail=%s",
         applied, count, error[0] == '\0' ? "unavailable" : error);
     if (written > 0 && (size_t)written < sizeof(message)) {
-        (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
-            ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+        system_log_failure(system, ASTERISKD_COMPONENT_RULES, message);
     }
     return -1;
 }
@@ -5000,8 +5264,7 @@ static int system_rules_apply_private(
         "private rules apply failed: result=%d detail=%s", applied,
         error[0] == '\0' ? "unavailable" : error);
     if (written > 0 && (size_t)written < sizeof(message)) {
-        (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
-            ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+        system_log_failure(system, ASTERISKD_COMPONENT_RULES, message);
     }
     return -1;
 }
@@ -5010,10 +5273,23 @@ static int system_rules_apply_route(
     void *opaque, const struct asteriskd_route_effect *effect) {
     struct asteriskd_system_supervisor *system = opaque;
     struct asteriskd_resource_operation record;
-    if (system_route_record(system, effect, &record) != 0) return -1;
-    char error[128U];
-    return system_apply_and_verify(
+    if (system_route_record(system, effect, &record) != 0) {
+        system_log_failure(system, ASTERISKD_COMPONENT_RULES,
+            "route rules apply failed: detail=route record is invalid");
+        return -1;
+    }
+    char error[128U] = {0};
+    int applied = system_apply_and_verify(
         system, &record, 1U, error, sizeof(error));
+    if (applied == 0) return 0;
+    char message[256U];
+    int written = snprintf(message, sizeof(message),
+        "route rules apply failed: result=%d detail=%s", applied,
+        error[0] == '\0' ? "unavailable" : error);
+    if (written > 0 && (size_t)written < sizeof(message)) {
+        system_log_failure(system, ASTERISKD_COMPONENT_RULES, message);
+    }
+    return -1;
 }
 
 static int system_rules_apply_hook(
@@ -5024,14 +5300,15 @@ static int system_rules_apply_hook(
     int applied = system_apply_and_verify(
         system, &record, 1U, error, sizeof(error));
     if (applied == 0) return 0;
+    const char *table_name = system_table_name(group->table);
     char message[256U];
     int written = snprintf(message, sizeof(message),
-        "hook rules apply failed: result=%d family=%d table=%d detail=%s",
-        applied, (int)group->family, (int)group->table,
+        "hook rules apply failed: result=%d family=%s table=%s detail=%s",
+        applied, group->family == ASTERISKD_IP_FAMILY_IPV6 ? "ipv6" : "ipv4",
+        table_name == NULL ? "invalid" : table_name,
         error[0] == '\0' ? "unavailable" : error);
     if (written > 0 && (size_t)written < sizeof(message)) {
-        (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
-            ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+        system_log_failure(system, ASTERISKD_COMPONENT_RULES, message);
     }
     return -1;
 }
@@ -5240,10 +5517,18 @@ static int system_effect_start_helper(
 static int system_effect_open_network(void *opaque) {
     struct asteriskd_system_supervisor *system = opaque;
     system->cleanup_in_progress = false;
-    char error[128U];
+    char error[128U] = {0};
     if (asteriskd_network_open(&system->loaded_config.config,
             asteriskd_system_network_backend(), &system->network,
-            error, sizeof(error)) != 0) return -1;
+            error, sizeof(error)) != 0) {
+        char message[192U];
+        int written = snprintf(message, sizeof(message), "network open failed: detail=%s",
+            error[0] == '\0' ? "unavailable" : error);
+        if (written > 0 && (size_t)written < sizeof(message)) {
+            system_log_failure(system, ASTERISKD_COMPONENT_NETWORK, message);
+        }
+        return -1;
+    }
     system->network_opened = true;
     system->network_effect_sink.dispatch = system_network_effect_dispatch;
     system->network_effect_sink.context = system;
@@ -5435,7 +5720,8 @@ static int system_reconcile_b2s_local_maps(
     const struct asteriskd_bpf_map_backend *backend = asteriskd_system_bpf_map_backend();
     if (!system->b2s_verified || backend == NULL) return -1;
     struct asteriskd_address_set addresses;
-    char error[128U];
+    char error[128U] = {0};
+    const char *family = "ipv4";
     const char *path = system_pin_path(
         system, ASTERISKD_PIN_BPF2SOCKS_LOCAL_ADDRESS_V4);
     uint64_t object_id = system_verified_pin_id(
@@ -5444,15 +5730,29 @@ static int system_reconcile_b2s_local_maps(
         system_collect_local_address_set(
             system, ASTERISKD_ADDRESS_IPV4, &addresses) != 0 ||
         asteriskd_bpf_local_map_reconcile(backend, path, object_id,
-            &addresses, error, sizeof(error)) != 0) return -1;
+            &addresses, error, sizeof(error)) != 0) goto failed;
     if (!system->loaded_config.config.enable_ipv6) return 0;
+    family = "ipv6";
     path = system_pin_path(system, ASTERISKD_PIN_BPF2SOCKS_LOCAL_ADDRESS_V6);
     object_id = system_verified_pin_id(
         system, ASTERISKD_PIN_BPF2SOCKS_LOCAL_ADDRESS_V6);
-    return path != NULL && object_id != 0U &&
+    if (path != NULL && object_id != 0U &&
         system_collect_local_address_set(system, ASTERISKD_ADDRESS_IPV6, &addresses) == 0 &&
         asteriskd_bpf_local_map_reconcile(backend, path, object_id,
-            &addresses, error, sizeof(error)) == 0 ? 0 : -1;
+            &addresses, error, sizeof(error)) == 0) return 0;
+
+failed:
+    {
+        char message[224U];
+        int written = snprintf(message, sizeof(message),
+            "bpf2socks local address map reconcile failed: family=%s pin=%d detail=%s",
+            family, path != NULL && object_id != 0U ? 1 : 0,
+            error[0] == '\0' ? "unavailable" : error);
+        if (written > 0 && (size_t)written < sizeof(message)) {
+            system_log_failure(system, ASTERISKD_COMPONENT_HELPER, message);
+        }
+    }
+    return -1;
 }
 
 static bool system_hotspot_interface_selected(
@@ -6327,14 +6627,23 @@ static int system_reconcile_verify_absent(
     void *opaque, char *error, size_t error_size) {
     struct asteriskd_system_supervisor *system = opaque;
 
-    if (system == NULL ||
-        system_reconcile_hooks(system, false) != 0 ||
-        system_reconcile_tc_filters(system, false) != 0 ||
-        system_reconcile_private_chains(system, false) != 0 ||
-        system_reconcile_policy_routing(system, false) != 0 ||
-        system_reconcile_bpf_pins(system, false) != 0) {
-        system_reconcile_error(
-            error, error_size, "owned resource verification failed");
+    if (system == NULL) {
+        system_reconcile_error(error, error_size, "owned resource verification failed");
+        return -1;
+    }
+    /* Probe every class so the warning names all resources still present. */
+    int hooks = system_reconcile_hooks(system, false);
+    int filters = system_reconcile_tc_filters(system, false);
+    int chains = system_reconcile_private_chains(system, false);
+    int routing = system_reconcile_policy_routing(system, false);
+    int pins = system_reconcile_bpf_pins(system, false);
+    if (hooks != 0 || filters != 0 || chains != 0 || routing != 0 || pins != 0) {
+        char detail[160U];
+        (void)snprintf(detail, sizeof(detail),
+            "owned resource verification failed: hooks=%d tc-filters=%d "
+            "private-chains=%d policy-routing=%d bpf-pins=%d",
+            hooks, filters, chains, routing, pins);
+        system_reconcile_error(error, error_size, detail);
         return -1;
     }
     return 0;
@@ -6838,8 +7147,7 @@ static int system_effect_rules(void *opaque, bool *active,
         int written = snprintf(message, sizeof(message),
             "rules apply failed: stage=%s", failed_stage);
         if (written > 0 && (size_t)written < sizeof(message)) {
-            (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
-                ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+            system_log_failure(system, ASTERISKD_COMPONENT_RULES, message);
         }
         return -1;
     }
@@ -6895,8 +7203,7 @@ static int system_effect_reconcile(void *opaque, bool *active,
         int written = snprintf(message, sizeof(message),
             "rules reconcile failed: stage=%s", failed_stage);
         if (written > 0 && (size_t)written < sizeof(message)) {
-            (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
-                ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+            system_log_failure(system, ASTERISKD_COMPONENT_RULES, message);
         }
         return -1;
     }
@@ -6965,7 +7272,17 @@ static int system_effect_stop_children(
         asteriskd_system_process_backends_init(&system->process_context,
             &system->core_spec,
             system->helper_launch_ready ? &system->helper_launch.process : NULL,
-            &system->readiness_backend, &system->stop_backend) != 0) return -1;
+            &system->readiness_backend, &system->stop_backend) != 0) {
+        char message[160U];
+        int written = snprintf(message, sizeof(message),
+            "child stop failed: stage=prepare coreIdentity=%d helperIdentity=%d",
+            core == NULL ? -1 : system->core_identity_ready ? 1 : 0,
+            helper == NULL ? -1 : system->helper_identity_ready ? 1 : 0);
+        if (written > 0 && (size_t)written < sizeof(message)) {
+            system_log_failure(system, ASTERISKD_COMPONENT_RUNTIME, message);
+        }
+        return -1;
+    }
     int64_t now = 0;
     if (system_runtime_clock(system, &now) != 0) return -1;
     asteriskd_stop_coordinator_init(&system->stop_coordinator);
@@ -6985,6 +7302,29 @@ static int system_effect_stop_children(
     system->stopping_children = false;
     bool killed = system->stop_coordinator.core.kill_sent ||
         system->stop_coordinator.helper.kill_sent;
+    if (system->stop_result != ASTERISKD_STOP_COMPLETE || killed) {
+        const struct asteriskd_stop_role_state *core_state = &system->stop_coordinator.core;
+        const struct asteriskd_stop_role_state *helper_state = &system->stop_coordinator.helper;
+        char message[320U];
+        int written = snprintf(message, sizeof(message),
+            "child stop %s: core=present:%d,term:%d,kill:%d,signalFailed:%d,reaped:%d "
+            "helper=present:%d,term:%d,kill:%d,signalFailed:%d,reaped:%d",
+            system->stop_result == ASTERISKD_STOP_COMPLETE ? "required SIGKILL" : "failed",
+            core_state->present ? 1 : 0, core_state->term_sent ? 1 : 0,
+            core_state->kill_sent ? 1 : 0, core_state->signal_failed ? 1 : 0,
+            core_state->reaped ? 1 : 0,
+            helper_state->present ? 1 : 0, helper_state->term_sent ? 1 : 0,
+            helper_state->kill_sent ? 1 : 0, helper_state->signal_failed ? 1 : 0,
+            helper_state->reaped ? 1 : 0);
+        if (written > 0 && (size_t)written < sizeof(message)) {
+            if (system->stop_result == ASTERISKD_STOP_COMPLETE) {
+                (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_WARNING,
+                    ASTERISKD_COMPONENT_RUNTIME, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+            } else {
+                system_log_failure(system, ASTERISKD_COMPONENT_RUNTIME, message);
+            }
+        }
+    }
     if (system->stop_result == ASTERISKD_STOP_COMPLETE) {
         if (core != NULL) system->core_reaped = true;
         if (helper != NULL) system->helper_reaped = true;

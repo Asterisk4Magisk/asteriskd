@@ -981,6 +981,8 @@ int asteriskd_readiness_poll(
     const struct asteriskd_config *, struct asteriskd_readiness_tracker *,
     const struct asteriskd_child_identity *, const struct asteriskd_readiness_backend *,
     uint64_t, bool);
+int asteriskd_readiness_target_describe(
+    const struct asteriskd_config *, enum asteriskd_child_role, char *, size_t);
 
 struct asteriskd_child_exit_status {
     bool has_exit_code;
@@ -1812,6 +1814,8 @@ int asteriskd_state_set_failure(
 void asteriskd_state_clear_failure(struct asteriskd_state_document *);
 int asteriskd_state_mark_stopped(struct asteriskd_state_document *, char *, size_t);
 bool asteriskd_state_is_stopped(const struct asteriskd_state_document *);
+const char *asteriskd_mode_name(enum asteriskd_mode);
+const char *asteriskd_failure_code_name(enum asteriskd_failure_code);
 int asteriskd_state_serialize(
     const struct asteriskd_state_document *, char **, size_t *, char *, size_t);
 int asteriskd_state_store_init(
