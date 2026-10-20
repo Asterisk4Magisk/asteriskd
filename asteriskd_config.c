@@ -918,7 +918,9 @@ static int parse_bpf(
         (bpf->tcp_buffer_size != 0U && (bpf->tcp_buffer_size < 4096U || bpf->tcp_buffer_size > 16777216U)) ||
         parse_u32(document, values[8], &bpf->max_tcp_sessions) != 0 || bpf->max_tcp_sessions < 1U || bpf->max_tcp_sessions > 1048576U ||
         parse_u32(document, values[9], &bpf->connect_timeout_milliseconds) != 0 || bpf->connect_timeout_milliseconds < 100U || bpf->connect_timeout_milliseconds > 60000U ||
-        parse_u32(document, values[10], &bpf->tcp_idle_timeout_milliseconds) != 0 || bpf->tcp_idle_timeout_milliseconds < 1000U || bpf->tcp_idle_timeout_milliseconds > 86400000U ||
+        parse_u32(document, values[10], &bpf->tcp_idle_timeout_milliseconds) != 0 ||
+        (bpf->tcp_idle_timeout_milliseconds != 0U &&
+            (bpf->tcp_idle_timeout_milliseconds < 1000U || bpf->tcp_idle_timeout_milliseconds > 86400000U)) ||
         parse_u32(document, values[11], &bpf->udp_socket_buffer_size) != 0 || bpf->udp_socket_buffer_size < 4096U || bpf->udp_socket_buffer_size > 16777216U ||
         parse_u32(document, values[12], &bpf->udp_batch_size) != 0 || bpf->udp_batch_size < 1U || bpf->udp_batch_size > 1024U ||
         parse_u32(document, values[13], &bpf->max_udp_sessions) != 0 || bpf->max_udp_sessions < 1U || bpf->max_udp_sessions > 1048576U ||
