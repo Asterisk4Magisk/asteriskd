@@ -17,10 +17,6 @@ struct binary_address {
     unsigned char bytes[16U];
 };
 
-static void set_error(char *error, size_t capacity, const char *message) {
-    if (error != NULL && capacity != 0U) (void)snprintf(error, capacity, "%s", message);
-}
-
 static bool interface_name_valid(const char *name) {
     size_t length = name == NULL ? 0U : strnlen(name, ASTERISKD_MAX_INTERFACE_NAME);
     if (length == 0U || length >= ASTERISKD_MAX_INTERFACE_NAME ||
@@ -69,13 +65,13 @@ int asteriskd_local_address_set_build(
     const struct asteriskd_interface_address *candidates, size_t candidate_count,
     struct asteriskd_address_set *set, char *error, size_t error_capacity) {
     if (set == NULL) {
-        set_error(error, error_capacity, "local address output is required");
+        asteriskd_error_copy(error, error_capacity, "local address output is required");
         return ASTERISKD_CONFIG_INVALID;
     }
     memset(set, 0, sizeof(*set));
     if (config == NULL || (candidate_count != 0U && candidates == NULL) ||
         (family != ASTERISKD_ADDRESS_IPV4 && family != ASTERISKD_ADDRESS_IPV6)) {
-        set_error(error, error_capacity, "invalid local address input");
+        asteriskd_error_copy(error, error_capacity, "invalid local address input");
         return ASTERISKD_CONFIG_INVALID;
     }
     set->family = family;
@@ -106,7 +102,7 @@ int asteriskd_local_address_set_build(
         if (unique_count >= ASTERISKD_MAX_ADDRESSES) {
             free(desired);
             memset(set, 0, sizeof(*set));
-            set_error(error, error_capacity, "too many local addresses");
+            asteriskd_error_copy(error, error_capacity, "too many local addresses");
             return ASTERISKD_CONFIG_INVALID;
         }
         if (unique_count != index) desired[unique_count] = desired[index];
@@ -123,7 +119,7 @@ int asteriskd_local_address_set_build(
 invalid:
     free(desired);
     memset(set, 0, sizeof(*set));
-    set_error(error, error_capacity, "invalid local interface address");
+    asteriskd_error_copy(error, error_capacity, "invalid local interface address");
     return ASTERISKD_CONFIG_INVALID;
 }
 
@@ -187,7 +183,7 @@ int asteriskd_local_bypass_plan_build(
         rules == NULL || desired == NULL || plan == NULL || desired->family != family ||
         desired->count > ASTERISKD_MAX_ADDRESSES ||
         (family != ASTERISKD_ADDRESS_IPV4 && family != ASTERISKD_ADDRESS_IPV6)) {
-        set_error(error, error_capacity, "invalid local bypass plan input");
+        asteriskd_error_copy(error, error_capacity, "invalid local bypass plan input");
         return ASTERISKD_CONFIG_INVALID;
     }
     char rule_prefix[ASTERISKD_MAX_CHAIN_NAME + 8U];
@@ -206,7 +202,7 @@ int asteriskd_local_bypass_plan_build(
         end_length <= 0 || (size_t)end_length >= sizeof(end_rule) ||
         destination_prefix_length <= 0 ||
         (size_t)destination_prefix_length >= sizeof(destination_prefix)) {
-        set_error(error, error_capacity, "invalid local bypass chain name");
+        asteriskd_error_copy(error, error_capacity, "invalid local bypass chain name");
         return ASTERISKD_CONFIG_INVALID;
     }
 
@@ -226,7 +222,7 @@ int asteriskd_local_bypass_plan_build(
             ? rules_length - offset : (size_t)(newline - (rules + offset));
         if (line_length != 0U && rules[offset + line_length - 1U] == '\r') --line_length;
         if (line_length >= 512U) {
-            set_error(error, error_capacity, "local bypass rule is too long");
+            asteriskd_error_copy(error, error_capacity, "local bypass rule is too long");
             return ASTERISKD_CONFIG_INVALID;
         }
         char line[512U];
@@ -237,7 +233,7 @@ int asteriskd_local_bypass_plan_build(
         ++rule_number;
         if (strcmp(line, begin_rule) == 0) {
             if (begin_found || end_found) {
-                set_error(error, error_capacity, "invalid local bypass begin marker");
+                asteriskd_error_copy(error, error_capacity, "invalid local bypass begin marker");
                 return ASTERISKD_CONFIG_INVALID;
             }
             begin_found = true;
@@ -246,7 +242,7 @@ int asteriskd_local_bypass_plan_build(
         }
         if (strcmp(line, end_rule) == 0) {
             if (!inside || end_found) {
-                set_error(error, error_capacity, "invalid local bypass end marker");
+                asteriskd_error_copy(error, error_capacity, "invalid local bypass end marker");
                 return ASTERISKD_CONFIG_INVALID;
             }
             end_found = true;
@@ -256,19 +252,19 @@ int asteriskd_local_bypass_plan_build(
         }
         if (!inside) continue;
         if (strncmp(line, destination_prefix, (size_t)destination_prefix_length) != 0) {
-            set_error(error, error_capacity, "foreign rule inside local bypass interval");
+            asteriskd_error_copy(error, error_capacity, "foreign rule inside local bypass interval");
             return ASTERISKD_CONFIG_INVALID;
         }
         const char *cidr = line + destination_prefix_length;
         const char *suffix = strstr(cidr, return_suffix);
         if (suffix == NULL || suffix[sizeof(return_suffix) - 1U] != '\0' ||
             current.count >= ASTERISKD_MAX_ADDRESSES) {
-            set_error(error, error_capacity, "invalid local bypass address rule");
+            asteriskd_error_copy(error, error_capacity, "invalid local bypass address rule");
             return ASTERISKD_CONFIG_INVALID;
         }
         size_t cidr_length = (size_t)(suffix - cidr);
         if (cidr_length == 0U || cidr_length >= 80U) {
-            set_error(error, error_capacity, "invalid local bypass address cidr");
+            asteriskd_error_copy(error, error_capacity, "invalid local bypass address cidr");
             return ASTERISKD_CONFIG_INVALID;
         }
         char cidr_value[80U];
@@ -277,13 +273,13 @@ int asteriskd_local_bypass_plan_build(
         char address[64U];
         if (parse_host_cidr(family, cidr_value, address, sizeof(address)) != 0 ||
             address_set_contains(&current, address)) {
-            set_error(error, error_capacity, "invalid local bypass host address");
+            asteriskd_error_copy(error, error_capacity, "invalid local bypass host address");
             return ASTERISKD_CONFIG_INVALID;
         }
         (void)snprintf(current.values[current.count++], sizeof(current.values[0]), "%s", address);
     }
     if (!begin_found || !end_found || inside || end_rule_number == 0U) {
-        set_error(error, error_capacity, "local bypass markers are missing or unordered");
+        asteriskd_error_copy(error, error_capacity, "local bypass markers are missing or unordered");
         return ASTERISKD_CONFIG_INVALID;
     }
     for (size_t index = 0U; index < desired->count; ++index) {
@@ -292,13 +288,13 @@ int asteriskd_local_bypass_plan_build(
         int native_family = family == ASTERISKD_ADDRESS_IPV4 ? AF_INET : AF_INET6;
         if (inet_pton(native_family, desired->values[index], binary) != 1 ||
             inet_ntop(native_family, binary, address, sizeof(address)) == NULL) {
-            set_error(error, error_capacity, "invalid desired local bypass address");
+            asteriskd_error_copy(error, error_capacity, "invalid desired local bypass address");
             return ASTERISKD_CONFIG_INVALID;
         }
         if (!address_set_contains(&current, address) && local_bypass_plan_append(
                 plan, ASTERISKD_LOCAL_BYPASS_INSERT,
                 end_rule_number, address) != 0) {
-            set_error(error, error_capacity, "local bypass insertion plan overflow");
+            asteriskd_error_copy(error, error_capacity, "local bypass insertion plan overflow");
             return ASTERISKD_CONFIG_INVALID;
         }
     }
@@ -306,7 +302,7 @@ int asteriskd_local_bypass_plan_build(
         if (!address_set_contains(desired, current.values[index]) && local_bypass_plan_append(
                 plan, ASTERISKD_LOCAL_BYPASS_DELETE,
                 0U, current.values[index]) != 0) {
-            set_error(error, error_capacity, "local bypass deletion plan overflow");
+            asteriskd_error_copy(error, error_capacity, "local bypass deletion plan overflow");
             return ASTERISKD_CONFIG_INVALID;
         }
     }

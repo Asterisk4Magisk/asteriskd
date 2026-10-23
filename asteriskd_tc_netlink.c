@@ -6,10 +6,6 @@
 #include <stdio.h>
 #include <string.h>
 
-static void set_error(char *error, size_t capacity, const char *message) {
-    if (error != NULL && capacity != 0U) (void)snprintf(error, capacity, "%s", message);
-}
-
 struct netlink_header_wire {
     uint32_t length;
     uint16_t type;
@@ -190,7 +186,7 @@ int asteriskd_tc_filter_netlink_decode(
         (*state != ASTERISKD_RULES_SLOT_ABSENT &&
          *state != ASTERISKD_RULES_SLOT_OWNED &&
          *state != ASTERISKD_RULES_SLOT_FOREIGN)) {
-        set_error(error, error_capacity, "invalid TC filter netlink arguments");
+        asteriskd_error_copy(error, error_capacity, "invalid TC filter netlink arguments");
         return ASTERISKD_CONFIG_INVALID;
     }
     const unsigned char *bytes = data;
@@ -228,7 +224,7 @@ int asteriskd_tc_filter_netlink_decode(
 invalid:
     *state = ASTERISKD_RULES_SLOT_FOREIGN;
     *done = false;
-    set_error(error, error_capacity, "invalid TC filter netlink response");
+    asteriskd_error_copy(error, error_capacity, "invalid TC filter netlink response");
     return ASTERISKD_CONFIG_INVALID;
 }
 
@@ -266,7 +262,7 @@ int asteriskd_tc_filter_slot_netlink_decode(
         state == NULL || done == NULL ||
         (*state != ASTERISKD_RULES_SLOT_ABSENT &&
          *state != ASTERISKD_RULES_SLOT_FOREIGN)) {
-        set_error(error, error_capacity, "invalid TC filter slot netlink arguments");
+        asteriskd_error_copy(error, error_capacity, "invalid TC filter slot netlink arguments");
         return ASTERISKD_CONFIG_INVALID;
     }
     const unsigned char *bytes = data;
@@ -304,7 +300,7 @@ int asteriskd_tc_filter_slot_netlink_decode(
 invalid:
     *state = ASTERISKD_RULES_SLOT_FOREIGN;
     *done = false;
-    set_error(error, error_capacity, "invalid TC filter slot netlink response");
+    asteriskd_error_copy(error, error_capacity, "invalid TC filter slot netlink response");
     return ASTERISKD_CONFIG_INVALID;
 }
 
@@ -353,7 +349,7 @@ int asteriskd_tc_qdisc_netlink_decode(
         (*state != ASTERISKD_RULES_SLOT_ABSENT &&
          *state != ASTERISKD_RULES_SLOT_OWNED &&
          *state != ASTERISKD_RULES_SLOT_FOREIGN)) {
-        set_error(error, error_capacity, "invalid TC qdisc netlink arguments");
+        asteriskd_error_copy(error, error_capacity, "invalid TC qdisc netlink arguments");
         return ASTERISKD_CONFIG_INVALID;
     }
     const unsigned char *bytes = data;
@@ -391,6 +387,6 @@ int asteriskd_tc_qdisc_netlink_decode(
 invalid:
     *state = ASTERISKD_RULES_SLOT_FOREIGN;
     *done = false;
-    set_error(error, error_capacity, "invalid TC qdisc netlink response");
+    asteriskd_error_copy(error, error_capacity, "invalid TC qdisc netlink response");
     return ASTERISKD_CONFIG_INVALID;
 }

@@ -55,7 +55,6 @@ static const char *const control_category_names[] = {
 };
 static const unsigned char control_abstract_name[] = "\0asteriskd.control";
 
-static size_t control_bounded_length(const char *, size_t);
 static uint64_t control_deadline_after(uint64_t, uint64_t);
 
 struct control_builder {
@@ -224,7 +223,7 @@ enum asteriskd_control_listener_result asteriskd_control_listener_open(int *out)
 
 static bool control_cli_config_path_valid(const char *path, size_t *length) {
     if (path == NULL || length == NULL) return false;
-    size_t size = control_bounded_length(path, ASTERISKD_MAX_PATH);
+    size_t size = asteriskd_bounded_length(path, ASTERISKD_MAX_PATH);
     if (size == 0U || size >= ASTERISKD_MAX_PATH || path[0] != '/' ||
         size == 1U || path[size - 1U] == '/') return false;
     size_t start = 1U;
@@ -301,13 +300,6 @@ invalid:
     return -1;
 }
 
-static size_t control_bounded_length(const char *value, size_t capacity) {
-    if (value == NULL) return capacity;
-    size_t length = 0U;
-    while (length < capacity && value[length] != '\0') ++length;
-    return length;
-}
-
 static bool control_utf8_valid(const char *bytes, size_t length, bool allow_nul) {
     if (bytes == NULL) return false;
     size_t index = 0U;
@@ -359,7 +351,7 @@ static bool control_message_valid(const char *message, size_t message_length) {
 }
 
 static bool control_request_id_valid(const char *request_id) {
-    size_t length = control_bounded_length(request_id, ASTERISKD_CONTROL_MAX_REQUEST_ID + 1U);
+    size_t length = asteriskd_bounded_length(request_id, ASTERISKD_CONTROL_MAX_REQUEST_ID + 1U);
     if (length == 0U || length > ASTERISKD_CONTROL_MAX_REQUEST_ID) return false;
     for (size_t index = 0U; index < length; ++index) {
         char value = request_id[index];
@@ -431,7 +423,7 @@ static void control_builder_json_bytes(
 }
 
 static void control_builder_json_string(struct control_builder *builder, const char *value) {
-    size_t length = control_bounded_length(value, ASTERISKD_CONTROL_MAX_PAYLOAD + 1U);
+    size_t length = asteriskd_bounded_length(value, ASTERISKD_CONTROL_MAX_PAYLOAD + 1U);
     if (length > ASTERISKD_CONTROL_MAX_PAYLOAD) {
         builder->failed = true;
         return;
@@ -566,8 +558,8 @@ static bool control_error_valid(const struct asteriskd_control_error *error) {
 }
 
 bool asteriskd_control_snapshot_valid(const struct asteriskd_control_snapshot *snapshot) {
-    if (snapshot == NULL || snapshot->dns_enhancement.phase > DNS_WAITING_NETWORK ||
-        snapshot->dns_enhancement.phase < DNS_DISABLED ||
+    if (snapshot == NULL || snapshot->dns_enhancement.phase > ASTERISKD_DNS_PHASE_WAITING_NETWORK ||
+        snapshot->dns_enhancement.phase < ASTERISKD_DNS_PHASE_DISABLED ||
         memchr(snapshot->dns_enhancement.reason, 0, sizeof(snapshot->dns_enhancement.reason)) == NULL) return false;
     if (snapshot == NULL || snapshot->phase < 0 || snapshot->phase >= ASTERISKD_PHASE_COUNT ||
         !control_combination_valid(snapshot->owner, snapshot->core_type, snapshot->mode) ||
@@ -692,7 +684,7 @@ int asteriskd_control_snapshot_from_state(
         snapshot->has_error = true;
         snapshot->error.code = state->failure.code;
         snapshot->error.component = state->failure.component;
-        size_t message_length = control_bounded_length(
+        size_t message_length = asteriskd_bounded_length(
             state->failure.message, sizeof(state->failure.message));
         if (asteriskd_control_error_set_message(
             &snapshot->error, state->failure.message, message_length) != 0) {
@@ -2004,21 +1996,29 @@ static int control_cli_run_control(
 static int control_cli_run_dns(const struct asteriskd_cli_backend *backend, void *context,
     const struct asteriskd_cli_invocation *invocation) {
     struct asteriskd_control_request request = {
-        .method = invocation->command == ASTERISKD_CLI_DNS_SUSPEND ? ASTERISKD_CONTROL_METHOD_DNS_SUSPEND :
-            invocation->command == ASTERISKD_CLI_DNS_RESUME ? ASTERISKD_CONTROL_METHOD_DNS_RESUME : ASTERISKD_CONTROL_METHOD_DNS_ABORT,
-        .instance_id=invocation->instance_id, .cycle_id=invocation->cycle_id, .generation=invocation->generation};
-    snprintf(request.request_id, sizeof(request.request_id), "%s", control_method_names[request.method]);
-    struct control_cli_sink sink = {.backend=backend, .context=context};
+        .method = invocation->command == ASTERISKD_CLI_DNS_SUSPEND
+            ? ASTERISKD_CONTROL_METHOD_DNS_SUSPEND
+            : invocation->command == ASTERISKD_CLI_DNS_RESUME ? ASTERISKD_CONTROL_METHOD_DNS_RESUME
+                                                              : ASTERISKD_CONTROL_METHOD_DNS_ABORT,
+        .instance_id = invocation->instance_id,
+        .cycle_id = invocation->cycle_id,
+        .generation = invocation->generation};
+    snprintf(
+        request.request_id, sizeof(request.request_id), "%s", control_method_names[request.method]);
+    struct control_cli_sink sink = {.backend = backend, .context = context};
     struct asteriskd_control_response response = {0};
-    enum asteriskd_control_client_result result = backend->control_request ?
-        backend->control_request(context, &request, control_cli_line_sink, &sink, &response) : ASTERISKD_CONTROL_CLIENT_IO_ERROR;
+    enum asteriskd_control_client_result result = backend->control_request
+        ? backend->control_request(context, &request, control_cli_line_sink, &sink, &response)
+        : ASTERISKD_CONTROL_CLIENT_IO_ERROR;
     if (result == ASTERISKD_CONTROL_CLIENT_OK) {
         int code = asteriskd_control_result_exit_code(response.result.code);
-        asteriskd_control_response_destroy(&response); return code;
+        asteriskd_control_response_destroy(&response);
+        return code;
     }
     asteriskd_control_response_destroy(&response);
     return control_cli_write_response(backend, context, request.request_id,
-        result == ASTERISKD_CONTROL_CLIENT_ABSENT ? ASTERISKD_CONTROL_RESULT_NOT_RUNNING : ASTERISKD_CONTROL_RESULT_INTERNAL_ERROR,
+        result == ASTERISKD_CONTROL_CLIENT_ABSENT ? ASTERISKD_CONTROL_RESULT_NOT_RUNNING
+                                                  : ASTERISKD_CONTROL_RESULT_INTERNAL_ERROR,
         NULL, "DNS control request failed");
 }
 
@@ -2749,11 +2749,6 @@ bool asteriskd_control_server_drained(
     return server != NULL && control_server_active_clients(server) == 0U;
 }
 
-uint64_t asteriskd_control_server_sequence(
-    const struct asteriskd_control_server *server) {
-    return server == NULL ? 0U : server->sequence;
-}
-
 void asteriskd_control_server_destroy(
     struct asteriskd_control_server *server) {
     if (server == NULL) return;
@@ -2766,41 +2761,3 @@ void asteriskd_control_server_destroy(
     }
     free(server);
 }
-
-#ifdef ASTERISKD_TESTING
-struct control_listener_close_test_context {
-    int listener_closes;
-    int client_closes;
-};
-
-static int control_listener_close_test_fd(void *opaque, int fd) {
-    struct control_listener_close_test_context *context = opaque;
-    if (fd == 10) ++context->listener_closes;
-    if (fd == 11) ++context->client_closes;
-    return 0;
-}
-
-bool asteriskd_test_listener_closes_before_client_drain(void) {
-    static const struct asteriskd_control_transport_backend transport = {
-        .close_fd = control_listener_close_test_fd,
-    };
-    struct control_listener_close_test_context context;
-    memset(&context, 0, sizeof(context));
-    struct asteriskd_control_server *server = calloc(1U, sizeof(*server));
-    if (server == NULL) return false;
-    server->listener_fd = 10;
-    server->accepting = true;
-    server->transport = &transport;
-    server->transport_context = &context;
-    server->clients[0].active = true;
-    server->clients[0].fd = 11;
-
-    asteriskd_control_server_close_listener(server);
-    bool released_before_drain = server->listener_fd == -1 &&
-        !server->accepting && context.listener_closes == 1 &&
-        context.client_closes == 0 && !asteriskd_control_server_drained(server);
-    asteriskd_control_server_destroy(server);
-    return released_before_drain && context.listener_closes == 1 &&
-        context.client_closes == 1;
-}
-#endif

@@ -8,12 +8,10 @@
 #include <string.h>
 
 static int fail(char *error, size_t error_size, const char *format, ...) {
-    if (error != NULL && error_size != 0U) {
-        va_list arguments;
-        va_start(arguments, format);
-        (void)vsnprintf(error, error_size, format, arguments);
-        va_end(arguments);
-    }
+    va_list arguments;
+    va_start(arguments, format);
+    asteriskd_error_vformat(error, error_size, format, arguments);
+    va_end(arguments);
     return ASTERISKD_CONFIG_IO;
 }
 
@@ -72,33 +70,4 @@ int asteriskd_b2s_pin_preflight(
     const char *paths[4U];
     for (size_t index = 0U; index < plan->pin_count; ++index) paths[index] = plan->pins[index].path;
     return preflight_paths(paths, plan->pin_count, backend, error, error_size);
-}
-
-int asteriskd_bpf_pin_cleanup_owned(
-    const char *path,
-    uint64_t expected_object_id,
-    const struct asteriskd_bpf_pin_ownership_backend *backend,
-    char *error,
-    size_t error_size) {
-    if (path == NULL || path[0] != '/' || expected_object_id == 0U || !backend_valid(backend)) {
-        return ASTERISKD_CONFIG_INVALID;
-    }
-    bool exists = true;
-    uint64_t object_id = 0U;
-    if (backend->probe(backend->context, path, &exists, &object_id) != 0) {
-        return fail(error, error_size, "cannot inspect BPF pin %s", path);
-    }
-    if (!exists) return object_id == 0U ? 0 : ASTERISKD_CONFIG_INVALID;
-    if (object_id != expected_object_id) {
-        return fail(error, error_size, "BPF pin identity changed: %s", path);
-    }
-    if (backend->unlink_exact(backend->context, path) != 0) {
-        return fail(error, error_size, "cannot unlink owned BPF pin %s", path);
-    }
-    exists = true;
-    object_id = 0U;
-    if (backend->probe(backend->context, path, &exists, &object_id) != 0 || exists) {
-        return fail(error, error_size, "owned BPF pin remains after unlink: %s", path);
-    }
-    return object_id == 0U ? 0 : ASTERISKD_CONFIG_INVALID;
 }

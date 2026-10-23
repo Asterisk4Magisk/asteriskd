@@ -1,6 +1,7 @@
 // Copyright 2026, Asterisk4Magisk contributors
 // SPDX-License-Identifier: GPL-3.0
 
+#include "asteriskd.h"
 #include "asteriskd_compat.h"
 
 #include <errno.h>
@@ -15,13 +16,10 @@
 #define ASTERISKD_TUN_MINOR 200U
 
 static int tun_error(char *error, size_t capacity, const char *format, ...) {
-    if (error != NULL && capacity != 0U) {
-        va_list arguments;
-        va_start(arguments, format);
-        int written = vsnprintf(error, capacity, format, arguments);
-        va_end(arguments);
-        if (written < 0 || (size_t)written >= capacity) error[capacity - 1U] = '\0';
-    }
+    va_list arguments;
+    va_start(arguments, format);
+    asteriskd_error_vformat(error, capacity, format, arguments);
+    va_end(arguments);
     return -1;
 }
 

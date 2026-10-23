@@ -4,14 +4,6 @@
 #include <stdio.h>
 #include <string.h>
 
-static void set_error(char *error, size_t capacity, const char *format, ...) {
-    if (error == NULL || capacity == 0U) return;
-    va_list arguments;
-    va_start(arguments, format);
-    (void)vsnprintf(error, capacity, format, arguments);
-    va_end(arguments);
-}
-
 static bool interface_name_valid(const char *name) {
     if (name == NULL) return false;
     size_t length = strnlen(name, ASTERISKD_MAX_INTERFACE_NAME);
@@ -31,18 +23,6 @@ static bool interface_name_valid(const char *name) {
 
 static bool slot_valid(enum asteriskd_tc_slot_state slot) {
     return slot >= ASTERISKD_TC_SLOT_ABSENT && slot <= ASTERISKD_TC_SLOT_FOREIGN;
-}
-
-enum asteriskd_tc_qdisc_cleanup_decision asteriskd_tc_qdisc_cleanup_decide(
-    bool ingress_occupied, bool egress_occupied) {
-    return ingress_occupied || egress_occupied
-        ? ASTERISKD_TC_QDISC_CLEANUP_RETAIN_SHARED
-        : ASTERISKD_TC_QDISC_CLEANUP_DELETE;
-}
-
-bool asteriskd_tc_qdisc_cleanup_restored(bool qdisc_present,
-    enum asteriskd_tc_qdisc_cleanup_decision decision) {
-    return !qdisc_present || decision == ASTERISKD_TC_QDISC_CLEANUP_RETAIN_SHARED;
 }
 
 static struct asteriskd_tc_plan_operation *append_operation(
@@ -114,7 +94,7 @@ int asteriskd_tc_install_plan_build(
     const struct asteriskd_config *config, const struct asteriskd_tc_interface_probe *probe,
     struct asteriskd_tc_plan *plan, char *error, size_t error_capacity) {
     if (plan == NULL) {
-        set_error(error, error_capacity, "tc plan output is required");
+        asteriskd_error_format(error, error_capacity, "tc plan output is required");
         return -1;
     }
     memset(plan, 0, sizeof(*plan));
@@ -123,7 +103,7 @@ int asteriskd_tc_install_plan_build(
         !interface_name_valid(probe->interface_name) || probe->interface_index == 0U ||
         probe->route_localnet_value > 1U || !slot_valid(probe->qdisc) ||
         !slot_valid(probe->egress) || !slot_valid(probe->ingress)) {
-        set_error(error, error_capacity, "invalid bpf2socks TC probe");
+        asteriskd_error_format(error, error_capacity, "invalid bpf2socks TC probe");
         return -1;
     }
     if (probe->qdisc == ASTERISKD_TC_SLOT_FOREIGN ||
@@ -131,13 +111,13 @@ int asteriskd_tc_install_plan_build(
         probe->ingress == ASTERISKD_TC_SLOT_FOREIGN ||
         probe->egress == ASTERISKD_TC_SLOT_COMPATIBLE ||
         probe->ingress == ASTERISKD_TC_SLOT_COMPATIBLE) {
-        set_error(error, error_capacity, "foreign TC resource collision");
+        asteriskd_error_format(error, error_capacity, "foreign TC resource collision");
         return -1;
     }
     if ((probe->egress == ASTERISKD_TC_SLOT_OWNED ||
          probe->ingress == ASTERISKD_TC_SLOT_OWNED) &&
         probe->qdisc == ASTERISKD_TC_SLOT_ABSENT) {
-        set_error(error, error_capacity, "TC filter exists without clsact");
+        asteriskd_error_format(error, error_capacity, "TC filter exists without clsact");
         return -1;
     }
     if (probe->route_localnet_value == 0U && append_route_localnet(plan, probe) != 0) goto failed;
@@ -150,38 +130,6 @@ int asteriskd_tc_install_plan_build(
 
 failed:
     memset(plan, 0, sizeof(*plan));
-    set_error(error, error_capacity, "too many TC plan operations");
+    asteriskd_error_format(error, error_capacity, "too many TC plan operations");
     return -1;
-}
-
-int asteriskd_tc_cleanup_plan_build(
-    const struct asteriskd_tc_plan *install, struct asteriskd_tc_plan *cleanup) {
-    if (cleanup == NULL) return -1;
-    memset(cleanup, 0, sizeof(*cleanup));
-    if (install == NULL || install->operation_count >
-        sizeof(install->operations) / sizeof(install->operations[0])) return -1;
-    for (size_t index = install->operation_count; index > 0U; --index) {
-        const struct asteriskd_tc_plan_operation *source = &install->operations[index - 1U];
-        struct asteriskd_tc_plan_operation *destination =
-            &cleanup->operations[cleanup->operation_count++];
-        *destination = *source;
-        switch (source->kind) {
-            case ASTERISKD_TC_PLAN_SET_ROUTE_LOCALNET:
-                destination->kind = ASTERISKD_TC_PLAN_RESTORE_ROUTE_LOCALNET;
-                break;
-            case ASTERISKD_TC_PLAN_CREATE_CLSACT:
-                destination->kind = ASTERISKD_TC_PLAN_REMOVE_CLSACT;
-                break;
-            case ASTERISKD_TC_PLAN_CREATE_EGRESS:
-                destination->kind = ASTERISKD_TC_PLAN_REMOVE_EGRESS;
-                break;
-            case ASTERISKD_TC_PLAN_CREATE_INGRESS:
-                destination->kind = ASTERISKD_TC_PLAN_REMOVE_INGRESS;
-                break;
-            default:
-                memset(cleanup, 0, sizeof(*cleanup));
-                return -1;
-        }
-    }
-    return 0;
 }

@@ -35,10 +35,6 @@ struct network_nlmsg_header {
 
 _Static_assert(sizeof(struct network_nlmsg_header) == 16U, "netlink header ABI");
 
-static void network_error(char *error, size_t error_size, const char *message) {
-    if (error != NULL && error_size != 0U) (void)snprintf(error, error_size, "%s", message);
-}
-
 static bool backend_valid(const struct asteriskd_network_backend *backend) {
     return backend != NULL && backend->open != NULL && backend->receive != NULL &&
         backend->interface_name != NULL && backend->close != NULL;
@@ -75,7 +71,7 @@ int asteriskd_network_open(
     if (runtime != NULL) memset(runtime, 0, sizeof(*runtime));
     if (error != NULL && error_size != 0U) error[0] = '\0';
     if (config == NULL || !backend_valid(backend) || runtime == NULL) {
-        network_error(error, error_size, "invalid network runtime input");
+        asteriskd_error_copy(error, error_size, "invalid network runtime input");
         return ASTERISKD_CONFIG_INVALID;
     }
     runtime->fd = -1;
@@ -85,7 +81,7 @@ int asteriskd_network_open(
     runtime->pending_batch_storage = calloc(1U, sizeof(*runtime->pending_batch_storage));
     if (runtime->pending_batch_storage == NULL) {
         memset(runtime, 0, sizeof(*runtime));
-        network_error(error, error_size, "network runtime allocation failed");
+        asteriskd_error_copy(error, error_size, "network runtime allocation failed");
         return ASTERISKD_CONFIG_NO_MEMORY;
     }
     if (runtime->groups == 0U) {
@@ -100,7 +96,7 @@ int asteriskd_network_open(
             &fd) != 0 || fd < 0) {
         free(runtime->pending_batch_storage);
         memset(runtime, 0, sizeof(*runtime));
-        network_error(error, error_size, "network socket open failed");
+        asteriskd_error_copy(error, error_size, "network socket open failed");
         return ASTERISKD_CONFIG_IO;
     }
     runtime->fd = fd;
@@ -234,14 +230,14 @@ static int queue_immediate_request(void *opaque,
         request->effect.kind != ASTERISKD_EFFECT_SYSCTL ||
         request->effect.resource.sysctl.sysctl_id !=
             ASTERISKD_SYSCTL_DISABLE_IPV6) {
-        network_error(error, error_size, "invalid immediate network request");
+        asteriskd_error_copy(error, error_size, "invalid immediate network request");
         return ASTERISKD_CONFIG_INVALID;
     }
     for (size_t index = 0U; index < runtime->immediate_request_count; ++index) {
         if (immediate_request_same(&runtime->immediate_requests[index], request)) return 0;
     }
     if (runtime->immediate_request_count >= ASTERISKD_MAX_NETWORK_IMMEDIATE_REQUESTS) {
-        network_error(error, error_size, "immediate network request capacity exceeded");
+        asteriskd_error_copy(error, error_size, "immediate network request capacity exceeded");
         return ASTERISKD_CONFIG_INVALID;
     }
     runtime->immediate_requests[runtime->immediate_request_count++] = *request;
@@ -443,7 +439,7 @@ int asteriskd_network_handle(
     size_t error_size) {
     if (error != NULL && error_size != 0U) error[0] = '\0';
     if (runtime == NULL || runtime->backend == NULL || runtime->pending_batch_storage == NULL) {
-        network_error(error, error_size, "invalid network handle input");
+        asteriskd_error_copy(error, error_size, "invalid network handle input");
         return ASTERISKD_CONFIG_INVALID;
     }
     if (runtime->no_op) return 0;
@@ -469,10 +465,10 @@ int asteriskd_network_handle(
             asteriskd_network_reopen(runtime, now_milliseconds, error, error_size) == 0) {
             continue;
         }
-        network_error(error, error_size, "network receive failed");
+        asteriskd_error_copy(error, error_size, "network receive failed");
         return ASTERISKD_CONFIG_IO;
     }
-    network_error(error, error_size, "network event deadline overflow");
+    asteriskd_error_copy(error, error_size, "network event deadline overflow");
     return ASTERISKD_CONFIG_INVALID;
 }
 
@@ -482,14 +478,14 @@ int asteriskd_network_reopen(
     if (error != NULL && error_size != 0U) error[0] = '\0';
     if (runtime == NULL || runtime->backend == NULL || runtime->no_op ||
         !runtime->fd_owned || runtime->backend->open == NULL || runtime->backend->close == NULL) {
-        network_error(error, error_size, "invalid network reopen input");
+        asteriskd_error_copy(error, error_size, "invalid network reopen input");
         return ASTERISKD_CONFIG_INVALID;
     }
     int old_fd = runtime->fd;
     runtime->fd = -1;
     runtime->fd_owned = false;
     if (runtime->backend->close(runtime->backend->context, old_fd) != 0) {
-        network_error(error, error_size, "network close before reopen failed");
+        asteriskd_error_copy(error, error_size, "network close before reopen failed");
         return ASTERISKD_CONFIG_IO;
     }
     int new_fd = -1;
@@ -498,13 +494,13 @@ int asteriskd_network_reopen(
         ASTERISKD_NETWORK_SOCKET_RAW | ASTERISKD_NETWORK_SOCKET_NONBLOCK |
             ASTERISKD_NETWORK_SOCKET_CLOEXEC,
         &new_fd) != 0 || new_fd < 0) {
-        network_error(error, error_size, "network reopen failed");
+        asteriskd_error_copy(error, error_size, "network reopen failed");
         return ASTERISKD_CONFIG_IO;
     }
     runtime->fd = new_fd;
     runtime->fd_owned = true;
     if (asteriskd_network_note(runtime, NULL, true, now_milliseconds) != 0) {
-        network_error(error, error_size, "network reopen deadline overflow");
+        asteriskd_error_copy(error, error_size, "network reopen deadline overflow");
         return ASTERISKD_CONFIG_INVALID;
     }
     return 0;
@@ -529,7 +525,7 @@ int asteriskd_network_apply_immediate(
         (runtime->immediate_request_count != 0U &&
             (runtime->effect_sink == NULL ||
              runtime->effect_sink->dispatch == NULL))) {
-        network_error(error, error_size, "invalid immediate network apply input");
+        asteriskd_error_copy(error, error_size, "invalid immediate network apply input");
         return ASTERISKD_CONFIG_INVALID;
     }
     while (runtime->immediate_request_count != 0U) {

@@ -198,23 +198,6 @@ static bool asteriskd_cron_day_matches(
     return day_of_month || day_of_week;
 }
 
-bool asteriskd_cron_matches(
-    const struct asteriskd_cron_expression *expression, const struct tm *value) {
-    if (expression == NULL || value == NULL ||
-        value->tm_min < 0 || value->tm_min > 59 ||
-        value->tm_hour < 0 || value->tm_hour > 23 ||
-        value->tm_mon < 0 || value->tm_mon > 11) {
-        return false;
-    }
-    return asteriskd_cron_mask_has(
-            expression->minutes, (unsigned int)value->tm_min, 0U) &&
-        asteriskd_cron_mask_has(
-            expression->hours, (unsigned int)value->tm_hour, 0U) &&
-        asteriskd_cron_mask_has(
-            expression->months, (unsigned int)value->tm_mon + 1U, 1U) &&
-        asteriskd_cron_day_matches(expression, value);
-}
-
 static bool asteriskd_cron_localtime(time_t epoch, struct tm *value) {
 #if defined(_WIN32)
     return localtime_s(value, &epoch) == 0;

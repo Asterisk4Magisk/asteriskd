@@ -4,6 +4,7 @@
 #ifndef ASTERISKD_H
 #define ASTERISKD_H
 
+#include <stdarg.h>
 #include <stdbool.h>
 #include "asteriskd_dns.h"
 #include "asteriskd_marks.h"
@@ -32,25 +33,18 @@ struct asteriskd_resource_operation;
 #define ASTERISKD_MAX_ADDRESSES 256U
 #define ASTERISKD_MAX_CHAIN_NAME 29U
 #define ASTERISKD_MAX_NETWORK_EVENTS 16U
-#define ASTERISKD_MAX_EMERGENCY_PROCESSES 8U
 #define ASTERISKD_MAX_COMMAND_MARKER 256U
 #define ASTERISKD_SYNC_DEBOUNCE_MILLIS 1500
 #define ASTERISKD_STATE_VERSION 2U
-#define ASTERISKD_LEGACY_ROUTE_LOCALNET_LEAF "asteriskd.state.route-localnet"
 #define ASTERISKD_MAX_CHILD_ARGV 16U
 #define ASTERISKD_MAX_PROCESS_ARGV 32U
 #define ASTERISKD_MAX_CHILD_ARG 512U
 #define ASTERISKD_MAX_STATE_MESSAGE 4096U
-#define ASTERISKD_MAX_HEX_ID 129U
-#define ASTERISKD_BPF_PROGRAM_TAG_HEX_LENGTH 16U
 #define ASTERISKD_TC_BPF_FLAG_ACT_DIRECT UINT32_C(1)
 #define ASTERISKD_TC_PARENT_CLSACT_INGRESS UINT32_C(0xfffffff2)
 #define ASTERISKD_TC_PARENT_CLSACT_EGRESS UINT32_C(0xfffffff3)
 #define ASTERISKD_TC_PARENT_CLSACT UINT32_C(0xfffffff1)
 #define ASTERISKD_TC_HANDLE_CLSACT UINT32_C(0xffff0000)
-#define ASTERISKD_LOG_MAX_CHILD_LINE 16384U
-#define ASTERISKD_LOG_MAX_BUFFERED_PER_CHILD 65536U
-#define ASTERISKD_LOG_PARTIAL_TIMEOUT_MILLIS 2000U
 #define ASTERISKD_LOG_REDACTION "[REDACTED]"
 #define ASTERISKD_CONTROL_PROTOCOL_VERSION 2U
 #define ASTERISKD_CONTROL_MAX_PAYLOAD 65536U
@@ -75,12 +69,10 @@ struct asteriskd_resource_operation;
 #define ASTERISKD_ANONYMOUS_REQUIRED_SEALS (ASTERISKD_ANONYMOUS_SEAL_WRITE | \
     ASTERISKD_ANONYMOUS_SEAL_GROW | ASTERISKD_ANONYMOUS_SEAL_SHRINK | \
     ASTERISKD_ANONYMOUS_SEAL_SEAL)
-#define ASTERISKD_IPTABLES_WAIT_SECONDS 100U
 #define ASTERISKD_ROUTE_RULE_PRIORITY 14599U
 #define ASTERISKD_DNS_ROUTE_RULE_PRIORITY 12999U
 #define ASTERISKD_TPROXY_TABLE 160U
 #define ASTERISKD_TUN_TABLE 168U
-#define ASTERISKD_RULE_PLAN_MAX_OPERATIONS 32U
 #define ASTERISKD_RULE_TRANSACTION_MAX_GROUPS 12U
 #define ASTERISKD_RULE_TRANSACTION_MAX_NAMES 4U
 #define ASTERISKD_RULE_TRANSACTION_MAX_HOOKS 4U
@@ -105,12 +97,9 @@ struct asteriskd_resource_operation;
 #define ASTERISKD_LIFECYCLE_HELPER_EXITED (-6)
 
 #define ASTERISKD_STATE_OK 0
-#define ASTERISKD_STATE_NOT_FOUND 1
 #define ASTERISKD_STATE_INVALID (-20)
-#define ASTERISKD_STATE_INCOMPATIBLE (-21)
 #define ASTERISKD_STATE_IO (-22)
 #define ASTERISKD_STATE_NO_MEMORY (-23)
-#define ASTERISKD_STATE_WRITE_BLOCKED (-24)
 
 #define ASTERISKD_LOG_OK 0
 #define ASTERISKD_LOG_INVALID (-30)
@@ -138,8 +127,6 @@ struct asteriskd_cron_expression {
 };
 
 int asteriskd_cron_parse(const char *, struct asteriskd_cron_expression *);
-bool asteriskd_cron_matches(
-    const struct asteriskd_cron_expression *, const struct tm *);
 int asteriskd_cron_next(
     const struct asteriskd_cron_expression *, time_t, time_t *);
 int asteriskd_cron_latest_between(
@@ -422,98 +409,6 @@ struct asteriskd_config {
 
 };
 
-enum asteriskd_rule_plan_operation_kind {
-    ASTERISKD_RULE_PLAN_PREPARE_PRIVATE,
-    ASTERISKD_RULE_PLAN_PREPARE_LOCAL_BYPASS,
-    ASTERISKD_RULE_PLAN_PREPARE_MATCHER,
-    ASTERISKD_RULE_PLAN_PREPARE_ROUTE,
-    ASTERISKD_RULE_PLAN_PREPARE_HELPER_TC,
-    ASTERISKD_RULE_PLAN_POPULATE_POLICY,
-    ASTERISKD_RULE_PLAN_POPULATE_DNS,
-    ASTERISKD_RULE_PLAN_POPULATE_FAKE_DNS,
-    ASTERISKD_RULE_PLAN_ACTIVATE_MAIN,
-    ASTERISKD_RULE_PLAN_ACTIVATE_DNS,
-    ASTERISKD_RULE_PLAN_ACTIVATE_FAKE_DNS,
-    ASTERISKD_RULE_PLAN_QUIESCE_MAIN,
-    ASTERISKD_RULE_PLAN_QUIESCE_DNS,
-    ASTERISKD_RULE_PLAN_QUIESCE_FAKE_DNS,
-    ASTERISKD_RULE_PLAN_REMOVE_PRIVATE,
-};
-
-struct asteriskd_rule_plan_operation {
-    enum asteriskd_rule_plan_operation_kind kind;
-    bool traffic_activation;
-};
-
-struct asteriskd_rule_plan {
-    bool no_op;
-    bool enable_ipv6;
-    bool uses_matcher;
-    bool uses_helper_tc;
-    uint32_t iptables_wait_seconds;
-    uint32_t route_rule_priority;
-    uint32_t primary_mark;
-    uint32_t mark_mask;
-    uint32_t routing_table;
-    char tunnel_name[ASTERISKD_MAX_TUNNEL_NAME];
-    bool has_token_ipv6_route;
-    char token_ipv6_prefix[ASTERISKD_MAX_CIDR];
-    struct asteriskd_rule_plan_operation operations[ASTERISKD_RULE_PLAN_MAX_OPERATIONS];
-    size_t operation_count;
-    size_t first_activation;
-};
-
-int asteriskd_rule_plan_build(
-    const struct asteriskd_config *, bool, struct asteriskd_rule_plan *);
-int asteriskd_rule_quiesce_plan_build(
-    const struct asteriskd_rule_plan *, struct asteriskd_rule_plan *);
-size_t asteriskd_default_bypass_cidr_count(void);
-const char *asteriskd_default_bypass_cidr(size_t);
-
-enum asteriskd_packet_direction {
-    ASTERISKD_PACKET_PREROUTING,
-    ASTERISKD_PACKET_OUTPUT,
-};
-
-enum asteriskd_packet_protocol {
-    ASTERISKD_PACKET_TCP,
-    ASTERISKD_PACKET_UDP,
-    ASTERISKD_PACKET_ICMP,
-};
-
-enum asteriskd_packet_action {
-    ASTERISKD_PACKET_NONE,
-    ASTERISKD_PACKET_RETURN,
-    ASTERISKD_PACKET_MARK_PRIMARY,
-    ASTERISKD_PACKET_TPROXY,
-    ASTERISKD_PACKET_DROP,
-    ASTERISKD_PACKET_REJECT,
-    ASTERISKD_PACKET_FAKE_DNS_REDIRECT,
-};
-
-struct asteriskd_packet_model_input {
-    enum asteriskd_packet_direction direction;
-    enum asteriskd_packet_protocol protocol;
-    bool ipv6;
-    bool destination_port_53;
-    bool icmp_echo;
-    bool bypass_uid;
-    bool uid_listed;
-    bool core_gid;
-    bool local_address;
-    bool proxy_private;
-    bool bypass_private;
-    bool primary_marked;
-    bool output_virtual_interface;
-    bool output_ignored_interface;
-    bool hotspot_input;
-    bool matcher_selected;
-};
-
-int asteriskd_packet_model_decide(
-    const struct asteriskd_config *, const struct asteriskd_rule_plan *,
-    const struct asteriskd_packet_model_input *, enum asteriskd_packet_action *);
-
 struct asteriskd_lifecycle_backend {
     int (*acquire)(void *);
     int (*start_core)(void *);
@@ -624,22 +519,7 @@ struct asteriskd_loaded_config {
     void *close_context;
 };
 
-struct asteriskd_config_load_backend {
-    int (*open_directory)(void *, const char *, int *, uint64_t *, uint64_t *);
-    int (*read_config)(void *, int, const char *, char **, size_t *, int *, uint64_t *, uint64_t *);
-    int (*validate_files)(void *, const struct asteriskd_config *, int);
-    int (*read_resource)(void *, int, const char *, char **, size_t *);
-    void (*close_fd)(void *, int);
-};
-
 int asteriskd_config_load(const char *, struct asteriskd_loaded_config *, char *, size_t);
-int asteriskd_config_load_with_backend(
-    const char *,
-    struct asteriskd_loaded_config *,
-    const struct asteriskd_config_load_backend *,
-    void *,
-    char *,
-    size_t);
 void asteriskd_loaded_config_release(struct asteriskd_loaded_config *);
 void asteriskd_runtime_directory_release(struct asteriskd_runtime_directory *);
 int asteriskd_runtime_directory_open(
@@ -671,7 +551,6 @@ int asteriskd_file_requirements_validate(
     bool,
     bool,
     bool);
-int asteriskd_load_config(const char *, struct asteriskd_config *, char *, size_t);
 
 enum asteriskd_process_output_mode {
     ASTERISKD_PROCESS_OUTPUT_CAPTURE,
@@ -701,6 +580,42 @@ struct asteriskd_anonymous_document {
     unsigned char *bytes;
     size_t length;
 };
+
+/* Shared helpers (asteriskd_util.c). Error writers are no-ops for NULL or empty buffers. */
+void asteriskd_error_copy(char *error, size_t error_size, const char *message);
+void asteriskd_error_format(char *error, size_t error_size, const char *format, ...)
+    __attribute__((format(printf, 3, 4)));
+void asteriskd_error_vformat(char *error, size_t error_size, const char *format, va_list arguments)
+    __attribute__((format(printf, 3, 0)));
+size_t asteriskd_bounded_length(const char *value, size_t capacity);
+/* Copies a nonempty string that fits capacity, including its terminator; -1 otherwise. */
+int asteriskd_copy_string(char *destination, size_t capacity, const char *source);
+int asteriskd_compare_u32(const void *left, const void *right);
+
+/* Document text writer (asteriskd_text.c). Failures latch into result. */
+struct asteriskd_text_writer {
+    unsigned char *bytes;
+    size_t length;
+    size_t capacity;
+    int result;
+};
+void asteriskd_text_writer_bytes(struct asteriskd_text_writer *, const char *, size_t);
+void asteriskd_text_writer_literal(struct asteriskd_text_writer *, const char *);
+void asteriskd_text_writer_format(struct asteriskd_text_writer *, const char *, ...)
+    __attribute__((format(printf, 2, 3)));
+void asteriskd_text_writer_json_string(struct asteriskd_text_writer *, const char *);
+void asteriskd_text_writer_yaml_string(struct asteriskd_text_writer *, const char *);
+int asteriskd_text_writer_take(
+    struct asteriskd_text_writer *, struct asteriskd_anonymous_document *);
+
+#define ASTERISKD_BYTE_BUFFER_MAX_BYTES (8U * 1024U * 1024U)
+struct asteriskd_byte_buffer {
+    unsigned char *bytes;
+    size_t length;
+    size_t capacity;
+};
+void asteriskd_byte_buffer_destroy(struct asteriskd_byte_buffer *);
+int asteriskd_byte_buffer_append(struct asteriskd_byte_buffer *, const void *, size_t);
 
 struct asteriskd_helper_documents {
     struct asteriskd_anonymous_document config;
@@ -759,6 +674,8 @@ int asteriskd_process_environment_add(
     struct asteriskd_process_spec *, const char *, const char *);
 int asteriskd_process_argument_add(
     struct asteriskd_process_spec *, const char *);
+/* Maps an owned descriptor to a fixed child descriptor number; both must be unique. */
+int asteriskd_process_inherit_fd(struct asteriskd_process_spec *, int source, int target);
 int asteriskd_process_core_log_path(
     const struct asteriskd_process_spec *, char *, size_t);
 int asteriskd_log_sibling_path(const char *, const char *, char *, size_t);
@@ -1041,15 +958,6 @@ int asteriskd_child_exit_status_from_wait(int, struct asteriskd_child_exit_statu
 void asteriskd_child_setup_stream_init(struct asteriskd_child_setup_stream *);
 int asteriskd_child_setup_stream_feed(
     struct asteriskd_child_setup_stream *, const void *, size_t, bool);
-#if defined(ASTERISKD_TESTING)
-bool asteriskd_test_action_identity_wait_can_retry(bool, int64_t, int64_t);
-int asteriskd_test_action_post_setup(
-    const struct asteriskd_child_setup_stream *, bool,
-    const struct asteriskd_child_exit_status *, int *);
-int asteriskd_test_action_post_identity(
-    int, int, const struct asteriskd_child_setup_stream *, bool,
-    const struct asteriskd_child_exit_status *, int *);
-#endif
 
 struct asteriskd_stop_role_state {
     bool present;
@@ -1513,8 +1421,6 @@ struct asteriskd_rule_transaction_plan {
 
 int asteriskd_rule_transaction_plan_build(
     const struct asteriskd_config *, bool, struct asteriskd_rule_transaction_plan *);
-int asteriskd_rule_transaction_quiesce_plan_build(
-    const struct asteriskd_rule_transaction_plan *, struct asteriskd_rule_transaction_plan *);
 int asteriskd_tproxy_rule_transaction_plan_build(
     const struct asteriskd_config *, bool, struct asteriskd_rule_transaction_plan *);
 int asteriskd_tun_rule_transaction_plan_build(
@@ -1568,8 +1474,6 @@ int asteriskd_xtables_private_chain_counts(
     const char *, size_t, const char *, size_t *, size_t *);
 size_t asteriskd_xtables_hook_arguments(
     const struct asteriskd_traffic_hook *, const char **);
-int asteriskd_xtables_rule_output_count(
-    const char *, size_t, const char *, const char *const *, size_t, size_t *);
 int asteriskd_xtables_rule_output_locate(
     const char *, size_t, const char *, const char *const *, size_t, size_t *, size_t *);
 int asteriskd_rules_install(struct asteriskd_rules_runtime *,
@@ -1598,13 +1502,6 @@ enum asteriskd_poll_source_kind {
     ASTERISKD_POLL_SOURCE_KIND_COUNT,
 };
 
-#if defined(ASTERISKD_TESTING)
-bool asteriskd_test_action_source_active(
-    bool, bool, enum asteriskd_poll_source_kind);
-bool asteriskd_test_action_setup_wait_done(
-    const struct asteriskd_child_setup_stream *, bool);
-bool asteriskd_test_action_io_drained(bool, bool, bool, bool);
-#endif
 
 struct asteriskd_poll_source {
     int fd;
@@ -1650,19 +1547,6 @@ struct asteriskd_runtime_delta {
     char error_message[256U];
 };
 
-#if defined(ASTERISKD_TESTING)
-int asteriskd_test_start_failure_detail(
-    int, const char *, struct asteriskd_runtime_delta *);
-int asteriskd_test_capability_path_search_result(bool, bool);
-int asteriskd_test_capability_inspect_error(int);
-int asteriskd_test_periodic_deadline(int64_t, int64_t, uint32_t, int64_t *);
-unsigned asteriskd_test_runtime_dispatch_priority(enum asteriskd_poll_source_kind);
-bool asteriskd_test_startup_components_verified(
-    bool, bool, bool, bool, bool, bool, bool, bool, bool);
-bool asteriskd_test_admission_reconcile_ready(bool, bool);
-bool asteriskd_test_owned_hook_rule_probe_required(
-    const struct asteriskd_owned_hook *, bool);
-#endif
 
 enum asteriskd_reactor_wait_result {
     ASTERISKD_REACTOR_WAIT_ERROR = -1,
@@ -1699,25 +1583,6 @@ int asteriskd_runtime_pump_until(
 int asteriskd_runtime_accept_delta(
     struct asteriskd_runtime *, const struct asteriskd_runtime_delta *);
 void asteriskd_runtime_destroy(struct asteriskd_runtime *);
-
-enum asteriskd_route_slot_state {
-    ASTERISKD_ROUTE_SLOT_ABSENT,
-    ASTERISKD_ROUTE_SLOT_OWNED,
-    ASTERISKD_ROUTE_SLOT_FOREIGN,
-};
-
-struct asteriskd_token_route_plan {
-    bool create;
-    char prefix[ASTERISKD_MAX_CIDR];
-    char interface_name[ASTERISKD_MAX_INTERFACE_NAME];
-    uint32_t interface_index;
-    bool local_table;
-    struct asteriskd_resource_operation operation;
-};
-
-int asteriskd_b2s_token_route_plan_build(
-    const struct asteriskd_config *, enum asteriskd_route_slot_state, uint32_t,
-    struct asteriskd_token_route_plan *, char *, size_t);
 
 struct asteriskd_state_children {
     bool core_present;
@@ -2011,10 +1876,6 @@ int asteriskd_rule_batch_document_render(
     const unsigned char *, size_t,
     unsigned char **, size_t *);
 
-#if defined(ASTERISKD_TESTING)
-int asteriskd_test_rule_batch_document(
-    const char *, const char *, const char *, const char *, char **, size_t *);
-#endif
 
 enum asteriskd_runtime_effect_result {
     ASTERISKD_RUNTIME_EFFECT_READINESS_TIMEOUT = -100,
@@ -2029,9 +1890,6 @@ int asteriskd_runtime_start_system(
     const char *, bool *, struct asteriskd_control_result *);
 int asteriskd_runtime_monitor_system(
     const char *, bool *, struct asteriskd_control_result *);
-#if defined(ASTERISKD_TESTING)
-bool asteriskd_test_cycle_failure_requires_shutdown(bool, bool);
-#endif
 
 enum asteriskd_control_backend_result {
     ASTERISKD_CONTROL_BACKEND_OK = 0,
@@ -2211,8 +2069,6 @@ int asteriskd_control_server_finish_stop(
     const struct asteriskd_control_result *, uint64_t);
 bool asteriskd_control_server_drained(
     const struct asteriskd_control_server *);
-uint64_t asteriskd_control_server_sequence(
-    const struct asteriskd_control_server *);
 void asteriskd_control_server_destroy(
     struct asteriskd_control_server *);
 
@@ -2327,16 +2183,6 @@ int asteriskd_log_open_append_fd_with_backend(
     const char *, const struct asteriskd_log_file_backend *, void *,
     int *, char *, size_t);
 
-struct asteriskd_log_partial {
-    unsigned char bytes[ASTERISKD_LOG_MAX_CHILD_LINE + ASTERISKD_MAX_SECRET_KEY - 1U];
-    size_t kept_length;
-    size_t raw_length;
-    uint64_t first_byte_milliseconds;
-    bool has_first_byte;
-    bool last_raw_was_cr;
-    bool truncated;
-};
-
 struct asteriskd_logger {
     int fd;
     bool fd_owned;
@@ -2352,7 +2198,6 @@ struct asteriskd_logger {
     struct asteriskd_clock_backend clock;
     const struct asteriskd_log_file_backend *file_backend;
     void *file_context;
-    struct asteriskd_log_partial partials[2][ASTERISKD_LOG_STREAM_COUNT];
 };
 
 int asteriskd_log_open(
@@ -2369,11 +2214,7 @@ void asteriskd_log_diagnostic(
     int (*)(void *, const char *, size_t), void *);
 void asteriskd_log_stderr(
     enum asteriskd_log_level, enum asteriskd_component, const char *);
-int asteriskd_log_child_bytes(
-    struct asteriskd_logger *, enum asteriskd_child_role, enum asteriskd_log_stream,
-    const unsigned char *, size_t, uint64_t, bool);
 int asteriskd_log_flush_expired(struct asteriskd_logger *, uint64_t);
-size_t asteriskd_log_buffered_bytes(const struct asteriskd_logger *, enum asteriskd_child_role);
 int asteriskd_log_close(struct asteriskd_logger *);
 
 struct asteriskd_address_set {
@@ -2533,13 +2374,6 @@ int asteriskd_matcher_pin_preflight(
 int asteriskd_b2s_pin_preflight(
     const struct asteriskd_b2s_pin_plan *,
     const struct asteriskd_bpf_pin_ownership_backend *, char *, size_t);
-int asteriskd_bpf_pin_cleanup_owned(
-    const char *, uint64_t, const struct asteriskd_bpf_pin_ownership_backend *, char *, size_t);
-int asteriskd_matcher_verify_residue(
-    const struct asteriskd_config *, const struct asteriskd_matcher_pin_plan *,
-    const struct asteriskd_bpf_program_backend *,
-    const struct asteriskd_bpf_pin_ownership_backend *,
-    struct asteriskd_matcher_verification *, char *, size_t);
 int asteriskd_b2s_verify_residue(
     const struct asteriskd_config *, const struct asteriskd_b2s_pin_plan *,
     const struct asteriskd_bpf_program_backend *,
@@ -2624,7 +2458,6 @@ const struct asteriskd_network_backend *asteriskd_system_network_backend(void);
 
 #define ASTERISKD_HOTSPOT_TC_PRIORITY 1U
 #define ASTERISKD_HOTSPOT_TC_HANDLE 1U
-#define ASTERISKD_ETH_PROTOCOL_IPV6 UINT32_C(0x86dd)
 #define ASTERISKD_ETH_PROTOCOL_ALL UINT32_C(0x0003)
 
 enum asteriskd_hotspot_ipv6_offload_policy {
@@ -2644,20 +2477,11 @@ enum asteriskd_tc_slot_state {
     ASTERISKD_TC_SLOT_FOREIGN,
 };
 
-enum asteriskd_tc_qdisc_cleanup_decision {
-    ASTERISKD_TC_QDISC_CLEANUP_DELETE,
-    ASTERISKD_TC_QDISC_CLEANUP_RETAIN_SHARED,
-};
-
 enum asteriskd_tc_plan_operation_kind {
     ASTERISKD_TC_PLAN_SET_ROUTE_LOCALNET,
     ASTERISKD_TC_PLAN_CREATE_CLSACT,
     ASTERISKD_TC_PLAN_CREATE_EGRESS,
     ASTERISKD_TC_PLAN_CREATE_INGRESS,
-    ASTERISKD_TC_PLAN_REMOVE_INGRESS,
-    ASTERISKD_TC_PLAN_REMOVE_EGRESS,
-    ASTERISKD_TC_PLAN_REMOVE_CLSACT,
-    ASTERISKD_TC_PLAN_RESTORE_ROUTE_LOCALNET,
 };
 
 struct asteriskd_tc_interface_probe {
@@ -2685,12 +2509,6 @@ struct asteriskd_tc_plan {
 int asteriskd_tc_install_plan_build(
     const struct asteriskd_config *, const struct asteriskd_tc_interface_probe *,
     struct asteriskd_tc_plan *, char *, size_t);
-int asteriskd_tc_cleanup_plan_build(
-    const struct asteriskd_tc_plan *, struct asteriskd_tc_plan *);
-enum asteriskd_tc_qdisc_cleanup_decision asteriskd_tc_qdisc_cleanup_decide(
-    bool ingress_occupied, bool egress_occupied);
-bool asteriskd_tc_qdisc_cleanup_restored(bool qdisc_present,
-    enum asteriskd_tc_qdisc_cleanup_decision decision);
 
 struct asteriskd_tc_filter_expectation {
     uint32_t interface_index;

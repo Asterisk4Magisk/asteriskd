@@ -6,8 +6,8 @@
 #include <stddef.h>
 struct asteriskd_keyguard_monitor;
 typedef void (*asteriskd_keyguard_changed)(void *, bool locked, bool baseline);
-int asteriskd_keyguard_open(struct asteriskd_keyguard_monitor **,
-    asteriskd_keyguard_changed, void *, char *, size_t);
+int asteriskd_keyguard_open(
+    struct asteriskd_keyguard_monitor **, asteriskd_keyguard_changed, void *, char *, size_t);
 int asteriskd_keyguard_fd(const struct asteriskd_keyguard_monitor *);
 int asteriskd_keyguard_dispatch(struct asteriskd_keyguard_monitor *);
 void asteriskd_keyguard_close(struct asteriskd_keyguard_monitor *);

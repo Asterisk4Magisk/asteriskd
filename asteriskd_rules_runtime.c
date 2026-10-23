@@ -373,14 +373,6 @@ int asteriskd_xtables_rule_output_locate(
     return 0;
 }
 
-int asteriskd_xtables_rule_output_count(
-    const char *bytes, size_t length, const char *chain,
-    const char *const *arguments, size_t argument_count, size_t *matches) {
-    size_t position = 0U;
-    return asteriskd_xtables_rule_output_locate(
-        bytes, length, chain, arguments, argument_count, matches, &position);
-}
-
 void asteriskd_rules_runtime_init(struct asteriskd_rules_runtime *runtime) {
     if (runtime == NULL) return;
     memset(runtime, 0, sizeof(*runtime));

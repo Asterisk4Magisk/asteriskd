@@ -17,10 +17,6 @@ static bool tag_nonzero(const unsigned char tag[ASTERISKD_BPF_PROGRAM_TAG_SIZE])
     return false;
 }
 
-static void set_error(char *error, size_t capacity, const char *message) {
-    if (error != NULL && capacity != 0U) (void)snprintf(error, capacity, "%s", message);
-}
-
 static int append_pin(
     struct asteriskd_b2s_pin_plan *plan, enum asteriskd_pin_id pin_id,
     const char *root, const char *leaf, bool program, const char *program_name) {
@@ -134,7 +130,7 @@ static int verify_pins(
         (allow_absent && (ownership == NULL || ownership->probe == NULL)) ||
         config->mode != ASTERISKD_MODE_BPF2SOCKS ||
         config->helper.type != ASTERISKD_HELPER_BPF2SOCKS || plan->pin_count != expected_count) {
-        set_error(error, error_capacity, "invalid bpf2socks pin verification input");
+        asteriskd_error_copy(error, error_capacity, "invalid bpf2socks pin verification input");
         return ASTERISKD_CONFIG_INVALID;
     }
     struct asteriskd_b2s_verification result;
@@ -146,7 +142,7 @@ static int verify_pins(
             if (ownership->probe(ownership->context, plan->pins[index].path,
                     &exists, &expected_object_id) != 0 ||
                 (!exists && expected_object_id != 0U)) {
-                set_error(error, error_capacity, "bpf2socks residue probe failed");
+                asteriskd_error_copy(error, error_capacity, "bpf2socks residue probe failed");
                 return ASTERISKD_CONFIG_IO;
             }
             if (!exists) continue;
@@ -158,7 +154,7 @@ static int verify_pins(
             verify_map_pin(&plan->pins[index], backend, &verified->object_id);
         if (pin_result != 0 ||
             (allow_absent && verified->object_id != expected_object_id)) {
-            set_error(error, error_capacity, "bpf2socks pin verification failed");
+            asteriskd_error_copy(error, error_capacity, "bpf2socks pin verification failed");
             return pin_result;
         }
         ++result.pin_count;

@@ -16,292 +16,488 @@
 #include <time.h>
 #include <unistd.h>
 #endif
-static uint64_t get(const unsigned char *p, size_t n) {
-    uint64_t v=0; for(size_t i=0;i<n;++i) v|=(uint64_t)p[i]<<(8U*i); return v;
+static uint64_t dns_read_le(const unsigned char *bytes, size_t size) {
+    uint64_t value = 0;
+    for (size_t i = 0; i < size; ++i) value |= (uint64_t)bytes[i] << (8U * i);
+    return value;
 }
-static void put(unsigned char *p,uint64_t v,size_t n) {
-    for(size_t i=0;i<n;++i) p[i]=(unsigned char)(v>>(8U*i));
+static void dns_write_le(unsigned char *bytes, uint64_t value, size_t size) {
+    for (size_t i = 0; i < size; ++i) bytes[i] = (unsigned char)(value >> (8U * i));
 }
-void asteriskd_dns_init(struct asteriskd_dns_client *c) { memset(c,0,sizeof(*c)); c->fd=-1; }
-void asteriskd_dns_close(struct asteriskd_dns_client *c) {
+void asteriskd_dns_init(struct asteriskd_dns_client *client) {
+    memset(client, 0, sizeof(*client));
+    client->fd = -1;
+}
+void asteriskd_dns_close(struct asteriskd_dns_client *client) {
 #if defined(__linux__) || defined(__ANDROID__)
-    if(c->fd>=0) close(c->fd);
+    if (client->fd >= 0) close(client->fd);
 #endif
-    c->fd=-1; c->connected=false; c->pending=false; free(c->tx); c->tx=NULL;
+    client->fd = -1;
+    client->connected = false;
+    client->pending = false;
+    free(client->tx);
+    client->tx = NULL;
 }
-void asteriskd_dns_fail(struct asteriskd_dns_client *c,const char *reason) {
-    asteriskd_dns_close(c); c->snapshot.phase=DNS_FAILED;
-    snprintf(c->snapshot.reason,sizeof(c->snapshot.reason),"%s",reason);
+void asteriskd_dns_fail(struct asteriskd_dns_client *client, const char *reason) {
+    asteriskd_dns_close(client);
+    client->snapshot.phase = ASTERISKD_DNS_PHASE_FAILED;
+    snprintf(client->snapshot.reason, sizeof(client->snapshot.reason), "%s", reason);
 }
 uint64_t asteriskd_dns_monotime(void) {
 #if defined(__linux__) || defined(__ANDROID__)
-    struct timespec t;
-    if(clock_gettime(CLOCK_MONOTONIC,&t)==0) return (uint64_t)t.tv_sec*1000U+(uint64_t)t.tv_nsec/1000000U;
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == 0)
+        return (uint64_t)now.tv_sec * 1000U + (uint64_t)now.tv_nsec / 1000000U;
 #endif
     return 0;
 }
-static int compare_uid(const void *a,const void *b) {
-    uint32_t x=*(const uint32_t *)a,y=*(const uint32_t *)b; return (x>y)-(x<y);
+static size_t uid_array(unsigned char *out, const uint32_t *uids, size_t count) {
+    uint32_t *sorted = malloc((count ? count : 1) * sizeof(*sorted));
+    if (!sorted) return SIZE_MAX;
+    if (count) memcpy(sorted, uids, count * sizeof(*uids));
+    qsort(sorted, count, sizeof(*sorted), asteriskd_compare_u32);
+    size_t written = 0;
+    for (size_t i = 0; i < count; ++i)
+        if (i == 0 || sorted[i] != sorted[i - 1]) dns_write_le(out + 4 * written++, sorted[i], 4);
+    free(sorted);
+    return written;
 }
-static size_t uid_array(unsigned char *out,const uint32_t *uids,size_t count) {
-    uint32_t *sorted=malloc((count?count:1)*sizeof(*sorted)); if(!sorted) return SIZE_MAX;
-    if(count) memcpy(sorted,uids,count*sizeof(*uids));
-    qsort(sorted,count,sizeof(*sorted),compare_uid); size_t n=0;
-    for(size_t i=0;i<count;++i) if(i==0 || sorted[i]!=sorted[i-1]) put(out+4*n++,sorted[i],4);
-    free(sorted); return n;
-}
-int asteriskd_dns_command(struct asteriskd_dns_client *c,uint16_t op,
-    const struct asteriskd_config *config,uint64_t now) {
-    if(c->fd<0 || c->pending || c->request_id==UINT32_MAX || op<1 || op>6) return -1;
-    size_t capacity=40+((op==3 || op==4)?8:0);
-    if(op==2) {
-        if(!config || config->uid_count>8192 || config->bypass_uid_count>8192) return -1;
-        capacity+=48+4*(config->uid_count+config->bypass_uid_count);
+int asteriskd_dns_command(struct asteriskd_dns_client *client, uint16_t opcode,
+    const struct asteriskd_config *config, uint64_t now) {
+    if (client->fd < 0 || client->pending || client->request_id == UINT32_MAX ||
+        opcode < ASTERISKD_DNS_OP_HELLO || opcode > ASTERISKD_DNS_OP_RELEASE)
+        return -1;
+    size_t capacity = ASTERISKD_DNS_HEADER_SIZE +
+        ((opcode == ASTERISKD_DNS_OP_ACTIVATE || opcode == ASTERISKD_DNS_OP_CHECK) ? 8 : 0);
+    if (opcode == ASTERISKD_DNS_OP_PREPARE) {
+        if (!config || config->uid_count > 8192 || config->bypass_uid_count > 8192) return -1;
+        capacity += 48 + 4 * (config->uid_count + config->bypass_uid_count);
     }
-    free(c->tx); c->tx=calloc(1,capacity); if(!c->tx) return -1;
-    size_t body=0;
-    if(op==3 || op==4) { body=8; put(c->tx+40,now+2000,8); }
-    if(op==2) {
-        unsigned char *b=c->tx+40;
-        uint32_t mode=config->mode==ASTERISKD_MODE_TPROXY?1:config->mode==ASTERISKD_MODE_TUN2SOCKS?2:3;
-        uint32_t policy=config->app_policy_mode==ASTERISKD_APP_POLICY_GLOBAL?3:config->app_policy_mode==ASTERISKD_APP_POLICY_BLACKLIST?2:1;
-        uint32_t port=mode==1?config->transparent_port:mode==2?config->helper.value.hev.socks_port:config->helper.value.bpf.socks_port;
-        put(b,mode,4); put(b+4,policy,4); put(b+8,2,4); put(b+12,port,4);
-        put(b+16,ASTERISKD_DNS_MARK_MASK,4); put(b+20,ASTERISKD_DNS_PROXY_DECISION,4); put(b+24,ASTERISKD_DNS_DIRECT_MARK,4);
-        size_t a=uid_array(b+48,config->uids,config->uid_count);
-        if(a==SIZE_MAX) return -1;
-        size_t d=uid_array(b+48+4*a,config->bypass_uids,config->bypass_uid_count);
-        if(d==SIZE_MAX) return -1;
-        put(b+28,a,4); put(b+32,d,4); put(b+36,0,4); put(b+40,c->netd,8);
-        body=48+4*(a+d); c->snapshot.phase=DNS_PREPARING; c->route_count=0; c->prepare_retry=false;
-        c->prepare_draining=false;
-        c->snapshot.reason[0]=0;
+    free(client->tx);
+    client->tx = calloc(1, capacity);
+    if (!client->tx) return -1;
+    size_t body = 0;
+    if (opcode == ASTERISKD_DNS_OP_ACTIVATE || opcode == ASTERISKD_DNS_OP_CHECK) {
+        body = 8;
+        dns_write_le(
+            client->tx + ASTERISKD_DNS_HEADER_SIZE, now + ASTERISKD_DNS_COMMAND_TIMEOUT_MILLIS, 8);
     }
-    put(c->tx,0x314e4541,4); put(c->tx+4,1,2); put(c->tx+6,op,2);
-    put(c->tx+8,body,4); put(c->tx+12,++c->request_id,4);
-    put(c->tx+16,c->snapshot.instance_id,8); put(c->tx+24,c->snapshot.cycle_id,8);
-    put(c->tx+32,c->snapshot.generation,8);
-    c->opcode=op; c->tx_size=40+body; c->tx_offset=0;
-    c->deadline=now+2000; c->pending=true; c->complete=false; c->result=0;
+    if (opcode == ASTERISKD_DNS_OP_PREPARE) {
+        unsigned char *payload = client->tx + ASTERISKD_DNS_HEADER_SIZE;
+        uint32_t mode = config->mode == ASTERISKD_MODE_TPROXY ? 1
+            : config->mode == ASTERISKD_MODE_TUN2SOCKS        ? 2
+                                                              : 3;
+        uint32_t policy = config->app_policy_mode == ASTERISKD_APP_POLICY_GLOBAL ? 3
+            : config->app_policy_mode == ASTERISKD_APP_POLICY_BLACKLIST          ? 2
+                                                                                 : 1;
+        uint32_t port = mode == 1 ? config->transparent_port
+            : mode == 2           ? config->helper.value.hev.socks_port
+                                  : config->helper.value.bpf.socks_port;
+        dns_write_le(payload, mode, 4);
+        dns_write_le(payload + 4, policy, 4);
+        dns_write_le(payload + 8, 2, 4);
+        dns_write_le(payload + 12, port, 4);
+        dns_write_le(payload + 16, ASTERISKD_DNS_MARK_MASK, 4);
+        dns_write_le(payload + 20, ASTERISKD_DNS_PROXY_DECISION, 4);
+        dns_write_le(payload + 24, ASTERISKD_DNS_DIRECT_MARK, 4);
+        size_t listed_count = uid_array(payload + 48, config->uids, config->uid_count);
+        if (listed_count == SIZE_MAX) return -1;
+        size_t bypass_count = uid_array(
+            payload + 48 + 4 * listed_count, config->bypass_uids, config->bypass_uid_count);
+        if (bypass_count == SIZE_MAX) return -1;
+        dns_write_le(payload + 28, listed_count, 4);
+        dns_write_le(payload + 32, bypass_count, 4);
+        dns_write_le(payload + 36, 0, 4);
+        dns_write_le(payload + 40, client->netd, 8);
+        body = 48 + 4 * (listed_count + bypass_count);
+        client->snapshot.phase = ASTERISKD_DNS_PHASE_PREPARING;
+        client->route_count = 0;
+        client->prepare_retry = false;
+        client->prepare_draining = false;
+        client->snapshot.reason[0] = 0;
+    }
+    dns_write_le(client->tx, ASTERISKD_DNS_FRAME_MAGIC, 4);
+    dns_write_le(client->tx + 4, ASTERISKD_DNS_FRAME_VERSION, 2);
+    dns_write_le(client->tx + 6, opcode, 2);
+    dns_write_le(client->tx + 8, body, 4);
+    dns_write_le(client->tx + 12, ++client->request_id, 4);
+    dns_write_le(client->tx + 16, client->snapshot.instance_id, 8);
+    dns_write_le(client->tx + 24, client->snapshot.cycle_id, 8);
+    dns_write_le(client->tx + 32, client->snapshot.generation, 8);
+    client->opcode = opcode;
+    client->tx_size = ASTERISKD_DNS_HEADER_SIZE + body;
+    client->tx_offset = 0;
+    client->deadline = now + ASTERISKD_DNS_COMMAND_TIMEOUT_MILLIS;
+    client->pending = true;
+    client->complete = false;
+    client->result = 0;
     return 0;
 }
-int asteriskd_dns_begin(struct asteriskd_dns_client *c,uint64_t instance,uint64_t cycle,
-    uint64_t generation,uint64_t now) {
-    asteriskd_dns_close(c); asteriskd_dns_init(c);
-    c->snapshot=(struct asteriskd_dns_snapshot){.required=true,.phase=DNS_PREPARING,
-        .instance_id=instance,.cycle_id=cycle,.generation=generation};
+int asteriskd_dns_begin(struct asteriskd_dns_client *client, uint64_t instance, uint64_t cycle,
+    uint64_t generation, uint64_t now) {
+    asteriskd_dns_close(client);
+    asteriskd_dns_init(client);
+    client->snapshot = (struct asteriskd_dns_snapshot){.required = true,
+        .phase = ASTERISKD_DNS_PHASE_PREPARING,
+        .instance_id = instance,
+        .cycle_id = cycle,
+        .generation = generation};
 #if defined(__linux__) || defined(__ANDROID__)
-    c->fd=socket(AF_UNIX,SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC,0);
-    struct sockaddr_un address={.sun_family=AF_UNIX};
-    const char name[]="\0asterisk.enhance.dns"; memcpy(address.sun_path,name,sizeof(name)-1);
-    if(c->fd<0 || (connect(c->fd,(struct sockaddr *)&address,
-        offsetof(struct sockaddr_un,sun_path)+sizeof(name)-1)!=0 && errno!=EINPROGRESS)) {
+    client->fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    struct sockaddr_un address = {.sun_family = AF_UNIX};
+    const char name[] = "\0asterisk.enhance.dns";
+    memcpy(address.sun_path, name, sizeof(name) - 1);
+    if (client->fd < 0 ||
+        (connect(client->fd, (struct sockaddr *)&address,
+             offsetof(struct sockaddr_un, sun_path) + sizeof(name) - 1) != 0 &&
+            errno != EINPROGRESS)) {
         int saved_errno = errno;
         char reason[128];
-        snprintf(reason, sizeof(reason), "companion unavailable: errno=%d (%s)",
-            saved_errno, strerror(saved_errno));
-        asteriskd_dns_fail(c,reason); return -1;
+        snprintf(reason, sizeof(reason), "companion unavailable: errno=%d (%s)", saved_errno,
+            strerror(saved_errno));
+        asteriskd_dns_fail(client, reason);
+        return -1;
     }
-    return asteriskd_dns_command(c,1,NULL,now);
+    return asteriskd_dns_command(client, ASTERISKD_DNS_OP_HELLO, NULL, now);
 #else
-    (void)now; asteriskd_dns_fail(c,"companion requires Android"); return -1;
+    (void)now;
+    asteriskd_dns_fail(client, "companion requires Android");
+    return -1;
 #endif
 }
-int asteriskd_dns_accept(struct asteriskd_dns_client *c,const unsigned char *p,size_t n,uint64_t now) {
-    if(!c->pending || now>=c->deadline || n<40 || get(p,4)!=0x314e4541 || get(p+4,2)!=1 ||
-        get(p+8,4)!=n-40 || get(p+12,4)!=c->request_id ||
-        get(p+16,8)!=c->snapshot.instance_id || get(p+24,8)!=c->snapshot.cycle_id ||
-        get(p+32,8)!=c->snapshot.generation) goto invalid;
-    if(c->opcode==1) {
-        if(n!=88 || get(p+6,2)!=9) goto invalid;
-        const unsigned char *b=p+40; uint32_t flags=(uint32_t)get(b+44,4);
-        c->netd=get(b,8);
-        if(!c->netd || get(b+8,4)!=7 || (flags&6)!=6 ||
+int asteriskd_dns_accept(
+    struct asteriskd_dns_client *client, const unsigned char *frame, size_t length, uint64_t now) {
+    if (!client->pending || now >= client->deadline || length < ASTERISKD_DNS_HEADER_SIZE ||
+        dns_read_le(frame, 4) != ASTERISKD_DNS_FRAME_MAGIC ||
+        dns_read_le(frame + 4, 2) != ASTERISKD_DNS_FRAME_VERSION ||
+        dns_read_le(frame + 8, 4) != length - ASTERISKD_DNS_HEADER_SIZE ||
+        dns_read_le(frame + 12, 4) != client->request_id ||
+        dns_read_le(frame + 16, 8) != client->snapshot.instance_id ||
+        dns_read_le(frame + 24, 8) != client->snapshot.cycle_id ||
+        dns_read_le(frame + 32, 8) != client->snapshot.generation)
+        goto invalid;
+    if (client->opcode == ASTERISKD_DNS_OP_HELLO) {
+        if (length != 88 || dns_read_le(frame + 6, 2) != ASTERISKD_DNS_OP_CAPABILITIES)
+            goto invalid;
+        const unsigned char *payload = frame + ASTERISKD_DNS_HEADER_SIZE;
+        uint32_t flags = (uint32_t)dns_read_le(payload + 44, 4);
+        client->netd = dns_read_le(payload, 8);
+        if (!client->netd || dns_read_le(payload + 8, 4) != 7 || (flags & 6) != 6 ||
 #if !defined(ASTERISKD_DNS_TEST_PROBE) || ASTERISKD_DNS_TEST_PROBE != 1
-            (flags&1) ||
+            (flags & 1) ||
 #endif
-            get(b+20,4)!=ASTERISKD_DNS_MARK_MASK || get(b+24,4)!=ASTERISKD_DNS_PROXY_DECISION ||
-            get(b+28,4)!=ASTERISKD_DNS_DIRECT_MARK || get(b+32,4)!=2 ||
-            get(b+36,4)!=0 || get(b+40,4)!=0) {
+            dns_read_le(payload + 20, 4) != ASTERISKD_DNS_MARK_MASK ||
+            dns_read_le(payload + 24, 4) != ASTERISKD_DNS_PROXY_DECISION ||
+            dns_read_le(payload + 28, 4) != ASTERISKD_DNS_DIRECT_MARK ||
+            dns_read_le(payload + 32, 4) != 2 || dns_read_le(payload + 36, 4) != 0 ||
+            dns_read_le(payload + 40, 4) != 0) {
             char reason[128];
             snprintf(reason, sizeof(reason),
-                "incompatible capabilities: netd=%s revision=%u flags=0x%x consumer=%u marks=%s reserved=%s",
-                c->netd ? "present" : "missing", (unsigned)get(b+8,4), flags,
-                (unsigned)get(b+32,4),
-                get(b+20,4)==ASTERISKD_DNS_MARK_MASK && get(b+24,4)==ASTERISKD_DNS_PROXY_DECISION &&
-                    get(b+28,4)==ASTERISKD_DNS_DIRECT_MARK ? "ok" : "mismatch",
-                get(b+36,4)==0 && get(b+40,4)==0 ? "ok" : "nonzero");
-            asteriskd_dns_fail(c,reason); return -1;
+                "incompatible capabilities: netd=%s revision=%u flags=0x%x consumer=%u marks=%s "
+                "reserved=%s",
+                client->netd ? "present" : "missing", (unsigned)dns_read_le(payload + 8, 4), flags,
+                (unsigned)dns_read_le(payload + 32, 4),
+                dns_read_le(payload + 20, 4) == ASTERISKD_DNS_MARK_MASK &&
+                        dns_read_le(payload + 24, 4) == ASTERISKD_DNS_PROXY_DECISION &&
+                        dns_read_le(payload + 28, 4) == ASTERISKD_DNS_DIRECT_MARK
+                    ? "ok"
+                    : "mismatch",
+                dns_read_le(payload + 36, 4) == 0 && dns_read_le(payload + 40, 4) == 0 ? "ok"
+                                                                                       : "nonzero");
+            asteriskd_dns_fail(client, reason);
+            return -1;
         }
-        c->result=(uint32_t)get(b+16,4); // Supported mode mask, checked before PREPARE.
-        c->drain_events=(flags&8U)!=0;
-        if(c->result==0) {
-            asteriskd_dns_close(c); c->snapshot.phase=DNS_UNSUPPORTED;
-            snprintf(c->snapshot.reason,sizeof(c->snapshot.reason),"module advertises no supported modes"); return -1;
+        client->result =
+            (uint32_t)dns_read_le(payload + 16, 4); // Supported mode mask, checked before PREPARE.
+        client->drain_events = (flags & 8U) != 0;
+        if (client->result == 0) {
+            asteriskd_dns_close(client);
+            client->snapshot.phase = ASTERISKD_DNS_PHASE_UNSUPPORTED;
+            snprintf(client->snapshot.reason, sizeof(client->snapshot.reason),
+                "module advertises no supported modes");
+            return -1;
         }
     } else {
-        if(n<64 || (get(p+6,2)!=7 && get(p+6,2)!=8) || get(p+40,8)!=c->netd || get(p+60,4)!=0) goto invalid;
-        c->result=(uint32_t)get(p+48,4); uint32_t phase=(uint32_t)get(p+52,4);
-        c->retained=(uint32_t)get(p+56,4);
-        if(c->opcode==2 && c->result==0 && phase==1 && get(p+6,2)==7) {
-            if(n<68) goto invalid;
-            size_t count=(size_t)get(p+64,4);
-            if(count>ASTERISKD_DNS_MAX_ROUTES || n!=68+32*count || (!count && c->retained)) goto invalid;
-            for(size_t i=0;i<count;i++) {
-                const unsigned char *b=p+68+32*i; struct asteriskd_dns_route *r=&c->routes[i];
-                r->netid=(uint32_t)get(b,4);r->mark=(uint32_t)get(b+4,4);
-                r->family=(uint32_t)get(b+8,4);r->scope=(uint32_t)get(b+12,4);memcpy(r->address,b+16,16);
-                if(!r->netid || (r->mark&ASTERISKD_DNS_MARK_MASK) || (r->family!=4 && r->family!=6)) goto invalid;
-                unsigned nonzero=0;for(size_t j=0;j<(r->family==4?4U:16U);j++)nonzero|=r->address[j];
-                if(!nonzero || (r->family==4 && (r->scope || r->address[0]>=224 || r->address[0]==0)) ||
-                    (r->family==6 && (r->address[0]==255 || (r->address[0]==0xfe && (r->address[1]&0xc0)==0x80 && !r->scope)))) goto invalid;
-                if(r->family==4)for(size_t j=4;j<16;j++)if(r->address[j])goto invalid;
-                for(size_t j=0;j<i;j++)if(!memcmp(r,&c->routes[j],sizeof(*r)))goto invalid;
+        if (length < 64 ||
+            (dns_read_le(frame + 6, 2) != ASTERISKD_DNS_OP_ACK &&
+                dns_read_le(frame + 6, 2) != ASTERISKD_DNS_OP_ERROR) ||
+            dns_read_le(frame + ASTERISKD_DNS_HEADER_SIZE, 8) != client->netd ||
+            dns_read_le(frame + 60, 4) != 0)
+            goto invalid;
+        client->result = (uint32_t)dns_read_le(frame + 48, 4);
+        uint32_t phase = (uint32_t)dns_read_le(frame + 52, 4);
+        client->retained = (uint32_t)dns_read_le(frame + 56, 4);
+        if (client->opcode == ASTERISKD_DNS_OP_PREPARE &&
+            client->result == ASTERISKD_DNS_RESULT_OK && phase == ASTERISKD_DNS_MODULE_PREPARED &&
+            dns_read_le(frame + 6, 2) == ASTERISKD_DNS_OP_ACK) {
+            if (length < 68) goto invalid;
+            size_t count = (size_t)dns_read_le(frame + 64, 4);
+            if (count > ASTERISKD_DNS_MAX_ROUTES || length != 68 + 32 * count ||
+                (!count && client->retained))
+                goto invalid;
+            for (size_t i = 0; i < count; i++) {
+                const unsigned char *payload = frame + 68 + 32 * i;
+                struct asteriskd_dns_route *route = &client->routes[i];
+                route->netid = (uint32_t)dns_read_le(payload, 4);
+                route->mark = (uint32_t)dns_read_le(payload + 4, 4);
+                route->family = (uint32_t)dns_read_le(payload + 8, 4);
+                route->scope = (uint32_t)dns_read_le(payload + 12, 4);
+                memcpy(route->address, payload + 16, 16);
+                if (!route->netid || (route->mark & ASTERISKD_DNS_MARK_MASK) ||
+                    (route->family != 4 && route->family != 6))
+                    goto invalid;
+                unsigned nonzero = 0;
+                for (size_t j = 0; j < (route->family == 4 ? 4U : 16U); j++)
+                    nonzero |= route->address[j];
+                if (!nonzero ||
+                    (route->family == 4 &&
+                        (route->scope || route->address[0] >= 224 || route->address[0] == 0)) ||
+                    (route->family == 6 &&
+                        (route->address[0] == 255 ||
+                            (route->address[0] == 0xfe && (route->address[1] & 0xc0) == 0x80 &&
+                                !route->scope))))
+                    goto invalid;
+                if (route->family == 4)
+                    for (size_t j = 4; j < 16; j++)
+                        if (route->address[j]) goto invalid;
+                for (size_t j = 0; j < i; j++)
+                    if (!memcmp(route, &client->routes[j], sizeof(*route))) goto invalid;
             }
-            c->route_count=count;
-        } else if(n==80 && c->opcode==2 && c->result==5 && get(p+6,2)==8) {
-            uint32_t stage=(uint32_t)get(p+64,4), detail=(uint32_t)get(p+68,4);
-            int32_t error=(int32_t)(uint32_t)get(p+72,4);
-            uint32_t network=(uint32_t)get(p+76,4);
-            static const char *const stages[]={"unknown","discover","read","reserve","configure","check","routes","release"};
-            static const char *const reasons[]={"unknown","not-ready","changed","private-dns","nat64","invalid-config","backend","capacity"};
-            if(stage>=8 || detail>=8 || (phase!=0 && phase!=3) || c->retained>64) goto invalid;
-            snprintf(c->snapshot.reason,sizeof(c->snapshot.reason),
+            client->route_count = count;
+        } else if (length == 80 && client->opcode == ASTERISKD_DNS_OP_PREPARE &&
+            client->result == ASTERISKD_DNS_RESULT_CACHE_ERROR &&
+            dns_read_le(frame + 6, 2) == ASTERISKD_DNS_OP_ERROR) {
+            uint32_t stage = (uint32_t)dns_read_le(frame + 64, 4),
+                     detail = (uint32_t)dns_read_le(frame + 68, 4);
+            int32_t error = (int32_t)(uint32_t)dns_read_le(frame + 72, 4);
+            uint32_t network = (uint32_t)dns_read_le(frame + 76, 4);
+            static const char *const stages[] = {"unknown", "discover", "read", "reserve",
+                "configure", "check", "routes", "release"};
+            static const char *const reasons[] = {"unknown", "not-ready", "changed", "private-dns",
+                "nat64", "invalid-config", "backend", "capacity"};
+            if (stage >= 8 || detail >= 8 ||
+                (phase != ASTERISKD_DNS_MODULE_IDLE && phase != ASTERISKD_DNS_MODULE_DRAINING) ||
+                client->retained > 64)
+                goto invalid;
+            snprintf(client->snapshot.reason, sizeof(client->snapshot.reason),
                 "CACHE_ERROR stage=%s reason=%s error=%d network=%u phase=%u retained=%u",
-                stages[stage],reasons[detail],error,network,phase,c->retained);
+                stages[stage], reasons[detail], error, network, phase, client->retained);
             // Only known transient failures on real networks, with complete cleanup.
             // Old/unknown errors and isolated-cache read failures remain terminal.
-            c->prepare_retry=phase==0 && c->retained==0 && network<=0xffffU &&
-                ((detail==1 && (stage==1 || stage==2) && (error==0 || error==-ENOENT)) ||
-                 (detail==2 && (stage==5 || stage==6) && error==-EAGAIN));
-            c->pending=false; c->complete=true;
-            if(c->prepare_retry) { c->snapshot.phase=DNS_INACTIVE; return 0; }
-            asteriskd_dns_close(c); c->snapshot.phase=DNS_FAILED; return -1;
-        } else if(n!=64 || (c->opcode==2 && c->result==5)) goto invalid;
-        if(c->result==6 && c->opcode==6 && phase==3) c->snapshot.phase=DNS_DRAINING;
-        else if(c->result==5 && (c->opcode==3 || c->opcode==4) && phase==3 && get(p+6,2)==8) {
+            client->prepare_retry = phase == ASTERISKD_DNS_MODULE_IDLE && client->retained == 0 &&
+                network <= 0xffffU &&
+                ((detail == 1 && (stage == 1 || stage == 2) && (error == 0 || error == -ENOENT)) ||
+                    (detail == 2 && (stage == 5 || stage == 6) && error == -EAGAIN));
+            client->pending = false;
+            client->complete = true;
+            if (client->prepare_retry) {
+                client->snapshot.phase = ASTERISKD_DNS_PHASE_INACTIVE;
+                return 0;
+            }
+            asteriskd_dns_close(client);
+            client->snapshot.phase = ASTERISKD_DNS_PHASE_FAILED;
+            return -1;
+        } else if (length != 64 ||
+            (client->opcode == ASTERISKD_DNS_OP_PREPARE &&
+                client->result == ASTERISKD_DNS_RESULT_CACHE_ERROR))
+            goto invalid;
+        if (client->result == ASTERISKD_DNS_RESULT_DRAINING &&
+            client->opcode == ASTERISKD_DNS_OP_RELEASE && phase == ASTERISKD_DNS_MODULE_DRAINING)
+            client->snapshot.phase = ASTERISKD_DNS_PHASE_DRAINING;
+        else if (client->result == ASTERISKD_DNS_RESULT_CACHE_ERROR &&
+            (client->opcode == ASTERISKD_DNS_OP_ACTIVATE ||
+                client->opcode == ASTERISKD_DNS_OP_CHECK) &&
+            phase == ASTERISKD_DNS_MODULE_DRAINING &&
+            dns_read_le(frame + 6, 2) == ASTERISKD_DNS_OP_ERROR) {
             // The module has already withdrawn the old policy. Keep the
             // authenticated connection for drain and a fresh network snapshot.
-            c->snapshot.phase=DNS_DRAINING; c->topology_changed=true;
-        }
-        else if(c->opcode==2 && c->result==4 && phase==3 && get(p+6,2)==8) {
+            client->snapshot.phase = ASTERISKD_DNS_PHASE_DRAINING;
+            client->topology_changed = true;
+        } else if (client->opcode == ASTERISKD_DNS_OP_PREPARE &&
+            client->result == ASTERISKD_DNS_RESULT_BUSY && phase == ASTERISKD_DNS_MODULE_DRAINING &&
+            dns_read_le(frame + 6, 2) == ASTERISKD_DNS_OP_ERROR) {
             // The previous owner's session is still auto-releasing in-flight
             // queries. Its caches are not ours; retry PREPARE after the drain event.
-            snprintf(c->snapshot.reason,sizeof(c->snapshot.reason),
-                "previous DNS cycle draining in-flight queries: retained=%u",c->retained);
-            c->retained=0; c->prepare_retry=true; c->prepare_draining=true;
-            c->snapshot.phase=DNS_DRAINING;
-        }
-        else if(c->result!=0 || get(p+6,2)!=7) {
-            static const char *const results[] = {"OK", "INVALID", "UNSUPPORTED", "STALE",
-                "BUSY", "CACHE_ERROR", "DRAINING", "EXHAUSTED", "IO_ERROR"};
-            char reason[128]; snprintf(reason,sizeof(reason),"companion command %u result %u (%s) phase=%u",
-                c->opcode,c->result,c->result<sizeof(results)/sizeof(results[0])?results[c->result]:"UNKNOWN",phase);
-            asteriskd_dns_fail(c,reason); return -1;
-        } else if(c->opcode==2 && phase==1) c->snapshot.phase=DNS_PREPARED;
-        else if((c->opcode==3 || c->opcode==4) && phase==2) {
-            c->snapshot.phase=c->route_count ? DNS_ACTIVE : DNS_WAITING_NETWORK;
-            snprintf(c->snapshot.reason,sizeof(c->snapshot.reason),"%s",
-                c->route_count ? "" : "waiting for network");
-        } else if(c->opcode==5 && (phase==0 || phase==3)) c->snapshot.phase=DNS_INACTIVE;
-        else if(c->opcode==6 && phase==0 && c->retained==0) c->snapshot.phase=DNS_INACTIVE;
-        else goto invalid;
+            snprintf(client->snapshot.reason, sizeof(client->snapshot.reason),
+                "previous DNS cycle draining in-flight queries: retained=%u", client->retained);
+            client->retained = 0;
+            client->prepare_retry = true;
+            client->prepare_draining = true;
+            client->snapshot.phase = ASTERISKD_DNS_PHASE_DRAINING;
+        } else if (client->result != ASTERISKD_DNS_RESULT_OK ||
+            dns_read_le(frame + 6, 2) != ASTERISKD_DNS_OP_ACK) {
+            static const char *const results[] = {"OK", "INVALID", "UNSUPPORTED", "STALE", "BUSY",
+                "CACHE_ERROR", "DRAINING", "EXHAUSTED", "IO_ERROR"};
+            char reason[128];
+            snprintf(reason, sizeof(reason), "companion command %u result %u (%s) phase=%u",
+                client->opcode, client->result,
+                client->result < sizeof(results) / sizeof(results[0]) ? results[client->result]
+                                                                      : "UNKNOWN",
+                phase);
+            asteriskd_dns_fail(client, reason);
+            return -1;
+        } else if (client->opcode == ASTERISKD_DNS_OP_PREPARE &&
+            phase == ASTERISKD_DNS_MODULE_PREPARED)
+            client->snapshot.phase = ASTERISKD_DNS_PHASE_PREPARED;
+        else if ((client->opcode == ASTERISKD_DNS_OP_ACTIVATE ||
+                     client->opcode == ASTERISKD_DNS_OP_CHECK) &&
+            phase == ASTERISKD_DNS_MODULE_ACTIVE) {
+            client->snapshot.phase = client->route_count ? ASTERISKD_DNS_PHASE_ACTIVE : ASTERISKD_DNS_PHASE_WAITING_NETWORK;
+            snprintf(client->snapshot.reason, sizeof(client->snapshot.reason), "%s",
+                client->route_count ? "" : "waiting for network");
+        } else if (client->opcode == ASTERISKD_DNS_OP_DEACTIVATE &&
+            (phase == ASTERISKD_DNS_MODULE_IDLE || phase == ASTERISKD_DNS_MODULE_DRAINING))
+            client->snapshot.phase = ASTERISKD_DNS_PHASE_INACTIVE;
+        else if (client->opcode == ASTERISKD_DNS_OP_RELEASE && phase == ASTERISKD_DNS_MODULE_IDLE &&
+            client->retained == 0)
+            client->snapshot.phase = ASTERISKD_DNS_PHASE_INACTIVE;
+        else
+            goto invalid;
     }
-    c->pending=false; c->complete=true; return 0;
+    client->pending = false;
+    client->complete = true;
+    return 0;
 invalid:
-    asteriskd_dns_fail(c,"late, stale or malformed companion response"); return -1;
+    asteriskd_dns_fail(client, "late, stale or malformed companion response");
+    return -1;
 }
-int asteriskd_dns_step(struct asteriskd_dns_client *c,uint64_t now) {
-    if(!c->snapshot.required || c->fd<0) return 0;
-    if(c->pending && now>=c->deadline) {
-        asteriskd_dns_fail(c,"companion command expired"); return -1;
+int asteriskd_dns_step(struct asteriskd_dns_client *client, uint64_t now) {
+    if (!client->snapshot.required || client->fd < 0) return 0;
+    if (client->pending && now >= client->deadline) {
+        asteriskd_dns_fail(client, "companion command expired");
+        return -1;
     }
 #if defined(__linux__) || defined(__ANDROID__)
-    if(!c->connected) {
-        struct ucred peer; socklen_t n=sizeof(peer);
-        if(getsockopt(c->fd,SOL_SOCKET,SO_PEERCRED,&peer,&n)!=0 || n!=sizeof(peer) || peer.uid!=0 || peer.pid<=0) {
-            asteriskd_dns_fail(c,"untrusted companion peer"); return -1;
+    if (!client->connected) {
+        struct ucred peer;
+        socklen_t count = sizeof(peer);
+        if (getsockopt(client->fd, SOL_SOCKET, SO_PEERCRED, &peer, &count) != 0 ||
+            count != sizeof(peer) || peer.uid != 0 || peer.pid <= 0) {
+            asteriskd_dns_fail(client, "untrusted companion peer");
+            return -1;
         }
-        c->connected=true;
+        client->connected = true;
     }
-    if(!c->pending && asteriskd_dns_serving(c->snapshot.phase) && c->network_changed && !c->busy && !c->rx_size) {
-        c->network_changed=false;
-        if(asteriskd_dns_command(c,4,NULL,now)!=0) return -1;
+    if (!client->pending && asteriskd_dns_serving(client->snapshot.phase) &&
+        client->network_changed && !client->busy && !client->rx_size) {
+        client->network_changed = false;
+        if (asteriskd_dns_command(client, ASTERISKD_DNS_OP_CHECK, NULL, now) != 0) return -1;
     }
-    if(c->pending && c->tx_offset<c->tx_size) {
-        ssize_t n=send(c->fd,c->tx+c->tx_offset,c->tx_size-c->tx_offset,MSG_DONTWAIT|MSG_NOSIGNAL);
-        if(n>0) c->tx_offset+=(size_t)n;
-        else if(n==0 || (errno!=EAGAIN && errno!=EWOULDBLOCK && errno!=EINTR)) goto io_error;
+    if (client->pending && client->tx_offset < client->tx_size) {
+        ssize_t count = send(client->fd, client->tx + client->tx_offset,
+            client->tx_size - client->tx_offset, MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (count > 0)
+            client->tx_offset += (size_t)count;
+        else if (count == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
+            goto io_error;
     }
-    size_t need=c->rx_size<40?40:40+(size_t)get(c->rx+8,4);
-    if(need>sizeof(c->rx) || need<c->rx_size) goto io_error;
-    ssize_t n=recv(c->fd,c->rx+c->rx_size,need-c->rx_size,MSG_DONTWAIT);
-    if(n>0) c->rx_size+=(size_t)n;
-    else if(n==0 || (errno!=EAGAIN && errno!=EWOULDBLOCK && errno!=EINTR)) goto io_error;
-    if(c->rx_size>=40) {
-        need=40+(size_t)get(c->rx+8,4);
-        if(need>sizeof(c->rx)) goto io_error;
-        if(c->rx_size==need) {
-            if(need==40 && get(c->rx,4)==0x314e4541 && get(c->rx+4,2)==1 &&
-                get(c->rx+6,2)==12 && get(c->rx+12,4)==1 &&
-                !get(c->rx+16,8) && !get(c->rx+24,8) && !get(c->rx+32,8)) {
-                c->network_changed=true; c->rx_size=0; return 0;
+    size_t need = client->rx_size < ASTERISKD_DNS_HEADER_SIZE
+        ? ASTERISKD_DNS_HEADER_SIZE
+        : ASTERISKD_DNS_HEADER_SIZE + (size_t)dns_read_le(client->rx + 8, 4);
+    if (need > sizeof(client->rx) || need < client->rx_size) goto io_error;
+    ssize_t count =
+        recv(client->fd, client->rx + client->rx_size, need - client->rx_size, MSG_DONTWAIT);
+    if (count > 0)
+        client->rx_size += (size_t)count;
+    else if (count == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
+        goto io_error;
+    if (client->rx_size >= ASTERISKD_DNS_HEADER_SIZE) {
+        need = ASTERISKD_DNS_HEADER_SIZE + (size_t)dns_read_le(client->rx + 8, 4);
+        if (need > sizeof(client->rx)) goto io_error;
+        if (client->rx_size == need) {
+            if (need == ASTERISKD_DNS_HEADER_SIZE &&
+                dns_read_le(client->rx, 4) == ASTERISKD_DNS_FRAME_MAGIC &&
+                dns_read_le(client->rx + 4, 2) == ASTERISKD_DNS_FRAME_VERSION &&
+                dns_read_le(client->rx + 6, 2) == ASTERISKD_DNS_OP_NETWORK_CHANGED &&
+                dns_read_le(client->rx + 12, 4) == 1 && !dns_read_le(client->rx + 16, 8) &&
+                !dns_read_le(client->rx + 24, 8) && !dns_read_le(client->rx + 32, 8)) {
+                client->network_changed = true;
+                client->rx_size = 0;
+                return 0;
             }
-            int result=asteriskd_dns_accept(c,c->rx,c->rx_size,now);
-            c->rx_size=0; return result;
+            int result = asteriskd_dns_accept(client, client->rx, client->rx_size, now);
+            client->rx_size = 0;
+            return result;
         }
     }
     return 0;
-io_error:
-    { char reason[128]; snprintf(reason,sizeof(reason),"companion I/O op=%u rx=%zu tx=%zu/%zu errno=%d",c->opcode,c->rx_size,c->tx_offset,c->tx_size,errno);
-      asteriskd_dns_fail(c,reason); return -1; }
+io_error: {
+    char reason[128];
+    snprintf(reason, sizeof(reason), "companion I/O op=%u rx=%zu tx=%zu/%zu errno=%d",
+        client->opcode, client->rx_size, client->tx_offset, client->tx_size, errno);
+    asteriskd_dns_fail(client, reason);
+    return -1;
+}
 #else
-    (void)now; return -1;
+    (void)now;
+    return -1;
 #endif
 }
 
 /* One-shot read-only bridge. No supervisor/config/log/state/network initialization. */
 #if defined(__linux__) || defined(__ANDROID__)
-static int info_transfer(int fd, unsigned char *bytes, size_t length, bool sending, uint64_t deadline) {
+static int info_transfer(
+    int fd, unsigned char *bytes, size_t length, bool sending, uint64_t deadline) {
     while (length) {
         uint64_t now = asteriskd_dns_monotime();
         if (now >= deadline) return -1;
-        struct pollfd event = {.fd=fd, .events=sending ? POLLOUT : POLLIN};
+        struct pollfd event = {.fd = fd, .events = sending ? POLLOUT : POLLIN};
         int ready = poll(&event, 1, (int)(deadline - now));
         if (ready < 0 && errno == EINTR) continue;
         if (ready <= 0) return -1;
-        ssize_t count = sending ? send(fd, bytes, length, MSG_DONTWAIT | MSG_NOSIGNAL) : recv(fd, bytes, length, MSG_DONTWAIT);
+        ssize_t count = sending ? send(fd, bytes, length, MSG_DONTWAIT | MSG_NOSIGNAL)
+                                : recv(fd, bytes, length, MSG_DONTWAIT);
         if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
         if (count <= 0) return -1;
-        bytes += count; length -= (size_t)count;
+        bytes += count;
+        length -= (size_t)count;
     }
     return asteriskd_dns_monotime() < deadline ? 0 : -1;
 }
 #endif
 int asteriskd_dns_info(void) {
 #if defined(__linux__) || defined(__ANDROID__)
-    if (geteuid() != 0) { puts("AE_ROOT_DENIED"); return 0; }
+    if (geteuid() != 0) {
+        puts("AE_ROOT_DENIED");
+        return 0;
+    }
     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    struct sockaddr_un address = {.sun_family=AF_UNIX};
+    struct sockaddr_un address = {.sun_family = AF_UNIX};
     const char name[] = "\0asterisk.enhance.dns";
     memcpy(address.sun_path, name, sizeof(name) - 1);
     bool valid = false;
-    unsigned char frame[40 + 512] = {0};
-    const uint64_t deadline = asteriskd_dns_monotime() + 2000;
-    if (fd >= 0 && (connect(fd, (struct sockaddr *)&address,
-        offsetof(struct sockaddr_un, sun_path) + sizeof(name) - 1) == 0 || errno == EINPROGRESS)) {
-        struct ucred peer; socklen_t size = sizeof(peer);
-        if (!getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer, &size) && size == sizeof(peer) && peer.uid == 0 && peer.pid > 1) {
-            put(frame, 0x314e4541, 4); put(frame + 4, 1, 2); put(frame + 6, 10, 2); put(frame + 12, 1, 4);
-            if (!info_transfer(fd, frame, 40, true, deadline) && !info_transfer(fd, frame, 40, false, deadline)) {
-                size_t length = (size_t)get(frame + 8, 4);
-                if (get(frame, 4) == 0x314e4541 && get(frame + 4, 2) == 1 && get(frame + 6, 2) == 11 &&
-                    get(frame + 12, 4) == 1 && !get(frame + 16, 8) && !get(frame + 24, 8) && !get(frame + 32, 8) &&
-                    length > 0 && length <= 512 && !info_transfer(fd, frame + 40, length, false, deadline)) {
-                    valid = length >= 10 && !memcmp(frame + 40, "AE_INFO 1\n", 10) && frame[39 + length] == '\n';
-                    for (size_t i = 40; valid && i < 40 + length; ++i)
+    unsigned char frame[ASTERISKD_DNS_HEADER_SIZE + 512] = {0};
+    const uint64_t deadline = asteriskd_dns_monotime() + ASTERISKD_DNS_COMMAND_TIMEOUT_MILLIS;
+    if (fd >= 0 &&
+        (connect(fd, (struct sockaddr *)&address,
+             offsetof(struct sockaddr_un, sun_path) + sizeof(name) - 1) == 0 ||
+            errno == EINPROGRESS)) {
+        struct ucred peer;
+        socklen_t size = sizeof(peer);
+        if (!getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer, &size) && size == sizeof(peer) &&
+            peer.uid == 0 && peer.pid > 1) {
+            dns_write_le(frame, ASTERISKD_DNS_FRAME_MAGIC, 4);
+            dns_write_le(frame + 4, ASTERISKD_DNS_FRAME_VERSION, 2);
+            dns_write_le(frame + 6, ASTERISKD_DNS_OP_INFO, 2);
+            dns_write_le(frame + 12, 1, 4);
+            if (!info_transfer(fd, frame, ASTERISKD_DNS_HEADER_SIZE, true, deadline) &&
+                !info_transfer(fd, frame, ASTERISKD_DNS_HEADER_SIZE, false, deadline)) {
+                size_t length = (size_t)dns_read_le(frame + 8, 4);
+                if (dns_read_le(frame, 4) == ASTERISKD_DNS_FRAME_MAGIC &&
+                    dns_read_le(frame + 4, 2) == ASTERISKD_DNS_FRAME_VERSION &&
+                    dns_read_le(frame + 6, 2) == ASTERISKD_DNS_OP_INFO_RESPONSE &&
+                    dns_read_le(frame + 12, 4) == 1 && !dns_read_le(frame + 16, 8) &&
+                    !dns_read_le(frame + 24, 8) && !dns_read_le(frame + 32, 8) && length > 0 &&
+                    length <= 512 &&
+                    !info_transfer(
+                        fd, frame + ASTERISKD_DNS_HEADER_SIZE, length, false, deadline)) {
+                    valid = length >= 10 &&
+                        !memcmp(frame + ASTERISKD_DNS_HEADER_SIZE, "AE_INFO 1\n", 10) &&
+                        frame[ASTERISKD_DNS_HEADER_SIZE - 1 + length] == '\n';
+                    for (size_t i = ASTERISKD_DNS_HEADER_SIZE;
+                        valid && i < ASTERISKD_DNS_HEADER_SIZE + length; ++i)
                         if (frame[i] != '\n' && (frame[i] < 32 || frame[i] > 126)) valid = false;
-                    if (valid) fwrite(frame + 40, 1, length, stdout);
+                    if (valid) fwrite(frame + ASTERISKD_DNS_HEADER_SIZE, 1, length, stdout);
                 }
             }
         }

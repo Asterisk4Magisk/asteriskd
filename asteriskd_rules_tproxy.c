@@ -5,13 +5,6 @@
 
 #include <string.h>
 
-static int copy_text(char *target, size_t capacity, const char *value) {
-    size_t length = strnlen(value, capacity);
-    if (length == 0U || length >= capacity) return ASTERISKD_CONFIG_INVALID;
-    memcpy(target, value, length + 1U);
-    return 0;
-}
-
 static struct asteriskd_private_chain_group *add_private_group(
     struct asteriskd_rule_transaction_plan *plan,
     enum asteriskd_ip_family family,
@@ -35,7 +28,7 @@ static int add_private_name(struct asteriskd_private_chain_group *group, const c
     if (group == NULL || group->name_count >= ASTERISKD_RULE_TRANSACTION_MAX_NAMES) {
         return ASTERISKD_CONFIG_INVALID;
     }
-    return copy_text(group->names[group->name_count++], ASTERISKD_MAX_CHAIN_NAME, name);
+    return asteriskd_copy_string(group->names[group->name_count++], ASTERISKD_MAX_CHAIN_NAME, name);
 }
 
 static struct asteriskd_traffic_hook_group *add_hook_group(
@@ -74,7 +67,7 @@ static int add_jump(
     hook->insert_at_head = insert_at_head;
     hook->dns_destination_protocol = dns_protocol;
     hook->verdict = ASTERISKD_HOOK_JUMP;
-    return copy_text(hook->jump_target, sizeof(hook->jump_target), target);
+    return asteriskd_copy_string(hook->jump_target, sizeof(hook->jump_target), target);
 }
 
 static struct asteriskd_route_effect *add_route(
@@ -104,8 +97,8 @@ static int add_normal_route(
     route->local_route = true;
     route->loopback_source = dns_enhancement && family == ASTERISKD_IP_FAMILY_IPV4;
     route->route_id = ASTERISKD_ROUTE_TPROXY;
-    if (copy_text(route->destination, sizeof(route->destination), "default") != 0 ||
-        copy_text(route->interface_name, sizeof(route->interface_name), "lo") != 0) {
+    if (asteriskd_copy_string(route->destination, sizeof(route->destination), "default") != 0 ||
+        asteriskd_copy_string(route->interface_name, sizeof(route->interface_name), "lo") != 0) {
         return ASTERISKD_CONFIG_INVALID;
     }
     return 0;

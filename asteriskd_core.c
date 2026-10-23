@@ -7,19 +7,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void core_error(char *error, size_t error_size, const char *message) {
-    if (error != NULL && error_size != 0U) {
-        (void)snprintf(error, error_size, "%s", message);
-    }
-}
-
-static size_t core_bounded_length(const char *value, size_t capacity) {
-    if (value == NULL) return capacity;
-    size_t length = 0U;
-    while (length < capacity && value[length] != '\0') ++length;
-    return length;
-}
-
 static int core_build_environment(
     const struct asteriskd_config *config,
     const char *const *inherited,
@@ -41,23 +28,23 @@ int asteriskd_core_process_spec(
     if (spec != NULL) memset(spec, 0, sizeof(*spec));
     if (error != NULL && error_size != 0U) error[0] = '\0';
     if (config == NULL || spec == NULL) {
-        core_error(error, error_size, "invalid core process input");
+        asteriskd_error_copy(error, error_size, "invalid core process input");
         return ASTERISKD_CONFIG_INVALID;
     }
-    size_t executable_length = core_bounded_length(
+    size_t executable_length = asteriskd_bounded_length(
         config->core_executable_path, sizeof(spec->executable_path));
-    size_t directory_length = core_bounded_length(
+    size_t directory_length = asteriskd_bounded_length(
         config->working_directory, sizeof(spec->working_directory));
     if (executable_length == 0U || executable_length >= sizeof(spec->executable_path) ||
         directory_length == 0U || directory_length >= sizeof(spec->working_directory)) {
-        core_error(error, error_size, "invalid core process path");
+        asteriskd_error_copy(error, error_size, "invalid core process path");
         return ASTERISKD_CONFIG_INVALID;
     }
     memcpy(spec->executable_path, config->core_executable_path, executable_length + 1U);
     memcpy(spec->working_directory, config->working_directory, directory_length + 1U);
     if (asteriskd_log_sibling_path(config->log_path, "error.log",
             spec->output_path, sizeof(spec->output_path)) != 0) {
-        core_error(error, error_size, "invalid core log path");
+        asteriskd_error_copy(error, error_size, "invalid core log path");
         return ASTERISKD_CONFIG_INVALID;
     }
     spec->uid = 0U;
@@ -91,14 +78,14 @@ int asteriskd_core_process_spec(
     }
     if (core_build_environment(
             config, inherited_environment, asset_key, spec) != 0) {
-        core_error(error, error_size, "core environment construction failed");
+        asteriskd_error_copy(error, error_size, "core environment construction failed");
         asteriskd_process_spec_destroy(spec);
         return ASTERISKD_CONFIG_NO_MEMORY;
     }
     return 0;
 
 invalid:
-    core_error(error, error_size, "invalid core process configuration");
+    asteriskd_error_copy(error, error_size, "invalid core process configuration");
     asteriskd_process_spec_destroy(spec);
     return ASTERISKD_CONFIG_INVALID;
 }

@@ -30,13 +30,6 @@
 #include <io.h>
 #endif
 
-static size_t process_bounded_length(const char *value, size_t capacity) {
-    if (value == NULL) return capacity;
-    size_t length = 0U;
-    while (length < capacity && value[length] != '\0') ++length;
-    return length;
-}
-
 static bool process_env_key_equals(const char *entry, size_t key_length, const char *key) {
     return strlen(key) == key_length && memcmp(entry, key, key_length) == 0;
 }
@@ -92,7 +85,7 @@ int asteriskd_process_environment_rebuild(
     size_t index = 0U;
     for (; index < ASTERISKD_PROCESS_MAX_INHERITED_ENV && inherited[index] != NULL; ++index) {
         const char *entry = inherited[index];
-        size_t length = process_bounded_length(entry, ASTERISKD_PROCESS_MAX_ENV_ENTRY);
+        size_t length = asteriskd_bounded_length(entry, ASTERISKD_PROCESS_MAX_ENV_ENTRY);
         if (length == 0U || length >= ASTERISKD_PROCESS_MAX_ENV_ENTRY) return -1;
         const char *separator = memchr(entry, '=', length);
         if (separator == NULL || separator == entry) return -1;
@@ -108,8 +101,8 @@ int asteriskd_process_environment_add(
     const char *key,
     const char *value) {
     if (spec == NULL || key == NULL || value == NULL || strchr(key, '=') != NULL || key[0] == '\0') return -1;
-    size_t key_length = process_bounded_length(key, ASTERISKD_PROCESS_MAX_ENV_ENTRY);
-    size_t value_length = process_bounded_length(value, ASTERISKD_PROCESS_MAX_ENV_ENTRY);
+    size_t key_length = asteriskd_bounded_length(key, ASTERISKD_PROCESS_MAX_ENV_ENTRY);
+    size_t value_length = asteriskd_bounded_length(value, ASTERISKD_PROCESS_MAX_ENV_ENTRY);
     if (key_length >= ASTERISKD_PROCESS_MAX_ENV_ENTRY || value_length >= ASTERISKD_PROCESS_MAX_ENV_ENTRY ||
         key_length + value_length + 1U >= ASTERISKD_PROCESS_MAX_ENV_ENTRY ||
         process_env_has_key(spec, key, key_length)) return -1;
@@ -131,10 +124,22 @@ int asteriskd_process_environment_add(
 
 int asteriskd_process_argument_add(struct asteriskd_process_spec *spec, const char *argument) {
     if (spec == NULL || spec->argc >= ASTERISKD_MAX_PROCESS_ARGV) return -1;
-    size_t length = process_bounded_length(argument, ASTERISKD_MAX_CHILD_ARG);
+    size_t length = asteriskd_bounded_length(argument, ASTERISKD_MAX_CHILD_ARG);
     if (length == 0U || length >= ASTERISKD_MAX_CHILD_ARG) return -1;
     memcpy(spec->argv[spec->argc], argument, length + 1U);
     ++spec->argc;
+    return 0;
+}
+
+int asteriskd_process_inherit_fd(struct asteriskd_process_spec *spec, int source, int target) {
+    if (source < 0 || target < 0 ||
+        spec->inherited_fd_count >= ASTERISKD_PROCESS_MAX_INHERITED_FDS) return -1;
+    for (size_t index = 0U; index < spec->inherited_fd_count; ++index) {
+        if (spec->inherited_fds[index] == source || spec->inherited_fd_targets[index] == target) return -1;
+    }
+    spec->inherited_fds[spec->inherited_fd_count] = source;
+    spec->inherited_fd_targets[spec->inherited_fd_count] = target;
+    ++spec->inherited_fd_count;
     return 0;
 }
 
@@ -147,7 +152,7 @@ int asteriskd_process_core_log_path(
         spec->output_mode != ASTERISKD_PROCESS_OUTPUT_APPEND_CORE_LOG) {
         return ASTERISKD_CONFIG_INVALID;
     }
-    size_t length = process_bounded_length(spec->output_path, sizeof(spec->output_path));
+    size_t length = asteriskd_bounded_length(spec->output_path, sizeof(spec->output_path));
     if (length == 0U || length >= sizeof(spec->output_path) ||
         spec->output_path[0] != '/' || length >= path_size) {
         return ASTERISKD_CONFIG_INVALID;
@@ -165,15 +170,6 @@ void asteriskd_process_spec_destroy(struct asteriskd_process_spec *spec) {
         free(spec->environment);
     }
     memset(spec, 0, sizeof(*spec));
-}
-
-static void anonymous_error(char *error, size_t error_size, const char *message) {
-    if (error != NULL && error_size != 0U) {
-        size_t length = strlen(message);
-        if (length >= error_size) length = error_size - 1U;
-        memcpy(error, message, length);
-        error[length] = '\0';
-    }
 }
 
 int asteriskd_anonymous_file_close(
@@ -202,7 +198,7 @@ int asteriskd_anonymous_file_create(
         file == NULL || (document->length != 0U && document->bytes == NULL) ||
         backend->create == NULL || backend->write == NULL || backend->rewind == NULL ||
         backend->add_seals == NULL || backend->get_seals == NULL || backend->close == NULL) {
-        anonymous_error(error, error_size, "invalid anonymous file input");
+        asteriskd_error_copy(error, error_size, "invalid anonymous file input");
         return ASTERISKD_CONFIG_INVALID;
     }
     int fd = -1;
@@ -210,7 +206,7 @@ int asteriskd_anonymous_file_create(
         ASTERISKD_ANONYMOUS_CREATE_ALLOW_SEALING;
     if (backend->create(backend->context, name, create_flags, &fd) != 0 || fd < 0) {
         if (fd >= 0) (void)backend->close(backend->context, fd);
-        anonymous_error(error, error_size, "anonymous file creation failed");
+        asteriskd_error_copy(error, error_size, "anonymous file creation failed");
         return ASTERISKD_CONFIG_IO;
     }
     file->fd = fd;
@@ -233,7 +229,7 @@ int asteriskd_anonymous_file_create(
 
 io_failure:
     (void)asteriskd_anonymous_file_close(backend, file);
-    anonymous_error(error, error_size, "anonymous file preparation failed");
+    asteriskd_error_copy(error, error_size, "anonymous file preparation failed");
     return ASTERISKD_CONFIG_IO;
 }
 
@@ -322,7 +318,7 @@ int asteriskd_child_setup_run(
         backend->set_gid == NULL || backend->set_uid == NULL ||
         backend->set_parent_death_signal == NULL || backend->get_parent_pid == NULL ||
         backend->prepare_descriptors == NULL || backend->exec_process == NULL) {
-        anonymous_error(error, error_size, "invalid child setup input");
+        asteriskd_error_copy(error, error_size, "invalid child setup input");
         return ASTERISKD_CONFIG_INVALID;
     }
     if (backend->restore_signals(backend->context) != 0) goto failed;
@@ -343,7 +339,7 @@ int asteriskd_child_setup_run(
     return 0;
 
 failed:
-    anonymous_error(error, error_size, "child setup failed");
+    asteriskd_error_copy(error, error_size, "child setup failed");
     return ASTERISKD_CONFIG_IO;
 }
 
@@ -406,7 +402,7 @@ int asteriskd_process_identity_read(
         spec == NULL || spec->argc == 0U || spec->argc > ASTERISKD_MAX_PROCESS_ARGV ||
         identity == NULL || backend->read_stat == NULL ||
         backend->read_exe_identity == NULL || backend->read_cmdline == NULL) {
-        anonymous_error(error, error_size, "invalid process identity input");
+        asteriskd_error_copy(error, error_size, "invalid process identity input");
         return ASTERISKD_CONFIG_INVALID;
     }
     const char *reason = "stat-unreadable";
@@ -1181,7 +1177,7 @@ int asteriskd_process_spawn_system(
         spec->environment == NULL || spec->inherited_fd_count > ASTERISKD_PROCESS_MAX_INHERITED_FDS ||
         spec->output_mode < ASTERISKD_PROCESS_OUTPUT_CAPTURE ||
         spec->output_mode >= ASTERISKD_PROCESS_OUTPUT_COUNT) {
-        anonymous_error(error, error_size, "invalid spawn input");
+        asteriskd_error_copy(error, error_size, "invalid spawn input");
         return ASTERISKD_CONFIG_INVALID;
     }
 #if defined(__linux__)
@@ -1271,10 +1267,10 @@ spawn_failed:
     system_spawn_close_pipe(stderr_pipe);
     system_spawn_close_pipe(status_pipe);
     system_spawn_close_fd(&output_fd);
-    anonymous_error(error, error_size, "process spawn failed");
+    asteriskd_error_copy(error, error_size, "process spawn failed");
     return ASTERISKD_CONFIG_IO;
 #else
-    anonymous_error(error, error_size, "system process spawn is unavailable");
+    asteriskd_error_copy(error, error_size, "system process spawn is unavailable");
     return ASTERISKD_CONFIG_IO;
 #endif
 }

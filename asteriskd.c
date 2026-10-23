@@ -147,8 +147,6 @@ int asteriskd_cli_main(int argc, const char *const *argv) {
     return asteriskd_cli_main_with_backend(argc, argv, &system_cli_backend, NULL);
 }
 
-#ifndef ASTERISKD_TESTING
 int main(int argc, char **argv) {
     return asteriskd_cli_main(argc, (const char *const *)argv);
 }
-#endif

@@ -14,6 +14,27 @@ nonzero. A clean explicit stop succeeds only after telemetry reaches `stopped`.
 The source root is build-system agnostic. The Android parent project compiles
 every top-level `.c` file as one PIE executable.
 
+## Source layout
+
+| Files | Responsibility |
+| --- | --- |
+| `asteriskd.c`, `asteriskd_control.c` | CLI entry point, control protocol and socket server |
+| `asteriskd_runtime.c` | Platform-neutral reactor, lifecycle driver and event publication |
+| `asteriskd_supervisor.c` | Linux supervisor: reactor backend, service control, children, lifecycle effects, cleanup |
+| `asteriskd_supervisor_action.c` | Short-lived root actions (iptables, ip, tc, sh) and rule batch scripts |
+| `asteriskd_supervisor_xtables.c` | iptables rule rendering, private chains, hooks and rule snapshots |
+| `asteriskd_supervisor_tc.c` | TC commands and netlink probes |
+| `asteriskd_supervisor_rules.c` | Routes, BPF pins, sysctl effects and the rules backend |
+| `asteriskd_supervisor_network.c` | Matcher/helper start, network open, local bypass and hotspot offload |
+| `asteriskd_supervisor_reconcile.c` | Stateless owned-resource reconciliation |
+| `asteriskd_supervisor_dns.c`, `asteriskd_dns.c` | DNS enhancement transitions and the AEN1 companion client |
+| `asteriskd_util.c`, `asteriskd_text.c` | Shared error, string, text-writer and byte-buffer helpers |
+
+`asteriskd.h` is the shared module interface. `asteriskd_supervisor.h` is private
+to the runtime and supervisor modules. Non-static functions use the
+`asteriskd_<module>_` prefix; file-local helpers in supervisor modules use
+`system_`. `.clang-format` records the formatting baseline.
+
 ## CLI
 
 ```text
@@ -196,9 +217,9 @@ resident supervisor's in-memory effect journal.
 
 The daemon is the only writer of `asteriskd.log`. It opens the file through a
 no-symlink path, anchors ownership to the pre-existing app-owned log directory,
-forces mode 0600, and emits bounded JSONL. Child stdout/stderr are framed,
-UTF-8-repaired, control-escaped, truncated at the fixed limit, and redacted for
-the exact AGE secret before persistence.
+forces mode 0600, and emits bounded JSONL with the exact AGE secret redacted.
+Core and bpf2socks helper stdout/stderr are appended directly to `error.log`;
+matcher and HEV helper output is discarded.
 
 The only persistent runtime artifacts are the app-published core config and
 `asteriskd.json`, daemon-owned telemetry file `asteriskd.state`, app-owned
@@ -238,12 +259,11 @@ and prepared again within a bounded startup window. The legacy mode is unchanged
 
 ## Verification and device boundary
 
-Host tests use explicit fake backends and compile with
-`-Wall -Wextra -Werror -std=c17`. Production sources must also compile for
-Android API 24 on arm64-v8a, armeabi-v7a, x86, and x86_64. Host tests cannot
-prove rooted-device SELinux, abstract-UDS peer credentials, inherited OFD
-locking, `/proc` identity races, netlink/BPF/TC kernel ABI, or filesystem label
-behavior; those remain mandatory device integration checks.
+Production sources compile with `-Wall -Wextra -std=c17` for Android API 26 on
+arm64-v8a, armeabi-v7a, x86, and x86_64. Compilation cannot prove rooted-device
+SELinux, abstract-UDS peer credentials, inherited OFD locking, `/proc` identity
+races, netlink/BPF/TC kernel ABI, or filesystem label behavior; those remain
+mandatory device integration checks.
 
 ## License
 

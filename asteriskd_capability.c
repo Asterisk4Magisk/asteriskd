@@ -11,10 +11,6 @@ static const char *const capability_rules[] = {
     "allow netutils_wrapper * bpf { prog_run map_read map_write }",
 };
 
-static void capability_error(char *error, size_t error_size, const char *message) {
-    if (error != NULL && error_size != 0U) (void)snprintf(error, error_size, "%s", message);
-}
-
 static bool absolute_normal_path(const char *path) {
     if (path == NULL || path[0] != '/' || path[1] == '\0' ||
         strnlen(path, ASTERISKD_MAX_PATH) >= ASTERISKD_MAX_PATH) return false;
@@ -28,13 +24,6 @@ static bool absolute_normal_path(const char *path) {
         component = slash + 1;
     }
     return true;
-}
-
-static int copy_path(char *destination, const char *source) {
-    size_t length = source == NULL ? 0U : strnlen(source, ASTERISKD_MAX_PATH);
-    if (length == 0U || length >= ASTERISKD_MAX_PATH) return -1;
-    memcpy(destination, source, length + 1U);
-    return 0;
 }
 
 static int executable_candidate(
@@ -62,7 +51,7 @@ static int fixed_candidate(
     const struct asteriskd_platform_capability_backend *backend,
     const char *fixed,
     char *path) {
-    if (copy_path(path, fixed) != 0) return -1;
+    if (asteriskd_copy_string(path, ASTERISKD_MAX_PATH, fixed) != 0) return -1;
     return executable_candidate(backend, path);
 }
 
@@ -172,14 +161,14 @@ int asteriskd_platform_capability_ensure(
     if (error != NULL && error_size != 0U) error[0] = '\0';
     if (config == NULL || backend == NULL || result == NULL || backend->find_on_path == NULL ||
         backend->inspect_executable == NULL || backend->execute == NULL) {
-        capability_error(error, error_size, "invalid platform capability input");
+        asteriskd_error_copy(error, error_size, "invalid platform capability input");
         return ASTERISKD_CONFIG_INVALID;
     }
     result->required = config->matcher.enabled || config->mode == ASTERISKD_MODE_BPF2SOCKS;
     if (!result->required) return 0;
     int found = select_tool(backend, &result->tool_kind, result->tool_path);
     if (found <= 0) {
-        capability_error(error, error_size, found < 0 ?
+        asteriskd_error_copy(error, error_size, found < 0 ?
             "platform capability discovery failed" : "platform capability tool not found");
         return 0;
     }
@@ -200,7 +189,7 @@ int asteriskd_platform_capability_ensure(
         }
         if (applied != 0) {
             result->partial_application = result->applied_rule_count != 0U;
-            capability_error(error, error_size, result->partial_application ?
+            asteriskd_error_copy(error, error_size, result->partial_application ?
                 "platform capability partially applied" : "platform capability application failed");
             return 0;
         }

@@ -8,106 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-struct matcher_writer {
-    unsigned char *bytes;
-    size_t length;
-    size_t capacity;
-    int result;
-};
-
-static void matcher_error(char *error, size_t error_size, const char *message) {
-    if (error != NULL && error_size != 0U) (void)snprintf(error, error_size, "%s", message);
-}
-
-static int writer_reserve(struct matcher_writer *writer, size_t additional) {
-    if (writer->result != 0) return writer->result;
-    if (additional > ASTERISKD_MAX_JSON_SIZE || writer->length > ASTERISKD_MAX_JSON_SIZE - additional) {
-        writer->result = ASTERISKD_CONFIG_INVALID;
-        return writer->result;
-    }
-    size_t needed = writer->length + additional + 1U;
-    if (needed <= writer->capacity) return 0;
-    size_t capacity = writer->capacity == 0U ? 256U : writer->capacity;
-    while (capacity < needed) {
-        if (capacity > (ASTERISKD_MAX_JSON_SIZE + 1U) / 2U) {
-            capacity = ASTERISKD_MAX_JSON_SIZE + 1U;
-            break;
-        }
-        capacity *= 2U;
-    }
-    unsigned char *bytes = realloc(writer->bytes, capacity);
-    if (bytes == NULL) {
-        writer->result = ASTERISKD_CONFIG_NO_MEMORY;
-        return writer->result;
-    }
-    writer->bytes = bytes;
-    writer->capacity = capacity;
-    return 0;
-}
-
-static void writer_bytes(struct matcher_writer *writer, const char *bytes, size_t length) {
-    if (writer_reserve(writer, length) != 0) return;
-    memcpy(writer->bytes + writer->length, bytes, length);
-    writer->length += length;
-    writer->bytes[writer->length] = '\0';
-}
-
-static void writer_literal(struct matcher_writer *writer, const char *literal) {
-    writer_bytes(writer, literal, strlen(literal));
-}
-
-static void writer_format(struct matcher_writer *writer, const char *format, ...) {
-    va_list arguments;
-    va_start(arguments, format);
-    va_list copy;
-    va_copy(copy, arguments);
-    int count = vsnprintf(NULL, 0U, format, copy);
-    va_end(copy);
-    if (count < 0 || writer_reserve(writer, (size_t)count) != 0) {
-        va_end(arguments);
-        if (count < 0) writer->result = ASTERISKD_CONFIG_INVALID;
-        return;
-    }
-    int written = vsnprintf(
-        (char *)writer->bytes + writer->length,
-        writer->capacity - writer->length,
-        format,
-        arguments);
-    va_end(arguments);
-    if (written != count) {
-        writer->result = ASTERISKD_CONFIG_INVALID;
-        return;
-    }
-    writer->length += (size_t)count;
-}
-
-static int writer_take(
-    struct matcher_writer *writer,
-    struct asteriskd_anonymous_document *document) {
-    if (writer->result != 0) {
-        int result = writer->result;
-        free(writer->bytes);
-        memset(writer, 0, sizeof(*writer));
-        return result;
-    }
-    if (writer->bytes == NULL) {
-        writer->bytes = calloc(1U, 1U);
-        if (writer->bytes == NULL) return ASTERISKD_CONFIG_NO_MEMORY;
-    }
-    document->bytes = writer->bytes;
-    document->length = writer->length;
-    memset(writer, 0, sizeof(*writer));
-    return 0;
-}
-
-static int uint32_compare(const void *left, const void *right) {
-    uint32_t a = *(const uint32_t *)left;
-    uint32_t b = *(const uint32_t *)right;
-    return a < b ? -1 : a > b ? 1 : 0;
-}
-
 static int render_uid_array(
-    struct matcher_writer *writer,
+    struct asteriskd_text_writer *writer,
     const uint32_t *values,
     size_t count,
     bool add_whitelist_system_uids) {
@@ -121,16 +23,16 @@ static int render_uid_array(
         sorted[length++] = 0U;
         sorted[length++] = 1052U;
     }
-    qsort(sorted, length, sizeof(*sorted), uint32_compare);
-    writer_literal(writer, "[");
+    qsort(sorted, length, sizeof(*sorted), asteriskd_compare_u32);
+    asteriskd_text_writer_literal(writer, "[");
     bool first = true;
     for (size_t index = 0U; index < length; ++index) {
         if (index != 0U && sorted[index] == sorted[index - 1U]) continue;
-        if (!first) writer_literal(writer, ",");
-        writer_format(writer, "%u", sorted[index]);
+        if (!first) asteriskd_text_writer_literal(writer, ",");
+        asteriskd_text_writer_format(writer, "%u", sorted[index]);
         first = false;
     }
-    writer_literal(writer, "]");
+    asteriskd_text_writer_literal(writer, "]");
     free(sorted);
     return writer->result;
 }
@@ -139,12 +41,12 @@ static int render_direct_family(
     const char values[][ASTERISKD_MAX_CIDR],
     size_t count,
     struct asteriskd_anonymous_document *document) {
-    struct matcher_writer writer = {0};
+    struct asteriskd_text_writer writer = {0};
     for (size_t index = 0U; index < count; ++index) {
-        writer_literal(&writer, values[index]);
-        writer_literal(&writer, "\n");
+        asteriskd_text_writer_literal(&writer, values[index]);
+        asteriskd_text_writer_literal(&writer, "\n");
     }
-    return writer_take(&writer, document);
+    return asteriskd_text_writer_take(&writer, document);
 }
 
 void asteriskd_matcher_documents_destroy(struct asteriskd_matcher_documents *documents) {
@@ -167,27 +69,27 @@ int asteriskd_matcher_render_documents(
     if (config == NULL || documents == NULL || !config->matcher.enabled ||
         (config->mode != ASTERISKD_MODE_TPROXY &&
          config->mode != ASTERISKD_MODE_TUN2SOCKS)) {
-        matcher_error(error, error_size, "invalid matcher document configuration");
+        asteriskd_error_copy(error, error_size, "invalid matcher document configuration");
         return ASTERISKD_CONFIG_INVALID;
     }
     const char *root = asteriskd_owned_resource_catalog()->bpf_root;
     if (config->direct_cidrs != NULL &&
         (direct_ipv4_fd < 0 || direct_ipv6_fd < 0)) {
-        matcher_error(error, error_size, "invalid matcher descriptor configuration");
+        asteriskd_error_copy(error, error_size, "invalid matcher descriptor configuration");
         return ASTERISKD_CONFIG_INVALID;
     }
     int mode = config->app_policy_mode == ASTERISKD_APP_POLICY_BLACKLIST ? 0 :
         config->app_policy_mode == ASTERISKD_APP_POLICY_WHITELIST ? 1 : 2;
-    struct matcher_writer writer = {0};
-    writer_format(&writer, "{\"version\":1,\"mode\":%d,\"uids\":", mode);
+    struct asteriskd_text_writer writer = {0};
+    asteriskd_text_writer_format(&writer, "{\"version\":1,\"mode\":%d,\"uids\":", mode);
     int result = render_uid_array(&writer, config->uids, config->uid_count,
         config->app_policy_mode == ASTERISKD_APP_POLICY_WHITELIST);
     if (result == 0) {
-        writer_literal(&writer, ",\"bypassUids\":");
+        asteriskd_text_writer_literal(&writer, ",\"bypassUids\":");
         result = render_uid_array(&writer, config->bypass_uids, config->bypass_uid_count, false);
     }
     if (result == 0) {
-        writer_format(&writer,
+        asteriskd_text_writer_format(&writer,
             ",\"bypassDirectCidrs\":%s,\"enableIpv6\":%s,"
             "\"directCidrPathV4\":\"%s\",\"directCidrPathV6\":\"%s\","
             "\"xtOutputV4ProgramPath\":\"%s/xt_output_v4\","
@@ -200,7 +102,7 @@ int asteriskd_matcher_render_documents(
             config->direct_cidrs != NULL ? "/proc/self/fd/5" : "",
             root, root, root, root, config->dns_enhancement
                 ? asteriskd_owned_pin_path(ASTERISKD_PIN_MATCHER_DNS_UID) : "");
-        result = writer_take(&writer, &documents->policy);
+        result = asteriskd_text_writer_take(&writer, &documents->policy);
     }
     if (result == 0 && config->direct_cidrs != NULL) {
         result = render_direct_family((const char (*)[ASTERISKD_MAX_CIDR])config->direct_cidrs->ipv4,
@@ -213,29 +115,10 @@ int asteriskd_matcher_render_documents(
     if (result != 0) {
         free(writer.bytes);
         asteriskd_matcher_documents_destroy(documents);
-        matcher_error(error, error_size, result == ASTERISKD_CONFIG_NO_MEMORY ?
+        asteriskd_error_copy(error, error_size, result == ASTERISKD_CONFIG_NO_MEMORY ?
             "matcher document allocation failed" : "invalid matcher document configuration");
     }
     return result;
-}
-
-static int copy_path(char *destination, size_t capacity, const char *source) {
-    size_t length = source == NULL ? 0U : strnlen(source, capacity);
-    if (length == 0U || length >= capacity) return -1;
-    memcpy(destination, source, length + 1U);
-    return 0;
-}
-
-static int process_add_fd(struct asteriskd_process_spec *spec, int source, int target) {
-    if (source < 0 || target < 0 ||
-        spec->inherited_fd_count >= ASTERISKD_PROCESS_MAX_INHERITED_FDS) return -1;
-    for (size_t index = 0U; index < spec->inherited_fd_count; ++index) {
-        if (spec->inherited_fds[index] == source || spec->inherited_fd_targets[index] == target) return -1;
-    }
-    spec->inherited_fds[spec->inherited_fd_count] = source;
-    spec->inherited_fd_targets[spec->inherited_fd_count] = target;
-    ++spec->inherited_fd_count;
-    return 0;
 }
 
 int asteriskd_matcher_process_spec(
@@ -250,26 +133,26 @@ int asteriskd_matcher_process_spec(
     if (spec != NULL) memset(spec, 0, sizeof(*spec));
     if (error != NULL && error_size != 0U) error[0] = '\0';
     if (config == NULL || spec == NULL || !config->matcher.enabled || policy_fd < 0 ||
-        copy_path(spec->working_directory, sizeof(spec->working_directory), config->working_directory) != 0 ||
-        copy_path(spec->executable_path, sizeof(spec->executable_path),
+        asteriskd_copy_string(spec->working_directory, sizeof(spec->working_directory), config->working_directory) != 0 ||
+        asteriskd_copy_string(spec->executable_path, sizeof(spec->executable_path),
             config->matcher.executable_path) != 0 ||
         asteriskd_process_environment_rebuild(inherited_environment, spec) != 0 ||
         asteriskd_process_argument_add(spec, spec->executable_path) != 0 ||
         asteriskd_process_argument_add(spec, "--start") != 0 ||
         asteriskd_process_argument_add(spec, "--policy") != 0 ||
         asteriskd_process_argument_add(spec, "/proc/self/fd/3") != 0 ||
-        process_add_fd(spec, policy_fd, 3) != 0) goto invalid;
+        asteriskd_process_inherit_fd(spec, policy_fd, 3) != 0) goto invalid;
     spec->uid = 0U;
     spec->gid = 0U;
     spec->output_mode = ASTERISKD_PROCESS_OUTPUT_DISCARD;
     spec->unlimited_locked_memory = true;
     if (config->direct_cidrs != NULL &&
-        (process_add_fd(spec, direct_ipv4_fd, 4) != 0 ||
-         process_add_fd(spec, direct_ipv6_fd, 5) != 0)) goto invalid;
+        (asteriskd_process_inherit_fd(spec, direct_ipv4_fd, 4) != 0 ||
+         asteriskd_process_inherit_fd(spec, direct_ipv6_fd, 5) != 0)) goto invalid;
     return 0;
 
 invalid:
-    matcher_error(error, error_size, "invalid matcher process configuration");
+    asteriskd_error_copy(error, error_size, "invalid matcher process configuration");
     asteriskd_process_spec_destroy(spec);
     return ASTERISKD_CONFIG_INVALID;
 }
@@ -297,7 +180,7 @@ int asteriskd_matcher_launch_prepare(
     if (launch != NULL) memset(launch, 0, sizeof(*launch));
     if (error != NULL && error_size != 0U) error[0] = '\0';
     if (config == NULL || backend == NULL || launch == NULL) {
-        matcher_error(error, error_size, "invalid matcher launch input");
+        asteriskd_error_copy(error, error_size, "invalid matcher launch input");
         return ASTERISKD_CONFIG_INVALID;
     }
     struct asteriskd_matcher_documents documents = {0};
@@ -344,9 +227,9 @@ int asteriskd_matcher_pin_plan_build(
         size_t source = config->enable_ipv6 ? index : ipv4_indices[index];
         struct asteriskd_matcher_pin_expectation *pin = &plan->pins[index];
         pin->pin_id = ids[source];
-        if (copy_path(pin->path, sizeof(pin->path),
+        if (asteriskd_copy_string(pin->path, sizeof(pin->path),
                 asteriskd_owned_pin_path(ids[source])) != 0 ||
-            copy_path(pin->program_name, sizeof(pin->program_name), names[source]) != 0) {
+            asteriskd_copy_string(pin->program_name, sizeof(pin->program_name), names[source]) != 0) {
             memset(plan, 0, sizeof(*plan));
             return ASTERISKD_CONFIG_INVALID;
         }

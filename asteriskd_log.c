@@ -37,14 +37,6 @@ static const char *const event_names[] = {
 };
 static const char *const stream_names[] = {"stdout", "stderr"};
 
-static void set_error(char *error, size_t error_size, const char *format, ...) {
-    if (error == NULL || error_size == 0U) return;
-    va_list arguments;
-    va_start(arguments, format);
-    (void)vsnprintf(error, error_size, format, arguments);
-    va_end(arguments);
-}
-
 static const char *core_start_failure_stage_name(
     enum asteriskd_core_start_failure_stage stage) {
     switch (stage) {
@@ -533,7 +525,7 @@ int asteriskd_log_open_append_fd_with_backend(
     if (out != NULL) *out = -1;
     if (out == NULL || !lexical_log_path_valid(path) ||
         !file_backend_complete(file_backend)) {
-        set_error(error, error_size, "invalid append log arguments");
+        asteriskd_error_format(error, error_size, "invalid append log arguments");
         return ASTERISKD_LOG_INVALID;
     }
     int fd = -1;
@@ -542,12 +534,12 @@ int asteriskd_log_open_append_fd_with_backend(
     memset(&parent_metadata, 0, sizeof(parent_metadata));
     if (open_log_path(path, file_backend, file_context, &fd, &parent_fd,
             &parent_metadata) != ASTERISKD_LOG_OK) {
-        set_error(error, error_size, "open append log failed");
+        asteriskd_error_format(error, error_size, "open append log failed");
         return ASTERISKD_LOG_IO;
     }
     if (file_backend->close_fd(file_context, parent_fd) != 0) {
         (void)file_backend->close_fd(file_context, fd);
-        set_error(error, error_size, "close append log parent failed");
+        asteriskd_error_format(error, error_size, "close append log parent failed");
         return ASTERISKD_LOG_IO;
     }
     *out = fd;
@@ -565,7 +557,7 @@ int asteriskd_log_open_append_fd(
 #else
     if (out != NULL) *out = -1;
     (void)path;
-    set_error(error, error_size, "system append log is unavailable");
+    asteriskd_error_format(error, error_size, "system append log is unavailable");
     return ASTERISKD_LOG_IO;
 #endif
 }
@@ -590,7 +582,7 @@ int asteriskd_log_open_with_backend(
         secret_length >= ASTERISKD_MAX_SECRET_KEY || (secret_length != 0U && secret == NULL) ||
         (secret_length != 0U &&
          (memchr(secret, '\r', secret_length) != NULL || memchr(secret, '\n', secret_length) != NULL))) {
-        set_error(error, error_size, "invalid logger arguments");
+        asteriskd_error_format(error, error_size, "invalid logger arguments");
         return ASTERISKD_LOG_INVALID;
     }
     int fd = -1;
@@ -600,7 +592,7 @@ int asteriskd_log_open_with_backend(
     if (open_log_path(
             path, file_backend, file_context, &fd, &parent_fd,
             &parent_metadata) != ASTERISKD_LOG_OK) {
-        set_error(error, error_size, "open structured log failed");
+        asteriskd_error_format(error, error_size, "open structured log failed");
         return ASTERISKD_LOG_IO;
     }
     logger->fd = fd;
@@ -616,7 +608,7 @@ int asteriskd_log_open_with_backend(
     logger->file_context = file_context;
     if (secret_length != 0U) memcpy(logger->age_secret, secret, secret_length);
     logger->age_secret_length = secret_length;
-    set_error(error, error_size, "ok");
+    asteriskd_error_format(error, error_size, "ok");
     return ASTERISKD_LOG_OK;
 }
 
@@ -637,7 +629,7 @@ int asteriskd_log_open(
         memset(logger, 0, sizeof(*logger));
         logger->fd = -1;
     }
-    set_error(error, error_size, "real structured log requires Linux; use injected host backend");
+    asteriskd_error_format(error, error_size, "real structured log requires Linux; use injected host backend");
     return ASTERISKD_LOG_IO;
 #else
     const struct asteriskd_clock_backend *selected_clock = clock == NULL ? &system_clock_backend : clock;
@@ -797,132 +789,19 @@ void asteriskd_log_stderr(enum asteriskd_log_level level,
     asteriskd_log_diagnostic(level, component, message, diagnostic_stderr, NULL);
 }
 
-static void partial_reset(struct asteriskd_log_partial *partial) {
-    memset(partial, 0, sizeof(*partial));
-}
-
-static int emit_partial(
-    struct asteriskd_logger *logger,
-    enum asteriskd_child_role role,
-    enum asteriskd_log_stream stream,
-    bool emit_empty) {
-    struct asteriskd_log_partial *partial = &logger->partials[role][stream];
-    if (!emit_empty && !partial->has_first_byte) return ASTERISKD_LOG_OK;
-    size_t visible_length = partial->raw_length < ASTERISKD_LOG_MAX_CHILD_LINE ?
-        partial->raw_length : ASTERISKD_LOG_MAX_CHILD_LINE;
-    if (visible_length > partial->kept_length) return ASTERISKD_LOG_INVALID;
-    int result = write_log_object(
-        logger,
-        ASTERISKD_LOG_LEVEL_INFO,
-        role == ASTERISKD_CHILD_CORE ? ASTERISKD_COMPONENT_CORE : ASTERISKD_COMPONENT_HELPER,
-        ASTERISKD_LOG_EVENT_CHILD_OUTPUT,
-        true,
-        stream,
-        partial->bytes,
-        partial->kept_length,
-        visible_length,
-        partial->truncated);
-    partial_reset(partial);
-    return result;
-}
-
-static void partial_append(
-    struct asteriskd_log_partial *partial,
-    unsigned char byte,
-    uint64_t now_milliseconds,
-    size_t capture_limit) {
-    if (!partial->has_first_byte) {
-        partial->has_first_byte = true;
-        partial->first_byte_milliseconds = now_milliseconds;
-    }
-    if (partial->kept_length < capture_limit) {
-        partial->bytes[partial->kept_length++] = byte;
-    }
-    if (partial->raw_length != SIZE_MAX) ++partial->raw_length;
-    partial->last_raw_was_cr = byte == '\r';
-    partial->truncated = partial->raw_length > ASTERISKD_LOG_MAX_CHILD_LINE;
-}
-
-int asteriskd_log_child_bytes(
-    struct asteriskd_logger *logger,
-    enum asteriskd_child_role role,
-    enum asteriskd_log_stream stream,
-    const unsigned char *bytes,
-    size_t length,
-    uint64_t now_milliseconds,
-    bool eof) {
-    if (logger == NULL || !logger->opened || logger->failed ||
-        (role != ASTERISKD_CHILD_CORE && role != ASTERISKD_CHILD_HELPER) ||
-        stream < 0 || stream >= ASTERISKD_LOG_STREAM_COUNT || (length != 0U && bytes == NULL)) {
-        return logger != NULL && logger->failed ? ASTERISKD_LOG_IO : ASTERISKD_LOG_INVALID;
-    }
-    struct asteriskd_log_partial *partial = &logger->partials[role][stream];
-    size_t redaction_overlap = logger->age_secret_length == 0U ?
-        0U : logger->age_secret_length - 1U;
-    size_t capture_limit = ASTERISKD_LOG_MAX_CHILD_LINE + redaction_overlap;
-    for (size_t index = 0U; index < length; ++index) {
-        if (bytes[index] != '\n') {
-            partial_append(partial, bytes[index], now_milliseconds, capture_limit);
-            continue;
-        }
-        if (partial->raw_length != 0U && partial->last_raw_was_cr) {
-            size_t raw_before = partial->raw_length;
-            bool terminal_cr_was_kept = raw_before != SIZE_MAX &&
-                partial->kept_length == raw_before;
-            if (partial->raw_length != SIZE_MAX) --partial->raw_length;
-            if (terminal_cr_was_kept && partial->kept_length != 0U &&
-                partial->bytes[partial->kept_length - 1U] == '\r') --partial->kept_length;
-            partial->truncated = partial->raw_length > ASTERISKD_LOG_MAX_CHILD_LINE;
-        }
-        int result = emit_partial(logger, role, stream, true);
-        if (result != ASTERISKD_LOG_OK) return result;
-        partial = &logger->partials[role][stream];
-    }
-    if (eof) return emit_partial(logger, role, stream, false);
-    return ASTERISKD_LOG_OK;
-}
-
+/* Reports a failed logger to the reactor deadline path. */
 int asteriskd_log_flush_expired(struct asteriskd_logger *logger, uint64_t now_milliseconds) {
+    (void)now_milliseconds;
     if (logger == NULL || !logger->opened || logger->failed) {
         return logger != NULL && logger->failed ? ASTERISKD_LOG_IO : ASTERISKD_LOG_INVALID;
     }
-    for (int role = 0; role < 2; ++role) {
-        for (int stream = 0; stream < (int)ASTERISKD_LOG_STREAM_COUNT; ++stream) {
-            struct asteriskd_log_partial *partial = &logger->partials[role][stream];
-            if (!partial->has_first_byte || now_milliseconds < partial->first_byte_milliseconds ||
-                now_milliseconds - partial->first_byte_milliseconds < ASTERISKD_LOG_PARTIAL_TIMEOUT_MILLIS) continue;
-            int result = emit_partial(
-                logger, (enum asteriskd_child_role)role, (enum asteriskd_log_stream)stream, false);
-            if (result != ASTERISKD_LOG_OK) return result;
-        }
-    }
     return ASTERISKD_LOG_OK;
-}
-
-size_t asteriskd_log_buffered_bytes(
-    const struct asteriskd_logger *logger,
-    enum asteriskd_child_role role) {
-    if (logger == NULL || (role != ASTERISKD_CHILD_CORE && role != ASTERISKD_CHILD_HELPER)) return 0U;
-    size_t total = 0U;
-    for (int stream = 0; stream < (int)ASTERISKD_LOG_STREAM_COUNT; ++stream) {
-        total += logger->partials[role][stream].kept_length;
-    }
-    return total;
 }
 
 int asteriskd_log_close(struct asteriskd_logger *logger) {
     if (logger == NULL) return ASTERISKD_LOG_INVALID;
     if (!logger->opened) return logger->failed ? ASTERISKD_LOG_IO : ASTERISKD_LOG_OK;
     int result = logger->failed ? ASTERISKD_LOG_IO : ASTERISKD_LOG_OK;
-    if (!logger->failed) {
-        for (int role = 0; role < 2; ++role) {
-            for (int stream = 0; stream < (int)ASTERISKD_LOG_STREAM_COUNT; ++stream) {
-                int flush = emit_partial(
-                    logger, (enum asteriskd_child_role)role, (enum asteriskd_log_stream)stream, false);
-                if (flush != ASTERISKD_LOG_OK) result = flush;
-            }
-        }
-    }
     if (logger->fd_owned && logger->fd >= 0 && logger->file_backend != NULL &&
         logger->file_backend->close_fd(logger->file_context, logger->fd) != 0) {
         result = ASTERISKD_LOG_IO;
