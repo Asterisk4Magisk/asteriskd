@@ -196,7 +196,7 @@ struct asteriskd_service_control_config {
 struct asteriskd_service_control_runtime {
     const struct asteriskd_service_control_config *config;
     struct asteriskd_wifi_identity previous_wifi;
-    bool keyguard_baseline_established;
+    bool keyguard_event_received;
     bool keyguard_locked;
     bool wifi_baseline_established;
     bool wifi_connected;

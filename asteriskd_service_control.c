@@ -95,11 +95,13 @@ static enum asteriskd_service_action asteriskd_service_control_apply(
 
 enum asteriskd_service_action asteriskd_service_control_on_keyguard(
     struct asteriskd_service_control_runtime *runtime, bool locked, bool baseline) {
-    if (runtime == NULL) return ASTERISKD_SERVICE_ACTION_NONE;
-    bool changed = runtime->keyguard_baseline_established && runtime->keyguard_locked != locked;
-    runtime->keyguard_baseline_established = true;
+    // The initial isKeyguardLocked query and listener callbacks have different
+    // semantics. Only callbacks may establish the state used for deduplication.
+    if (runtime == NULL || baseline) return ASTERISKD_SERVICE_ACTION_NONE;
+    bool changed = !runtime->keyguard_event_received || runtime->keyguard_locked != locked;
+    runtime->keyguard_event_received = true;
     runtime->keyguard_locked = locked;
-    if (baseline || !changed || !runtime->config || !runtime->config->enabled ||
+    if (!changed || !runtime->config || !runtime->config->enabled ||
         !runtime->config->keyguard.enabled) return ASTERISKD_SERVICE_ACTION_NONE;
     const struct asteriskd_keyguard_control_config *rule = &runtime->config->keyguard;
     if (locked ? rule->lock_stop : rule->unlock_stop)

@@ -107,9 +107,12 @@ environment, and configuration content are never exposed.
 
 Android 13+ can enable `serviceControl.keyguard`: `enabled`, `lockStart`,
 `lockStop`, `unlockStart`, and `unlockStop`. Start/stop for the same event are
-mutually exclusive. Initial state establishes a baseline; duplicate state
-notifications do not trigger actions. This follows Keyguard showing/dismissed
-state, not display power or credential-storage unlock.
+mutually exclusive. The initial query validates initialization without triggering
+an action or seeding callback deduplication: `isKeyguardLocked()` can differ from
+the listener's showing state when another app temporarily disables the keyguard.
+The first callback after priming is eligible for an action; later callbacks that
+repeat the last callback value do not trigger actions. This follows Keyguard
+showing/dismissed state, not display power or credential-storage unlock.
 
 The native supervisor loads `libbinder_ndk` only when this control is enabled,
 registers a WindowManager listener, and adds the Binder fd to its existing
