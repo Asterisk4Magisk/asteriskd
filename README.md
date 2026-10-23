@@ -211,9 +211,42 @@ operator or a later normal service action to handle.
 One reactor owns signals, control clients, child setup/log/pidfd events,
 route-netlink input, debounce deadlines, readiness, action commands, and stop
 deadlines. Netlink subscribes before the initial snapshot, drains to `EAGAIN`,
-and performs a full reconcile after the 1500 ms trailing debounce or any
-integrity loss. System-IPv6 disablement records original values only in the
-resident supervisor's in-memory effect journal.
+and performs a full reconcile for routing changes after the 1500 ms trailing
+debounce or any integrity loss. Events used only by the system IPv6 guard do
+not schedule a full rules reconcile.
+
+`disableSystemIpv6` disables IPv6 only on netd data networks available to
+ordinary applications. The guard identifies them from IPv6 FIB rules: a global
+explicit-network fwmark rule with a nonzero netId, permission `NONE`, and no UID
+range, plus an `oif` rule for the same table. The table must be in the range
+`1000 < table < 1000000000`, and `table - 1000` must equal the named interface's
+ifindex when entering the guarded set. Classification does not
+depend on rule priority or interface-name prefixes. Restricted `NETWORK` or
+`SYSTEM` networks, including IMS, emergency and background networks, remain
+untouched, as do interfaces outside netd's data-network set, including the
+core's TUN. Loopback and `ipsec+` interfaces are always excluded.
+
+The existing netlink socket watches IPv6 rule changes. Startup obtains one
+`RTM_GETRULE` snapshot through a separate socket with a one-second receive
+timeout; integrity loss or a socket reopen requests another snapshot after
+pending events drain. There is no polling or child process for classification.
+Rule membership is deduplicated by identity, so a snapshot and a queued event
+for the same rule do not count it twice. Interrupted dumps preserve the previous
+set and report a sync failure.
+Entering the data-network set disables IPv6. Link and IPv6 address events
+reapply the guard only to interfaces whose name and ifindex match that set, including when
+Android re-enables IPv6. Pending disable/restore requests for the same
+interface use the latest requested state.
+
+Original `disable_ipv6` values exist only in the resident supervisor's
+in-memory effect journal. Leaving the data-network set, including a change to
+restricted permission, restores the recorded value so a persistent cellular
+interface can be reused by IMS. Graceful cleanup also restores recorded values.
+A vanished interface is skipped on apply and its journal entry is discarded
+on restore. A failed restore logs a warning and remains journaled for graceful
+cleanup to retry; no value is recovered from disk after a crash. Startup logs
+the detected network classifications, and guard changes log the interface
+whose IPv6 was disabled or restored.
 
 The daemon is the only writer of `asteriskd.log`. It opens the file through a
 no-symlink path, anchors ownership to the pre-existing app-owned log directory,
@@ -249,8 +282,9 @@ including UID selection, CIDR and interface bypasses, matcher decisions, and the
 IPv6 switch. They do not receive a separate DNS classification or an exemption
 from address bypasses. Marked system DNS retains its dedicated routing path even
 when ordinary IPv6 proxying is disabled. Core identity bypasses and the existing
-hotspot DNS policy remain in effect. Disabling system IPv6 also disables its
-DNS transport; this differs from disabling ordinary IPv6 proxying.
+hotspot DNS policy remain in effect. Disabling system IPv6 also disables IPv6
+DNS transport on guarded data networks; this differs from disabling ordinary
+IPv6 proxying.
 
 Startup and resume verify consumers, installed rules, and the module
 PREPARE/ACTIVATE exchange. They do not send synthetic DNS queries or inject

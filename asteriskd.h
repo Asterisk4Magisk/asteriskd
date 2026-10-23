@@ -1329,6 +1329,13 @@ int asteriskd_effect_journal_apply(
 int asteriskd_effect_journal_rollback(
     struct asteriskd_effect_journal *, const struct asteriskd_effect_backend *,
     char *, size_t);
+/* Restores one journaled effect; an effect that was never applied is a no-op. */
+int asteriskd_effect_journal_restore(
+    struct asteriskd_effect_journal *, const struct asteriskd_effect *,
+    const struct asteriskd_effect_backend *, char *, size_t);
+/* Drops a journaled effect whose resource no longer exists. */
+void asteriskd_effect_journal_forget(
+    struct asteriskd_effect_journal *, const struct asteriskd_effect *);
 
 struct asteriskd_resource_operation {
     enum asteriskd_resource_operation_kind kind;
@@ -2074,6 +2081,8 @@ void asteriskd_control_server_destroy(
 
 struct asteriskd_network_effect_request {
     struct asteriskd_effect effect;
+    /* Restore the journaled original value instead of applying the effect. */
+    bool restore;
 };
 
 struct asteriskd_network_effect_sink {
@@ -2390,6 +2399,7 @@ const struct asteriskd_bpf_program_backend *asteriskd_system_bpf_program_backend
 #define ASTERISKD_NETWORK_GROUP_LINK UINT32_C(0x00000001)
 #define ASTERISKD_NETWORK_GROUP_IPV4_ADDRESS UINT32_C(0x00000010)
 #define ASTERISKD_NETWORK_GROUP_IPV6_ADDRESS UINT32_C(0x00000100)
+#define ASTERISKD_NETWORK_GROUP_IPV6_RULE UINT32_C(0x00040000)
 #define ASTERISKD_NETWORK_RECEIVE_BUFFER_SIZE (1024U * 1024U)
 #define ASTERISKD_NETWORK_SOCKET_RAW UINT32_C(0x1)
 #define ASTERISKD_NETWORK_SOCKET_NONBLOCK UINT32_C(0x2)
@@ -2397,6 +2407,7 @@ const struct asteriskd_bpf_program_backend *asteriskd_system_bpf_program_backend
 
 struct asteriskd_network_event;
 struct asteriskd_event_batch;
+struct asteriskd_netd_rule;
 
 enum asteriskd_network_receive_result {
     ASTERISKD_NETWORK_RECEIVE_DATA,
@@ -2413,7 +2424,19 @@ struct asteriskd_network_backend {
         void *, int, void *, size_t, size_t *, uint32_t *, bool *);
     int (*interface_name)(void *, uint32_t, char *, size_t);
     int (*ipv6_disabled)(void *, const char *, uint32_t, uint8_t *, bool *);
+    /* Opens a blocking, time-bounded socket with an IPv6 FIB rule dump in flight. */
+    int (*dump_ipv6_rules)(void *, int *);
     int (*close)(void *, int);
+};
+
+/* A netd per-interface routing table, learned from its IPv6 FIB rules. */
+struct asteriskd_netd_network {
+    uint32_t table;
+    char interface_name[ASTERISKD_MAX_INTERFACE_NAME];
+    uint16_t output_rules;
+    uint16_t unrestricted_rules;
+    uint16_t restricted_rules;
+    bool ipv6_guarded;
 };
 
 struct asteriskd_network_runtime {
@@ -2431,6 +2454,11 @@ struct asteriskd_network_runtime {
     struct asteriskd_network_effect_request
         immediate_requests[ASTERISKD_MAX_NETWORK_IMMEDIATE_REQUESTS];
     size_t immediate_request_count;
+    struct asteriskd_netd_network netd_networks[ASTERISKD_MAX_INTERFACES];
+    size_t netd_network_count;
+    struct asteriskd_netd_rule *netd_rules;
+    bool netd_network_overflow;
+    bool ipv6_guard_resync;
 };
 
 int asteriskd_network_open(
@@ -2454,6 +2482,11 @@ int asteriskd_network_apply_immediate(
     struct asteriskd_network_runtime *, char *, size_t);
 int asteriskd_network_reopen(
     struct asteriskd_network_runtime *, uint64_t, char *, size_t);
+/* Rebuilds the netd network set from an IPv6 rule dump and queues guard changes. */
+int asteriskd_network_sync_ipv6_guard(struct asteriskd_network_runtime *, char *, size_t);
+/* Writes "name:state" pairs (data, restricted, incomplete) for diagnostics. */
+void asteriskd_network_describe_ipv6_guard(
+    const struct asteriskd_network_runtime *, char *, size_t);
 const struct asteriskd_network_backend *asteriskd_system_network_backend(void);
 
 #define ASTERISKD_HOTSPOT_TC_PRIORITY 1U

@@ -930,49 +930,66 @@ int asteriskd_supervisor_network_effect_dispatch(void *opaque,
         request->effect.kind != ASTERISKD_EFFECT_SYSCTL) {
         return ASTERISKD_STATE_INVALID;
     }
-    return asteriskd_supervisor_effect_apply_sysctl(
-        system, &request->effect.resource.sysctl, error, error_size);
-}
-
-static int system_apply_ipv6_guard(
-    struct asteriskd_system_supervisor *system, const char *name, uint32_t index) {
-    struct asteriskd_resource_operation record;
-    memset(&record, 0, sizeof(record));
-    record.kind = ASTERISKD_RESOURCE_OPERATION_SYSCTL;
-    record.resource.sysctl.sysctl_id = ASTERISKD_SYSCTL_DISABLE_IPV6;
-    (void)snprintf(record.resource.sysctl.interface_name,
-        sizeof(record.resource.sysctl.interface_name), "%s", name);
-    record.resource.sysctl.interface_index = index;
-    record.resource.sysctl.original_value = 0U;
-    record.resource.sysctl.desired_value = 1U;
+    const struct asteriskd_sysctl_resource *sysctl = &request->effect.resource.sysctl;
+    char message[160U];
     uint8_t current = 0U;
-    int read_result = asteriskd_supervisor_sysctl_read(&record.resource.sysctl, &current);
-    if (read_result == 1 || (read_result == 0 && current == 1U)) return 0;
-    if (read_result != 0 || current != 0U) return -1;
-    char error[128U];
-    return asteriskd_supervisor_effect_apply_sysctl(
-        system, &record.resource.sysctl, error, sizeof(error));
+    int present = asteriskd_supervisor_sysctl_read(sysctl, &current);
+    if (!request->restore) {
+        // The interface may disappear between the netlink event and this request.
+        if (present == 1) return 0;
+        int applied = asteriskd_supervisor_effect_apply_sysctl(system, sysctl, error, error_size);
+        if (applied == 0 && sysctl->sysctl_id == ASTERISKD_SYSCTL_DISABLE_IPV6 &&
+            snprintf(message, sizeof(message), "system IPv6 disabled: interface=%s",
+                sysctl->interface_name) > 0) {
+            (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_INFO,
+                ASTERISKD_COMPONENT_NETWORK, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+        }
+        return applied;
+    }
+    struct asteriskd_effect_backend backend = asteriskd_supervisor_effect_backend(system);
+    if (present == 1) {
+        // The interface is gone, so there is nothing left to restore.
+        asteriskd_effect_journal_forget(&system->volatile_effects, &request->effect);
+        return 0;
+    }
+    char restore_error[128U] = {0};
+    int restored = asteriskd_effect_journal_restore(&system->volatile_effects,
+        &request->effect, &backend, restore_error, sizeof(restore_error));
+    // A failed restore stays journaled; graceful cleanup retries it.
+    int written = restored == 0
+        ? snprintf(message, sizeof(message), "system IPv6 restored: interface=%s",
+            sysctl->interface_name)
+        : snprintf(message, sizeof(message), "system IPv6 restore deferred: interface=%s detail=%s",
+            sysctl->interface_name, restore_error[0] == '\0' ? "unavailable" : restore_error);
+    if (written > 0) {
+        (void)asteriskd_log_line(&system->logger,
+            restored == 0 ? ASTERISKD_LOG_LEVEL_INFO : ASTERISKD_LOG_LEVEL_WARNING,
+            ASTERISKD_COMPONENT_NETWORK, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+    }
+    return 0;
 }
 
-int asteriskd_supervisor_apply_initial_ipv6_guard(struct asteriskd_system_supervisor *system) {
+int asteriskd_supervisor_sync_ipv6_guard(struct asteriskd_system_supervisor *system) {
     if (!system->loaded_config.config.disable_system_ipv6) return 0;
-    DIR *directory = opendir("/proc/sys/net/ipv6/conf");
-    if (directory == NULL) return -1;
-    int result = 0;
-    struct dirent *entry;
-    while ((entry = readdir(directory)) != NULL) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0 ||
-            strcmp(entry->d_name, "all") == 0 || strcmp(entry->d_name, "default") == 0 ||
-            strcmp(entry->d_name, "lo") == 0 ||
-            asteriskd_interface_matches_selector(entry->d_name, "ipsec+")) continue;
-        unsigned index = if_nametoindex(entry->d_name);
-        if (index == 0U || system_apply_ipv6_guard(system, entry->d_name, index) != 0) {
-            result = -1;
-            break;
+    char error[128U] = {0};
+    if (asteriskd_network_sync_ipv6_guard(&system->network, error, sizeof(error)) != 0 ||
+        asteriskd_network_apply_immediate(&system->network, error, sizeof(error)) != 0) {
+        char message[192U];
+        if (snprintf(message, sizeof(message), "system IPv6 guard sync failed: detail=%s",
+                error[0] == '\0' ? "unavailable" : error) > 0) {
+            asteriskd_supervisor_log_failure(system, ASTERISKD_COMPONENT_NETWORK, message);
         }
+        return -1;
     }
-    if (closedir(directory) != 0) result = -1;
-    return result;
+    char networks[256U];
+    asteriskd_network_describe_ipv6_guard(&system->network, networks, sizeof(networks));
+    char message[320U];
+    if (snprintf(message, sizeof(message), "system IPv6 guard networks: %s",
+            networks[0] == '\0' ? "none" : networks) > 0) {
+        (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_INFO,
+            ASTERISKD_COMPONENT_NETWORK, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
+    }
+    return 0;
 }
 
 int asteriskd_supervisor_effect_rules(

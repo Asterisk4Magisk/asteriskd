@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/bpf.h>
+#include <linux/fib_rules.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <net/if.h>
@@ -18,6 +19,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 static int system_bpf(enum bpf_cmd command, union bpf_attr *attributes) {
@@ -383,12 +385,53 @@ static int system_network_ipv6_disabled(
     return 0;
 }
 
+static int system_network_dump_ipv6_rules(void *context, int *fd) {
+    (void)context;
+    if (fd == NULL) return -1;
+    *fd = -1;
+    int socket_fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+    if (socket_fd < 0) return -1;
+    // The kernel answers a dump synchronously; the timeout only bounds a stalled reply.
+    struct timeval timeout = {.tv_sec = 1, .tv_usec = 0};
+    struct {
+        struct nlmsghdr header;
+        struct fib_rule_hdr rule;
+    } request;
+    memset(&request, 0, sizeof(request));
+    request.header.nlmsg_len = sizeof(request);
+    request.header.nlmsg_type = RTM_GETRULE;
+    request.header.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    request.header.nlmsg_seq = 1U;
+    request.rule.family = AF_INET6;
+    struct sockaddr_nl kernel;
+    memset(&kernel, 0, sizeof(kernel));
+    kernel.nl_family = AF_NETLINK;
+    ssize_t sent;
+    if (setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) {
+        sent = -1;
+    } else {
+        do {
+            sent = sendto(socket_fd, &request, sizeof(request), 0,
+                (const struct sockaddr *)&kernel, sizeof(kernel));
+        } while (sent < 0 && errno == EINTR);
+    }
+    if (sent != (ssize_t)sizeof(request)) {
+        int saved = errno;
+        (void)close(socket_fd);
+        errno = saved;
+        return -1;
+    }
+    *fd = socket_fd;
+    return 0;
+}
+
 static const struct asteriskd_network_backend network_backend = {
     .context = NULL,
     .open = system_network_open,
     .receive = system_network_receive,
     .interface_name = system_network_interface_name,
     .ipv6_disabled = system_network_ipv6_disabled,
+    .dump_ipv6_rules = system_network_dump_ipv6_rules,
     .close = system_close,
 };
 

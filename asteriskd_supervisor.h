@@ -375,7 +375,7 @@ void asteriskd_supervisor_rules_backend_init(struct asteriskd_system_supervisor 
 int asteriskd_supervisor_network_effect_dispatch(void *opaque,
     const struct asteriskd_network_effect_request *request,
     char *error, size_t error_size);
-int asteriskd_supervisor_apply_initial_ipv6_guard(struct asteriskd_system_supervisor *system);
+int asteriskd_supervisor_sync_ipv6_guard(struct asteriskd_system_supervisor *system);
 int asteriskd_supervisor_effect_rules(
     void *opaque, bool *active, uint64_t *generation, uint32_t *categories);
 

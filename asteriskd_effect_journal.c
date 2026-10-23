@@ -184,6 +184,34 @@ int asteriskd_effect_journal_apply(
     return 0;
 }
 
+int asteriskd_effect_journal_restore(
+    struct asteriskd_effect_journal *journal,
+    const struct asteriskd_effect *effect,
+    const struct asteriskd_effect_backend *backend,
+    char *error, size_t error_size) {
+    effect_error_clear(error, error_size);
+    if (journal == NULL || effect == NULL || !effect_backend_valid(backend)) {
+        effect_error_copy(error, error_size, "invalid effect journal arguments");
+        return -1;
+    }
+    size_t index = effect_find(journal, effect);
+    if (index == journal->count) return 0;
+    int result = backend->undo(backend->context, &journal->entries[index], error, error_size);
+    if (result == 0) {
+        result = backend->verify_restored(
+            backend->context, &journal->entries[index], error, error_size);
+    }
+    if (result == 0) effect_remove(journal, index);
+    return result;
+}
+
+void asteriskd_effect_journal_forget(
+    struct asteriskd_effect_journal *journal, const struct asteriskd_effect *effect) {
+    if (journal == NULL || effect == NULL) return;
+    size_t index = effect_find(journal, effect);
+    if (index < journal->count) effect_remove(journal, index);
+}
+
 int asteriskd_effect_journal_rollback(
     struct asteriskd_effect_journal *journal,
     const struct asteriskd_effect_backend *backend,

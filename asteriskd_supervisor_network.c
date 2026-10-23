@@ -96,7 +96,7 @@ int asteriskd_supervisor_effect_open_network(void *opaque) {
     system->network_effect_sink.context = system;
     if (asteriskd_network_set_effect_sink(
             &system->network, &system->network_effect_sink) != 0) return -1;
-    return asteriskd_supervisor_apply_initial_ipv6_guard(system);
+    return asteriskd_supervisor_sync_ipv6_guard(system);
 }
 
 int asteriskd_supervisor_collect_local_address_set(
