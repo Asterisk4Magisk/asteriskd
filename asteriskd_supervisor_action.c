@@ -446,46 +446,34 @@ int asteriskd_supervisor_action_run_argv(struct asteriskd_system_supervisor *sys
     return result;
 }
 
-static int system_byte_buffer_append_byte(
-    struct asteriskd_byte_buffer *batch, unsigned char byte) {
-    return asteriskd_byte_buffer_append(batch, &byte, 1U);
-}
-
-static int system_rule_batch_append_shell_argument(
-    struct asteriskd_byte_buffer *batch, const char *argument) {
-    if (argument == NULL || argument[0] == '\0' ||
-        system_byte_buffer_append_byte(batch, '\'') != 0) return -1;
-    for (size_t index = 0U; argument[index] != '\0'; ++index) {
-        unsigned char byte = (unsigned char)argument[index];
-        if (byte == '\n' || byte == '\r' || byte == '\0') return -1;
-        if (byte == '\'') {
-            static const char escaped[] = "'\\''";
-            if (asteriskd_byte_buffer_append(
-                    batch, escaped, sizeof(escaped) - 1U) != 0) return -1;
-        } else if (system_byte_buffer_append_byte(batch, byte) != 0) {
-            return -1;
-        }
+/*
+ * Appends one batch line of space-separated tokens. Tokens never contain
+ * whitespace or quotes, so iptables-restore and the ip queue split them
+ * exactly as the caller passed them.
+ */
+int asteriskd_supervisor_rule_batch_append_line(
+    struct asteriskd_byte_buffer *batch, const char *const *tokens) {
+    if (batch == NULL || tokens == NULL || tokens[0] == NULL) return -1;
+    for (size_t index = 0U; tokens[index] != NULL; ++index) {
+        const char *token = tokens[index];
+        size_t length = strlen(token);
+        if (length == 0U || strpbrk(token, " \t\r\n\"'\\") != NULL ||
+            (index != 0U && asteriskd_byte_buffer_append(batch, " ", 1U) != 0) ||
+            asteriskd_byte_buffer_append(batch, token, length) != 0) return -1;
     }
-    return system_byte_buffer_append_byte(batch, '\'');
-}
-
-int asteriskd_supervisor_rule_batch_append_shell_command(
-    struct asteriskd_byte_buffer *batch, const char *const *argv) {
-    if (batch == NULL || argv == NULL || argv[0] == NULL) return -1;
-    for (size_t index = 0U; argv[index] != NULL; ++index) {
-        if (index != 0U && system_byte_buffer_append_byte(batch, ' ') != 0) return -1;
-        if (system_rule_batch_append_shell_argument(batch, argv[index]) != 0) return -1;
-    }
-    return system_byte_buffer_append_byte(batch, '\n');
+    return asteriskd_byte_buffer_append(batch, "\n", 1U);
 }
 
 void asteriskd_supervisor_rule_batch_destroy(struct system_rule_command_batch *batch) {
     if (batch == NULL) return;
-    asteriskd_byte_buffer_destroy(&batch->xtables_before_ip);
-    asteriskd_byte_buffer_destroy(&batch->xtables_after_ip);
-    for (size_t index = 0U; index < ASTERISKD_IP_FAMILY_COUNT; ++index) {
-        asteriskd_byte_buffer_destroy(&batch->ip[index]);
+    for (size_t stage = 0U; stage < SYSTEM_RULE_BATCH_STAGES; ++stage) {
+        for (size_t family = 0U; family < ASTERISKD_IP_FAMILY_COUNT; ++family) {
+            for (size_t table = 0U; table < ASTERISKD_IP_TABLE_COUNT; ++table) {
+                asteriskd_byte_buffer_destroy(&batch->xtables[stage][family][table]);
+            }
+        }
     }
+    asteriskd_byte_buffer_destroy(&batch->ip);
     batch->ip_started = false;
     batch->active = false;
 }
@@ -530,47 +518,104 @@ static int system_action_run_document(
     return result;
 }
 
+static void system_rule_batch_log_failure(struct asteriskd_system_supervisor *system,
+    const char *phase, const char *family, int exit_status) {
+    char stderr_summary[256U];
+    asteriskd_supervisor_action_stderr_summary(system, stderr_summary, sizeof(stderr_summary));
+    char message[384U];
+    int written = snprintf(message, sizeof(message),
+        "rule batch commit failed: phase=%s family=%s exitStatus=%d stderr=%s",
+        phase, family, exit_status, stderr_summary);
+    if (written > 0 && (size_t)written < sizeof(message)) {
+        asteriskd_supervisor_log_failure(system, ASTERISKD_COMPONENT_RULES, message);
+    }
+}
+
+/* Commits one stage of one family through a single iptables-restore process. */
+static int system_rule_batch_flush_xtables(struct asteriskd_system_supervisor *system,
+    size_t stage, enum asteriskd_ip_family family) {
+    const char *table_names[ASTERISKD_IP_TABLE_COUNT];
+    for (size_t table = 0U; table < ASTERISKD_IP_TABLE_COUNT; ++table) {
+        table_names[table] = asteriskd_supervisor_table_name((enum asteriskd_ip_table)table);
+    }
+    struct asteriskd_byte_buffer document = {0};
+    const char *family_name = family == ASTERISKD_IP_FAMILY_IPV4 ? "ipv4" : "ipv6";
+    if (asteriskd_rule_batch_restore_render(table_names,
+            system->rule_commands.xtables[stage][family], ASTERISKD_IP_TABLE_COUNT,
+            &document.bytes, &document.length) != 0) {
+        system_rule_batch_log_failure(system, "render", family_name, -1);
+        return -1;
+    }
+    if (document.length == 0U) return 0;
+    const char *argv[] = {
+        family == ASTERISKD_IP_FAMILY_IPV4 ? "iptables-restore" : "ip6tables-restore",
+        "-w", "100", "--noflush", "/proc/self/fd/3", NULL,
+    };
+    int exit_status = -1;
+    int result = system_action_run_document(system, argv, &document, &exit_status);
+    asteriskd_byte_buffer_destroy(&document);
+    if (result == 0 && exit_status == 0) return 0;
+    /* A run failure is already logged by the action runner. */
+    if (result == 0) system_rule_batch_log_failure(system, "restore", family_name, exit_status);
+    return -1;
+}
+
+/* Runs queued ip commands in order through rtnetlink. */
+static int system_rule_batch_flush_ip(struct asteriskd_system_supervisor *system) {
+    const struct asteriskd_byte_buffer *queue = &system->rule_commands.ip;
+    size_t offset = 0U;
+    while (offset < queue->length) {
+        const unsigned char *newline = memchr(queue->bytes + offset, '\n', queue->length - offset);
+        if (newline == NULL) return -1;
+        size_t length = (size_t)(newline - (queue->bytes + offset));
+        char line[512U];
+        if (length == 0U || length >= sizeof(line)) return -1;
+        memcpy(line, queue->bytes + offset, length);
+        line[length] = '\0';
+        offset += length + 1U;
+        const char *tokens[24U];
+        size_t count = 0U;
+        char *cursor = NULL;
+        for (char *token = strtok_r(line, " ", &cursor); token != NULL;
+                token = strtok_r(NULL, " ", &cursor)) {
+            if (count == sizeof(tokens) / sizeof(tokens[0])) return -1;
+            tokens[count++] = token;
+        }
+        if (count < 3U || (strcmp(tokens[0], "4") != 0 && strcmp(tokens[0], "6") != 0)) return -1;
+        enum asteriskd_ip_family family = tokens[0][0] == '4'
+            ? ASTERISKD_IP_FAMILY_IPV4 : ASTERISKD_IP_FAMILY_IPV6;
+        int exit_status = -1;
+        if (asteriskd_supervisor_rtnl_ip(system, family, &tokens[1], count - 1U,
+                false, &exit_status) != 0 || exit_status != 0) {
+            system_rule_batch_log_failure(system, "ip",
+                family == ASTERISKD_IP_FAMILY_IPV4 ? "ipv4" : "ipv6", exit_status);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * Commits the queued commands: private chains, then routing, then hooks.
+ * Each table of each family is replaced atomically; a failed table leaves
+ * earlier commits in place for the caller's cleanup, as before.
+ */
 int asteriskd_supervisor_rule_batch_flush(
     struct asteriskd_system_supervisor *system) {
     struct system_rule_command_batch *batch = &system->rule_commands;
     if (!batch->active) return -1;
-    size_t command_length = batch->xtables_before_ip.length +
-        batch->ip[ASTERISKD_IP_FAMILY_IPV4].length +
-        batch->ip[ASTERISKD_IP_FAMILY_IPV6].length +
-        batch->xtables_after_ip.length;
-    if (command_length == 0U) return 0;
-    struct asteriskd_byte_buffer document = {0};
-    if (asteriskd_rule_batch_document_render(
-            batch->xtables_before_ip.bytes, batch->xtables_before_ip.length,
-            batch->ip[ASTERISKD_IP_FAMILY_IPV4].bytes,
-            batch->ip[ASTERISKD_IP_FAMILY_IPV4].length,
-            batch->ip[ASTERISKD_IP_FAMILY_IPV6].bytes,
-            batch->ip[ASTERISKD_IP_FAMILY_IPV6].length,
-            batch->xtables_after_ip.bytes, batch->xtables_after_ip.length,
-            &document.bytes, &document.length) != 0) {
-        asteriskd_supervisor_log_failure(system, ASTERISKD_COMPONENT_RULES,
-            "rule batch commit failed: phase=render");
-        return -1;
-    }
-    const char *argv[] = {"sh", "/proc/self/fd/3", NULL};
-    int exit_status = -1;
-    int result = system_action_run_document(
-        system, argv, &document, &exit_status);
-    asteriskd_byte_buffer_destroy(&document);
-    if (result == 0 && exit_status == 0) return 0;
-    /* A run failure is already logged by the action runner. */
-    if (result == 0) {
-        char stderr_summary[256U];
-        asteriskd_supervisor_action_stderr_summary(system, stderr_summary, sizeof(stderr_summary));
-        char message[384U];
-        int written = snprintf(message, sizeof(message),
-            "rule batch commit failed: phase=exit exitStatus=%d stderr=%s",
-            exit_status, stderr_summary);
-        if (written > 0 && (size_t)written < sizeof(message)) {
-            asteriskd_supervisor_log_failure(system, ASTERISKD_COMPONENT_RULES, message);
+    for (size_t family = 0U; family < ASTERISKD_IP_FAMILY_COUNT; ++family) {
+        if (system_rule_batch_flush_xtables(system, 0U, (enum asteriskd_ip_family)family) != 0) {
+            return -1;
         }
     }
-    return -1;
+    if (system_rule_batch_flush_ip(system) != 0) return -1;
+    for (size_t family = 0U; family < ASTERISKD_IP_FAMILY_COUNT; ++family) {
+        if (system_rule_batch_flush_xtables(system, 1U, (enum asteriskd_ip_family)family) != 0) {
+            return -1;
+        }
+    }
+    return 0;
 }
 
 static int system_capability_find(

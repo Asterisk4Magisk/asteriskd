@@ -91,6 +91,104 @@ static int system_owned_chain_presence(
     struct asteriskd_system_supervisor *,
     const struct asteriskd_owned_chain *, bool *);
 
+/*
+ * Owned-resource reconciliation reads each table once with "-S" and answers
+ * every presence probe from that listing. A mutation invalidates the table,
+ * which is listed again on its next probe. Without a listing, probes use the
+ * per-object commands as before.
+ */
+static const struct system_rule_view *system_owned_view(
+    struct asteriskd_system_supervisor *system,
+    enum asteriskd_ip_family family, enum asteriskd_ip_table table) {
+    if (!system->owned_snapshot_enabled) return NULL;
+    struct system_rule_view *view = &system->owned_xtables[family][table];
+    if (!system->owned_xtables_valid[family][table]) {
+        if (asteriskd_supervisor_rule_view_capture_table(system, family, table, view) != 0) {
+            return NULL;
+        }
+        system->owned_xtables_valid[family][table] = true;
+    }
+    return view;
+}
+
+static void system_owned_view_invalidate(struct asteriskd_system_supervisor *system,
+    enum asteriskd_ip_family family, enum asteriskd_ip_table table) {
+    system->owned_xtables_valid[family][table] = false;
+}
+
+static void system_owned_snapshot_release(struct asteriskd_system_supervisor *system) {
+    for (size_t family = 0U; family < ASTERISKD_IP_FAMILY_COUNT; ++family) {
+        for (size_t table = 0U; table < ASTERISKD_IP_TABLE_COUNT; ++table) {
+            asteriskd_supervisor_rule_view_destroy(&system->owned_xtables[family][table]);
+            system->owned_xtables_valid[family][table] = false;
+        }
+    }
+    system->owned_snapshot_enabled = false;
+}
+
+static bool system_listing_token_follows(const char *line, size_t length,
+    const char *needle) {
+    size_t needle_length = strlen(needle);
+    for (size_t offset = 0U; offset + needle_length <= length; ++offset) {
+        if (memcmp(line + offset, needle, needle_length) == 0 &&
+            (offset + needle_length == length || line[offset + needle_length] == ' ')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Counts listing lines that are this hook in "-S" form (exact) and lines that
+ * reach the same verdict in the same builtin chain (loose). Equal counts
+ * prove the listing has no differently spelled variant of the hook.
+ */
+static int system_owned_hook_listing_counts(const struct system_rule_view *view,
+    const struct asteriskd_owned_hook *hook, size_t *exact, size_t *loose) {
+    const char *arguments[10U];
+    size_t count = 0U;
+    const char *protocol = hook->dns_destination_protocol == ASTERISKD_DNS_TCP ? "tcp" : "udp";
+    bool dns = hook->dns_destination_protocol != ASTERISKD_DNS_NONE;
+    if (dns) {
+        arguments[count++] = "-p";
+        arguments[count++] = protocol;
+        arguments[count++] = "-m";
+        arguments[count++] = protocol;
+        arguments[count++] = "--dport";
+        arguments[count++] = "53";
+    }
+    arguments[count++] = "-j";
+    arguments[count++] = hook->target;
+    if (strcmp(hook->target, "REJECT") == 0) {
+        arguments[count++] = "--reject-with";
+        arguments[count++] = hook->family == ASTERISKD_IP_FAMILY_IPV6
+            ? "icmp6-port-unreachable" : "icmp-port-unreachable";
+    }
+    size_t position = 0U;
+    if (view->length == 0U || asteriskd_xtables_rule_output_locate(view->bytes, view->length,
+            hook->builtin_chain, arguments, count, exact, &position) != 0) return -1;
+    char prefix[ASTERISKD_MAX_CHAIN_NAME + 8U];
+    char verdict[ASTERISKD_MAX_CHAIN_NAME + 8U];
+    if (snprintf(prefix, sizeof(prefix), "-A %s ", hook->builtin_chain) >= (int)sizeof(prefix) ||
+        snprintf(verdict, sizeof(verdict), " -j %s", hook->target) >= (int)sizeof(verdict)) {
+        return -1;
+    }
+    size_t prefix_length = strlen(prefix);
+    *loose = 0U;
+    size_t offset = 0U;
+    while (offset < view->length) {
+        const char *line = view->bytes + offset;
+        const char *newline = memchr(line, '\n', view->length - offset);
+        size_t length = newline == NULL ? view->length - offset : (size_t)(newline - line);
+        offset += length + 1U;
+        if (length < prefix_length || memcmp(line, prefix, prefix_length) != 0) continue;
+        if (!system_listing_token_follows(line, length, verdict)) continue;
+        if (dns && !system_listing_token_follows(line, length, " --dport 53")) continue;
+        ++*loose;
+    }
+    return 0;
+}
+
 static int system_reconcile_hook(
     struct asteriskd_system_supervisor *system,
     const struct asteriskd_owned_hook *hook,
@@ -108,6 +206,15 @@ static int system_reconcile_hook(
         if (system_owned_chain_presence(system, target_chain, &target_present) != 0) return -1;
         if (!system_owned_hook_rule_probe_required(hook, target_present)) return 0;
     }
+    const struct system_rule_view *view = system_owned_view(system, hook->family, hook->table);
+    size_t exact = 0U;
+    size_t loose = 0U;
+    if (view != NULL &&
+        system_owned_hook_listing_counts(view, hook, &exact, &loose) == 0 && exact == loose) {
+        if (exact == 0U) return 0;
+        if (!remove) return -1;
+    }
+    // A present or ambiguous hook is checked and removed by the kernel's own matching.
     for (attempt = 0U; attempt < 64U; ++attempt) {
         int exit_status = -1;
         if (asteriskd_supervisor_xtables(system, hook->family, hook->table,
@@ -115,6 +222,7 @@ static int system_reconcile_hook(
                 &exit_status) != 0) return -1;
         if (exit_status == 1) return 0;
         if (exit_status != 0 || !remove) return -1;
+        system_owned_view_invalidate(system, hook->family, hook->table);
         if (asteriskd_supervisor_xtables(system, hook->family, hook->table,
                 "-D", hook->builtin_chain, arguments, argument_count,
                 &exit_status) != 0 || exit_status != 0) return -1;
@@ -143,8 +251,18 @@ static int system_owned_chain_presence(
     bool *present) {
     int exit_status = -1;
 
-    if (present == NULL ||
-        asteriskd_supervisor_xtables(system, chain->family, chain->table,
+    if (present == NULL) return -1;
+    const struct system_rule_view *view = system_owned_view(system, chain->family, chain->table);
+    if (view != NULL) {
+        size_t declarations = 0U;
+        size_t rules = 0U;
+        if (view->length != 0U && asteriskd_xtables_private_chain_counts(
+                view->bytes, view->length, chain->name, &declarations, &rules) == 0) {
+            *present = declarations != 0U || rules != 0U;
+            return 0;
+        }
+    }
+    if (asteriskd_supervisor_xtables(system, chain->family, chain->table,
             "-S", chain->name, NULL, 0U, &exit_status) != 0 ||
         (exit_status != 0 && exit_status != 1)) return -1;
     *present = exit_status == 0;
@@ -172,6 +290,7 @@ static int system_reconcile_private_chains(
             result = -1;
             continue;
         }
+        system_owned_view_invalidate(system, chain->family, chain->table);
         if (asteriskd_supervisor_xtables(system, chain->family, chain->table,
                 "-F", chain->name, NULL, 0U, &exit_status) != 0 ||
             exit_status != 0) result = -1;
@@ -188,6 +307,7 @@ static int system_reconcile_private_chains(
             continue;
         }
         if (!present) continue;
+        system_owned_view_invalidate(system, chain->family, chain->table);
         if (asteriskd_supervisor_xtables(system, chain->family, chain->table,
                 "-X", chain->name, NULL, 0U, &exit_status) != 0 ||
             exit_status != 0) result = -1;
@@ -738,8 +858,10 @@ static int system_reconcile_owned_resources_after_listener(
     asteriskd_supervisor_rule_batch_destroy(&system->rule_commands);
     asteriskd_supervisor_rule_snapshot_destroy(&system->rule_snapshot);
     system->owned_cleanup_in_progress = true;
+    system->owned_snapshot_enabled = true;
     int result = asteriskd_reconcile_after_listener(
         listener_result, &backend, &report, error, error_size);
+    system_owned_snapshot_release(system);
     system->owned_cleanup_in_progress = false;
     return result;
 }

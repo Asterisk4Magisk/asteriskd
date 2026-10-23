@@ -93,28 +93,22 @@ int asteriskd_supervisor_xtables_zero(struct asteriskd_system_supervisor *system
         }
     }
     if (system->rule_commands.active) {
-        const char *executable = system_xtables_path(family);
-        const char *table_name = asteriskd_supervisor_table_name(table);
-        if (system->verify_private_rules || executable == NULL || table_name == NULL ||
+        if (system->verify_private_rules || system_xtables_path(family) == NULL ||
+            asteriskd_supervisor_table_name(table) == NULL ||
             argument_count > 24U || (argument_count != 0U && arguments == NULL)) return -1;
-        const char *argv[32U];
+        // Queued as an iptables-restore line for the table's single commit.
+        const char *tokens[28U];
         size_t count = 0U;
-        argv[count++] = executable;
-        argv[count++] = "-w";
-        argv[count++] = "100";
-        argv[count++] = "-t";
-        argv[count++] = table_name;
-        argv[count++] = operation;
-        argv[count++] = chain;
+        tokens[count++] = operation;
+        tokens[count++] = chain;
         for (size_t index = 0U; index < argument_count; ++index) {
             if (arguments[index] == NULL || arguments[index][0] == '\0') return -1;
-            argv[count++] = arguments[index];
+            tokens[count++] = arguments[index];
         }
-        argv[count] = NULL;
-        struct asteriskd_byte_buffer *commands = system->rule_commands.ip_started
-            ? &system->rule_commands.xtables_after_ip
-            : &system->rule_commands.xtables_before_ip;
-        return asteriskd_supervisor_rule_batch_append_shell_command(commands, argv);
+        tokens[count] = NULL;
+        return asteriskd_supervisor_rule_batch_append_line(
+            &system->rule_commands.xtables[system->rule_commands.ip_started ? 1U : 0U]
+                [family][table], tokens);
     }
     int exit_status = -1;
     int run_result = asteriskd_supervisor_xtables(system, family, table, effective_operation, chain,
@@ -1152,16 +1146,9 @@ int asteriskd_supervisor_ip_command(struct asteriskd_system_supervisor *system,
     size_t argument_count, bool capture, int *exit_status) {
     if (argument_count > 20U || (argument_count != 0U && arguments == NULL) ||
         exit_status == NULL) return -1;
-    const char *argv[24U];
-    size_t count = 0U;
-    argv[count++] = "ip";
-    argv[count++] = family == ASTERISKD_IP_FAMILY_IPV4 ? "-4" : "-6";
-    for (size_t index = 0U; index < argument_count; ++index) {
-        if (arguments[index] == NULL || arguments[index][0] == '\0') return -1;
-        argv[count++] = arguments[index];
-    }
-    argv[count] = NULL;
-    return asteriskd_supervisor_action_run_argv(system, argv, capture, exit_status);
+    // Served in process through rtnetlink; no ip(8) child is started.
+    return asteriskd_supervisor_rtnl_ip(
+        system, family, arguments, argument_count, capture, exit_status);
 }
 
 int asteriskd_supervisor_ip_zero(struct asteriskd_system_supervisor *system,
@@ -1170,18 +1157,16 @@ int asteriskd_supervisor_ip_zero(struct asteriskd_system_supervisor *system,
         if (family < ASTERISKD_IP_FAMILY_IPV4 ||
             family >= ASTERISKD_IP_FAMILY_COUNT || argument_count > 20U ||
             (argument_count != 0U && arguments == NULL)) return -1;
-        const char *argv[24U];
+        const char *tokens[24U];
         size_t count = 0U;
-        argv[count++] = "ip";
-        argv[count++] = family == ASTERISKD_IP_FAMILY_IPV4 ? "-4" : "-6";
+        tokens[count++] = family == ASTERISKD_IP_FAMILY_IPV4 ? "4" : "6";
         for (size_t index = 0U; index < argument_count; ++index) {
             if (arguments[index] == NULL || arguments[index][0] == '\0') return -1;
-            argv[count++] = arguments[index];
+            tokens[count++] = arguments[index];
         }
-        argv[count] = NULL;
+        tokens[count] = NULL;
         system->rule_commands.ip_started = true;
-        return asteriskd_supervisor_rule_batch_append_shell_command(
-            &system->rule_commands.ip[family], argv);
+        return asteriskd_supervisor_rule_batch_append_line(&system->rule_commands.ip, tokens);
     }
     int exit_status = -1;
     return asteriskd_supervisor_ip_command(system, family, arguments, argument_count,
@@ -1221,6 +1206,24 @@ static int system_rule_view_capture(
     return 0;
 }
 
+void asteriskd_supervisor_rule_view_destroy(struct system_rule_view *view) {
+    system_rule_view_destroy(view);
+}
+
+/* Captures one complete "-S" table listing into a view. */
+int asteriskd_supervisor_rule_view_capture_table(struct asteriskd_system_supervisor *system,
+    enum asteriskd_ip_family family, enum asteriskd_ip_table table,
+    struct system_rule_view *view) {
+    int exit_status = -1;
+    if (system == NULL || view == NULL ||
+        system_xtables_table(system, family, table, &exit_status) != 0 ||
+        exit_status != 0 || system_rule_view_capture(system, view) != 0) {
+        if (view != NULL) system_rule_view_destroy(view);
+        return -1;
+    }
+    return 0;
+}
+
 int asteriskd_supervisor_rule_snapshot_capture(
     struct asteriskd_system_supervisor *system,
     const struct asteriskd_rule_transaction_plan *plan,
@@ -1230,10 +1233,12 @@ int asteriskd_supervisor_rule_snapshot_capture(
          phase != SYSTEM_RULE_SNAPSHOT_AFTER_APPLY)) return -1;
     bool tables[ASTERISKD_IP_FAMILY_COUNT][ASTERISKD_IP_TABLE_COUNT];
     bool rules[ASTERISKD_IP_FAMILY_COUNT];
-    bool routes[ASTERISKD_IP_FAMILY_COUNT];
+    // Route listings cover only the tables the plan owns routes in.
+    uint32_t route_tables[ASTERISKD_IP_FAMILY_COUNT][ASTERISKD_RULE_TRANSACTION_MAX_ROUTES];
+    size_t route_table_count[ASTERISKD_IP_FAMILY_COUNT];
     memset(tables, 0, sizeof(tables));
     memset(rules, 0, sizeof(rules));
-    memset(routes, 0, sizeof(routes));
+    memset(route_table_count, 0, sizeof(route_table_count));
     for (size_t index = 0U; index < plan->private_group_count; ++index) {
         const struct asteriskd_private_chain_group *group = &plan->private_groups[index];
         tables[group->family][group->table] = true;
@@ -1245,7 +1250,13 @@ int asteriskd_supervisor_rule_snapshot_capture(
     for (size_t index = 0U; index < plan->route_count; ++index) {
         const struct asteriskd_route_effect *effect = &plan->routes[index];
         if (effect->kind == ASTERISKD_ROUTE_EFFECT_IP_RULE) rules[effect->family] = true;
-        if (effect->kind == ASTERISKD_ROUTE_EFFECT_ROUTE) routes[effect->family] = true;
+        if (effect->kind != ASTERISKD_ROUTE_EFFECT_ROUTE) continue;
+        size_t *count = &route_table_count[effect->family];
+        bool listed = false;
+        for (size_t known = 0U; known < *count; ++known) {
+            if (route_tables[effect->family][known] == effect->table) listed = true;
+        }
+        if (!listed) route_tables[effect->family][(*count)++] = effect->table;
     }
     asteriskd_supervisor_rule_snapshot_destroy(&system->rule_snapshot);
     const char *source = NULL;
@@ -1271,13 +1282,12 @@ int asteriskd_supervisor_rule_snapshot_capture(
                 exit_status != 0 || system_rule_view_capture(system,
                     &system->rule_snapshot.ip_rules[family]) != 0) goto failed;
         }
-        if (routes[family]) {
-            const char *arguments[] = {"route", "show", "table", "all"};
+        if (route_table_count[family] != 0U) {
             source = "ip-route";
             exit_status = -1;
-            if (asteriskd_supervisor_ip_command(system, (enum asteriskd_ip_family)family,
-                    arguments, 4U, true, &exit_status) != 0 ||
-                exit_status != 0 || system_rule_view_capture(system,
+            if (asteriskd_supervisor_rtnl_route_render(system, (enum asteriskd_ip_family)family,
+                    route_tables[family], route_table_count[family]) != 0 ||
+                system_rule_view_capture(system,
                     &system->rule_snapshot.ip_routes[family]) != 0) goto failed;
         }
     }

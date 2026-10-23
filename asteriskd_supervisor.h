@@ -87,10 +87,18 @@ enum system_tc_netlink_query_kind {
     SYSTEM_TC_NETLINK_QUERY_QDISC,
 };
 
+/*
+ * Rule commands queued for one commit. iptables commands are kept as
+ * iptables-restore lines per stage, family and table; stage 1 holds commands
+ * queued after the first ip command, so hooks still follow routing. ip
+ * commands are kept one per line as "<family> <arguments...>".
+ */
+#define SYSTEM_RULE_BATCH_STAGES 2U
+
 struct system_rule_command_batch {
-    struct asteriskd_byte_buffer xtables_before_ip;
-    struct asteriskd_byte_buffer xtables_after_ip;
-    struct asteriskd_byte_buffer ip[ASTERISKD_IP_FAMILY_COUNT];
+    struct asteriskd_byte_buffer
+        xtables[SYSTEM_RULE_BATCH_STAGES][ASTERISKD_IP_FAMILY_COUNT][ASTERISKD_IP_TABLE_COUNT];
+    struct asteriskd_byte_buffer ip;
     bool ip_started;
     bool active;
 };
@@ -210,6 +218,10 @@ struct asteriskd_system_supervisor {
     size_t action_stderr_length;
     struct system_rule_command_batch rule_commands;
     struct system_rule_snapshot rule_snapshot;
+    /* Table listings shared by one owned-resource reconciliation. */
+    struct system_rule_view owned_xtables[ASTERISKD_IP_FAMILY_COUNT][ASTERISKD_IP_TABLE_COUNT];
+    bool owned_xtables_valid[ASTERISKD_IP_FAMILY_COUNT][ASTERISKD_IP_TABLE_COUNT];
+    bool owned_snapshot_enabled;
     bool verify_private_rules;
     size_t verified_private_rule_count;
     struct asteriskd_system_process_context process_context;
@@ -267,13 +279,20 @@ int asteriskd_supervisor_action_run_spec(struct asteriskd_system_supervisor *sys
     const struct asteriskd_process_spec *spec, bool capture_stdout, int *exit_status);
 int asteriskd_supervisor_action_run_argv(struct asteriskd_system_supervisor *system,
     const char *const *argv, bool capture_stdout, int *exit_status);
-int asteriskd_supervisor_rule_batch_append_shell_command(
-    struct asteriskd_byte_buffer *batch, const char *const *argv);
+int asteriskd_supervisor_rule_batch_append_line(
+    struct asteriskd_byte_buffer *batch, const char *const *tokens);
 void asteriskd_supervisor_rule_batch_destroy(struct system_rule_command_batch *batch);
 int asteriskd_supervisor_rule_batch_begin(struct system_rule_command_batch *batch);
 int asteriskd_supervisor_rule_batch_flush(
     struct asteriskd_system_supervisor *system);
 int asteriskd_supervisor_effect_capability(void *opaque);
+
+/* asteriskd_supervisor_rtnl.c */
+int asteriskd_supervisor_rtnl_ip(struct asteriskd_system_supervisor *system,
+    enum asteriskd_ip_family family, const char *const *arguments,
+    size_t argument_count, bool capture, int *exit_status);
+int asteriskd_supervisor_rtnl_route_render(struct asteriskd_system_supervisor *system,
+    enum asteriskd_ip_family family, const uint32_t *tables, size_t table_count);
 
 /* asteriskd_supervisor_xtables.c */
 const char *asteriskd_supervisor_table_name(enum asteriskd_ip_table table);
@@ -318,6 +337,10 @@ int asteriskd_supervisor_ip_command(struct asteriskd_system_supervisor *system,
 int asteriskd_supervisor_ip_zero(struct asteriskd_system_supervisor *system,
     enum asteriskd_ip_family family, const char *const *arguments, size_t argument_count);
 void asteriskd_supervisor_rule_snapshot_destroy(struct system_rule_snapshot *snapshot);
+void asteriskd_supervisor_rule_view_destroy(struct system_rule_view *view);
+int asteriskd_supervisor_rule_view_capture_table(struct asteriskd_system_supervisor *system,
+    enum asteriskd_ip_family family, enum asteriskd_ip_table table,
+    struct system_rule_view *view);
 int asteriskd_supervisor_rule_snapshot_capture(
     struct asteriskd_system_supervisor *system,
     const struct asteriskd_rule_transaction_plan *plan,
@@ -393,7 +416,7 @@ int asteriskd_supervisor_capture_local_address_snapshot(
 void asteriskd_supervisor_clear_local_address_snapshot(
     struct asteriskd_system_supervisor *system);
 int asteriskd_supervisor_reconcile_iptables_local_bypass(
-    struct asteriskd_system_supervisor *system);
+    struct asteriskd_system_supervisor *system, bool *changed);
 int asteriskd_supervisor_reconcile_b2s_local_maps(
     struct asteriskd_system_supervisor *system);
 int asteriskd_supervisor_reconcile_hotspot_tc(struct asteriskd_system_supervisor *system);

@@ -33,6 +33,7 @@ struct asteriskd_resource_operation;
 #define ASTERISKD_MAX_ADDRESSES 256U
 #define ASTERISKD_MAX_CHAIN_NAME 29U
 #define ASTERISKD_MAX_NETWORK_EVENTS 16U
+#define ASTERISKD_MAX_NETWORK_KNOWN_ADDRESSES 128U
 #define ASTERISKD_MAX_COMMAND_MARKER 256U
 #define ASTERISKD_SYNC_DEBOUNCE_MILLIS 1500
 #define ASTERISKD_STATE_VERSION 2U
@@ -1876,11 +1877,8 @@ struct asteriskd_runtime_effect_backend {
     int (*release)(void *);
 };
 
-int asteriskd_rule_batch_document_render(
-    const unsigned char *, size_t,
-    const unsigned char *, size_t,
-    const unsigned char *, size_t,
-    const unsigned char *, size_t,
+int asteriskd_rule_batch_restore_render(
+    const char *const *, const struct asteriskd_byte_buffer *, size_t,
     unsigned char **, size_t *);
 
 
@@ -2439,6 +2437,13 @@ struct asteriskd_netd_network {
     bool ipv6_guarded;
 };
 
+/* A tracked address already reported to reconciliation. */
+struct asteriskd_network_known_address {
+    uint32_t interface_index;
+    int family;
+    unsigned char address[16U];
+};
+
 struct asteriskd_network_runtime {
     const struct asteriskd_config *config;
     const struct asteriskd_network_backend *backend;
@@ -2459,6 +2464,8 @@ struct asteriskd_network_runtime {
     struct asteriskd_netd_rule *netd_rules;
     bool netd_network_overflow;
     bool ipv6_guard_resync;
+    struct asteriskd_network_known_address known_addresses[ASTERISKD_MAX_NETWORK_KNOWN_ADDRESSES];
+    size_t known_address_count;
 };
 
 int asteriskd_network_open(

@@ -1091,18 +1091,28 @@ static int system_effect_reconcile(void *opaque, bool *active,
     system->rules_verified = false;
     system->rules_reconciling = true;
     const char *failed_stage = NULL;
+    bool local_bypass_changed = false;
+    // Local bypass planning reads the captured mangle tables; the snapshot is
+    // captured again only when the bypass rules actually changed. Rule repairs
+    // move the snapshot out of BEFORE_APPLY, so an unchanged snapshot is current.
     if (asteriskd_supervisor_capture_local_address_snapshot(system) != 0) {
         failed_stage = "local-address-snapshot";
-    } else if (asteriskd_supervisor_reconcile_iptables_local_bypass(system) != 0) {
-        failed_stage = "iptables-local-bypass";
     } else if (asteriskd_supervisor_rule_snapshot_capture(
+            system, &system->rules_runtime.plan,
+            SYSTEM_RULE_SNAPSHOT_BEFORE_APPLY) != 0) {
+        failed_stage = "rules-snapshot-before-reconcile";
+    } else if (asteriskd_supervisor_reconcile_iptables_local_bypass(
+            system, &local_bypass_changed) != 0) {
+        failed_stage = "iptables-local-bypass";
+    } else if (local_bypass_changed && asteriskd_supervisor_rule_snapshot_capture(
             system, &system->rules_runtime.plan,
             SYSTEM_RULE_SNAPSHOT_BEFORE_APPLY) != 0) {
         failed_stage = "rules-snapshot-before-reconcile";
     } else if (asteriskd_rules_reconcile(
             &system->rules_runtime, &system->rules_backend) != 0) {
         failed_stage = "rules-reconcile";
-    } else if (asteriskd_supervisor_rule_snapshot_capture(
+    } else if (system->rule_snapshot.phase != SYSTEM_RULE_SNAPSHOT_BEFORE_APPLY &&
+        asteriskd_supervisor_rule_snapshot_capture(
             system, &system->rules_runtime.plan,
             SYSTEM_RULE_SNAPSHOT_AFTER_APPLY) != 0) {
         failed_stage = "rules-snapshot-after-reconcile";
@@ -1349,8 +1359,31 @@ static int system_effect_remove_rules(void *opaque) {
     struct asteriskd_system_supervisor *system = opaque;
     system->cleanup_in_progress = true;
     if (asteriskd_mode_core_managed(system->loaded_config.config.mode)) return 0;
-    if (!system->rules_initialized || asteriskd_rules_remove(
-            &system->rules_runtime, &system->rules_backend) != 0) return -1;
+    if (!system->rules_initialized) return -1;
+    // Probes read one snapshot and every removal is committed in one batch. The
+    // journal is restored if the commit fails, so a later cleanup retries it.
+    struct asteriskd_rules_runtime journal = system->rules_runtime;
+    int removed = -1;
+    if (asteriskd_supervisor_rule_snapshot_capture(system, &system->rules_runtime.plan,
+            SYSTEM_RULE_SNAPSHOT_BEFORE_APPLY) != 0) {
+        // Without a snapshot, each object is still probed and removed on its own.
+        removed = asteriskd_rules_remove(&system->rules_runtime, &system->rules_backend);
+    } else if (asteriskd_supervisor_rule_batch_begin(&system->rule_commands) == 0) {
+        removed = asteriskd_rules_remove(&system->rules_runtime, &system->rules_backend);
+        if (asteriskd_supervisor_rule_batch_flush(system) != 0) {
+            memcpy(system->rules_runtime.private_cleanup_required,
+                journal.private_cleanup_required, sizeof(journal.private_cleanup_required));
+            memcpy(system->rules_runtime.route_cleanup_required,
+                journal.route_cleanup_required, sizeof(journal.route_cleanup_required));
+            memcpy(system->rules_runtime.hook_cleanup_required,
+                journal.hook_cleanup_required, sizeof(journal.hook_cleanup_required));
+            system->rules_runtime.installed = journal.installed;
+            removed = -1;
+        }
+    }
+    asteriskd_supervisor_rule_batch_destroy(&system->rule_commands);
+    asteriskd_supervisor_rule_snapshot_destroy(&system->rule_snapshot);
+    if (removed != 0) return -1;
     if (asteriskd_runtime_remove_tc_before_helper_stop(
             system->loaded_config.config.mode)) {
         char error[128U];

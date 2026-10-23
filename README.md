@@ -21,7 +21,8 @@ every top-level `.c` file as one PIE executable.
 | `asteriskd.c`, `asteriskd_control.c` | CLI entry point, control protocol and socket server |
 | `asteriskd_runtime.c` | Platform-neutral reactor, lifecycle driver and event publication |
 | `asteriskd_supervisor.c` | Linux supervisor: reactor backend, service control, children, lifecycle effects, cleanup |
-| `asteriskd_supervisor_action.c` | Short-lived root actions (iptables, ip, tc, sh) and rule batch scripts |
+| `asteriskd_supervisor_action.c` | Short-lived root actions (iptables, tc) and rule batches committed through `iptables-restore --noflush` |
+| `asteriskd_supervisor_rtnl.c` | In-process `ip rule`/`ip route` requests and listings over rtnetlink |
 | `asteriskd_supervisor_xtables.c` | iptables rule rendering, private chains, hooks and rule snapshots |
 | `asteriskd_supervisor_tc.c` | TC commands and netlink probes |
 | `asteriskd_supervisor_rules.c` | Routes, BPF pins, sysctl effects and the rules backend |

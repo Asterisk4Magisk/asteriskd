@@ -185,6 +185,8 @@ int asteriskd_network_note(
         runtime->integrity_loss = true;
         batch->truncated = true;
         changed = true;
+        // A lost removal could leave a stale entry that suppresses a later re-add.
+        runtime->known_address_count = 0U;
         // Lost rule events are recovered by one dump after the socket drains.
         if (runtime->config != NULL && runtime->config->disable_system_ipv6) {
             runtime->ipv6_guard_resync = true;
@@ -331,6 +333,42 @@ static int attribute_payload(
     return offset == attributes_length ? 0 : -1;
 }
 
+/*
+ * Tracks addresses already reported for reconciliation. RTM_NEWADDR also
+ * reports lifetime and flag updates for an existing address (for example on
+ * every IPv6 router advertisement); those do not change the address set that
+ * reconciliation consumes. Returns true when the message must be reported.
+ */
+static bool known_address_update(
+    struct asteriskd_network_runtime *runtime, uint32_t interface_index, int family,
+    const unsigned char *address, size_t address_length, bool removed) {
+    size_t index = 0U;
+    for (; index < runtime->known_address_count; ++index) {
+        const struct asteriskd_network_known_address *known = &runtime->known_addresses[index];
+        if (known->interface_index == interface_index && known->family == family &&
+            memcmp(known->address, address, address_length) == 0) break;
+    }
+    bool present = index < runtime->known_address_count;
+    if (removed) {
+        if (present) {
+            runtime->known_addresses[index] =
+                runtime->known_addresses[--runtime->known_address_count];
+        }
+        return true;
+    }
+    if (present) return false;
+    // A full set only loses deduplication; every new address is still reported.
+    if (runtime->known_address_count < ASTERISKD_MAX_NETWORK_KNOWN_ADDRESSES) {
+        struct asteriskd_network_known_address *known =
+            &runtime->known_addresses[runtime->known_address_count++];
+        memset(known, 0, sizeof(*known));
+        known->interface_index = interface_index;
+        known->family = family;
+        memcpy(known->address, address, address_length);
+    }
+    return true;
+}
+
 static int record_address_message(
     struct asteriskd_network_runtime *runtime,
     const unsigned char *message,
@@ -375,6 +413,8 @@ static int record_address_message(
     bool relevant = tracked_interface(runtime->config, interface_name) ||
         hotspot_interface(runtime->config, interface_name);
     if (!relevant) return 0;
+    if (!known_address_update(runtime, interface_index, family, address, address_length,
+            message_type == ASTERISKD_RTM_DELADDR)) return 0;
     struct asteriskd_network_event event;
     memset(&event, 0, sizeof(event));
     event.is_address = true;

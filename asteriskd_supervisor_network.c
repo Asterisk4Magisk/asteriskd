@@ -202,17 +202,32 @@ static int system_reconcile_local_bypass_consumer(
     const char *consumer_chain,
     const char *begin_chain,
     const char *end_chain,
-    const struct asteriskd_address_set *desired) {
-    int exit_status = -1;
-    if (asteriskd_supervisor_xtables_run(system, family, ASTERISKD_IP_TABLE_MANGLE,
-            "-S", consumer_chain, NULL, 0U, true, &exit_status) != 0 ||
-        exit_status != 0 || system->action_stdout_overflow) return -1;
+    const struct asteriskd_address_set *desired,
+    bool *changed) {
+    // The plan reads only "-A <consumer>" lines, so a captured table listing
+    // replaces a per-chain listing without another iptables process.
+    const char *rules = NULL;
+    size_t rules_length = 0U;
+    const struct system_rule_view *view =
+        &system->rule_snapshot.xtables[family][ASTERISKD_IP_TABLE_MANGLE];
+    if ((system->rule_snapshot.phase == SYSTEM_RULE_SNAPSHOT_BEFORE_APPLY ||
+            system->rule_snapshot.phase == SYSTEM_RULE_SNAPSHOT_AFTER_APPLY) && view->present) {
+        rules = view->bytes;
+        rules_length = view->length;
+    } else {
+        int exit_status = -1;
+        if (asteriskd_supervisor_xtables_run(system, family, ASTERISKD_IP_TABLE_MANGLE,
+                "-S", consumer_chain, NULL, 0U, true, &exit_status) != 0 ||
+            exit_status != 0 || system->action_stdout_overflow) return -1;
+        rules = system->action_stdout;
+        rules_length = system->action_stdout_length;
+    }
     struct asteriskd_local_bypass_plan plan;
     char error[160U];
     int address_family = family == ASTERISKD_IP_FAMILY_IPV4
         ? ASTERISKD_ADDRESS_IPV4 : ASTERISKD_ADDRESS_IPV6;
     if (asteriskd_local_bypass_plan_build(address_family, consumer_chain,
-            begin_chain, end_chain, system->action_stdout, system->action_stdout_length,
+            begin_chain, end_chain, rules, rules_length,
             desired, &plan, error, sizeof(error)) != 0) {
         char message[256U];
         int written = snprintf(message, sizeof(message),
@@ -223,12 +238,13 @@ static int system_reconcile_local_bypass_consumer(
         }
         return -1;
     }
+    if (plan.operation_count != 0U) *changed = true;
     return system_apply_local_bypass_plan(system, family, consumer_chain, &plan);
 }
 
 static int system_reconcile_iptables_local_family(
     struct asteriskd_system_supervisor *system,
-    enum asteriskd_ip_family family) {
+    enum asteriskd_ip_family family, bool *changed) {
     const struct asteriskd_private_chain_group *local_group = NULL;
     const struct asteriskd_private_chain_group *consumer_group = NULL;
     enum asteriskd_chain_id consumer_id = system->loaded_config.config.mode ==
@@ -260,20 +276,25 @@ static int system_reconcile_iptables_local_family(
             continue;
         }
         if (system_reconcile_local_bypass_consumer(system, family, consumer,
-                begin_chain, end_chain, desired) != 0) return -1;
+                begin_chain, end_chain, desired, changed) != 0) return -1;
     }
     return 0;
 }
 
 int asteriskd_supervisor_reconcile_iptables_local_bypass(
-    struct asteriskd_system_supervisor *system) {
+    struct asteriskd_system_supervisor *system, bool *changed) {
+    *changed = false;
     if (!system_uses_iptables_local_bypass(system)) return 0;
     if (!system->local_address_snapshot_active) return -1;
-    if (system_reconcile_iptables_local_family(
-            system, ASTERISKD_IP_FAMILY_IPV4) != 0) return -1;
-    return !system->loaded_config.config.enable_ipv6 ||
-        system_reconcile_iptables_local_family(
-            system, ASTERISKD_IP_FAMILY_IPV6) == 0 ? 0 : -1;
+    // Every bypass change of both families is committed by one restore per family.
+    if (asteriskd_supervisor_rule_batch_begin(&system->rule_commands) != 0) return -1;
+    int result = system_reconcile_iptables_local_family(
+            system, ASTERISKD_IP_FAMILY_IPV4, changed) == 0 &&
+        (!system->loaded_config.config.enable_ipv6 || system_reconcile_iptables_local_family(
+            system, ASTERISKD_IP_FAMILY_IPV6, changed) == 0) &&
+        asteriskd_supervisor_rule_batch_flush(system) == 0 ? 0 : -1;
+    asteriskd_supervisor_rule_batch_destroy(&system->rule_commands);
+    return result;
 }
 
 int asteriskd_supervisor_reconcile_b2s_local_maps(
