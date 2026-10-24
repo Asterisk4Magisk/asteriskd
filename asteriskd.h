@@ -60,7 +60,9 @@ struct asteriskd_resource_operation;
 #define ASTERISKD_PROCESS_MAX_INHERITED_FDS 8U
 #define ASTERISKD_PROCESS_TERM_GRACE_MILLIS 3000U
 #define ASTERISKD_PROCESS_KILL_REAP_MILLIS 1000U
-#define ASTERISKD_READINESS_POLL_INTERVAL_MILLIS 100U
+// A readiness check reads one /proc listing; a short interval keeps the
+// notice delay small for children that become ready a few hundred ms in.
+#define ASTERISKD_READINESS_POLL_INTERVAL_MILLIS 20U
 #define ASTERISKD_ANONYMOUS_CREATE_CLOEXEC UINT32_C(0x1)
 #define ASTERISKD_ANONYMOUS_CREATE_ALLOW_SEALING UINT32_C(0x2)
 #define ASTERISKD_ANONYMOUS_SEAL_WRITE UINT32_C(0x1)
@@ -1480,6 +1482,8 @@ bool asteriskd_xtables_private_chain_shape_valid(
 size_t asteriskd_xtables_fake_dns_arguments(const char *, const char **);
 int asteriskd_xtables_private_chain_counts(
     const char *, size_t, const char *, size_t *, size_t *);
+int asteriskd_xtables_save_table_listing(
+    const char *, size_t, const char *, struct asteriskd_byte_buffer *);
 size_t asteriskd_xtables_hook_arguments(
     const struct asteriskd_traffic_hook *, const char **);
 int asteriskd_xtables_rule_output_locate(

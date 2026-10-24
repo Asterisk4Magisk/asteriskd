@@ -1189,6 +1189,7 @@ void asteriskd_supervisor_rule_snapshot_destroy(struct system_rule_snapshot *sna
         system_rule_view_destroy(&snapshot->ip_routes[family]);
     }
     snapshot->phase = SYSTEM_RULE_SNAPSHOT_NONE;
+    snapshot->removal_ready = false;
 }
 
 static int system_rule_view_capture(
@@ -1220,6 +1221,68 @@ int asteriskd_supervisor_rule_view_capture_table(struct asteriskd_system_supervi
         exit_status != 0 || system_rule_view_capture(system, view) != 0) {
         if (view != NULL) system_rule_view_destroy(view);
         return -1;
+    }
+    return 0;
+}
+
+/*
+ * Fills the wanted tables of one family from a single iptables-save run, in
+ * the same "-S" form a per-table listing produces. Tables it cannot provide
+ * (failed run, truncated output, missing section) stay unfilled so the
+ * caller lists them with "-S" instead.
+ */
+void asteriskd_supervisor_rule_views_capture_family(
+    struct asteriskd_system_supervisor *system, enum asteriskd_ip_family family,
+    const bool *wanted, struct system_rule_view *views, bool *filled) {
+    const char *argv[] = {
+        family == ASTERISKD_IP_FAMILY_IPV4 ? "iptables-save" : "ip6tables-save", NULL,
+    };
+    int exit_status = -1;
+    for (size_t table = 0U; table < ASTERISKD_IP_TABLE_COUNT; ++table) filled[table] = false;
+    if (asteriskd_supervisor_action_run_argv(system, argv, true, &exit_status) != 0 ||
+        exit_status != 0 || system->action_stdout_overflow) return;
+    for (size_t table = 0U; table < ASTERISKD_IP_TABLE_COUNT; ++table) {
+        if (!wanted[table]) continue;
+        struct asteriskd_byte_buffer listing = {0};
+        if (asteriskd_xtables_save_table_listing(system->action_stdout,
+                system->action_stdout_length,
+                asteriskd_supervisor_table_name((enum asteriskd_ip_table)table),
+                &listing) != 0 || listing.length == 0U) {
+            asteriskd_byte_buffer_destroy(&listing);
+            continue;
+        }
+        system_rule_view_destroy(&views[table]);
+        views[table].bytes = (char *)listing.bytes;
+        views[table].length = listing.length;
+        views[table].present = true;
+        filled[table] = true;
+    }
+}
+
+/*
+ * Re-reads the mangle listing of each family whose local bypass rules were
+ * just rewritten. The bypass touches no other table, rule or route, so the
+ * rest of the snapshot stays current. A family without a captured mangle
+ * listing falls back to a full capture.
+ */
+int asteriskd_supervisor_rule_snapshot_refresh_mangle(
+    struct asteriskd_system_supervisor *system,
+    const struct asteriskd_rule_transaction_plan *plan, const bool *changed) {
+    if (system == NULL || plan == NULL || changed == NULL) return -1;
+    enum system_rule_snapshot_phase phase = system->rule_snapshot.phase;
+    for (size_t family = 0U; family < ASTERISKD_IP_FAMILY_COUNT; ++family) {
+        if (!changed[family]) continue;
+        struct system_rule_view *view =
+            &system->rule_snapshot.xtables[family][ASTERISKD_IP_TABLE_MANGLE];
+        if (phase == SYSTEM_RULE_SNAPSHOT_NONE || !view->present) {
+            return asteriskd_supervisor_rule_snapshot_capture(
+                system, plan, SYSTEM_RULE_SNAPSHOT_BEFORE_APPLY);
+        }
+        if (asteriskd_supervisor_rule_view_capture_table(system,
+                (enum asteriskd_ip_family)family, ASTERISKD_IP_TABLE_MANGLE, view) != 0) {
+            asteriskd_supervisor_rule_snapshot_destroy(&system->rule_snapshot);
+            return -1;
+        }
     }
     return 0;
 }
@@ -1264,8 +1327,19 @@ int asteriskd_supervisor_rule_snapshot_capture(
     int exit_status = -1;
     for (size_t family = 0U; family < ASTERISKD_IP_FAMILY_COUNT; ++family) {
         failed_family = family;
+        // Two or more tables of a family are read from one iptables-save run.
+        bool filled[ASTERISKD_IP_TABLE_COUNT] = {false};
+        size_t wanted_count = 0U;
         for (size_t table = 0U; table < ASTERISKD_IP_TABLE_COUNT; ++table) {
-            if (!tables[family][table]) continue;
+            if (tables[family][table]) ++wanted_count;
+        }
+        if (wanted_count >= 2U) {
+            asteriskd_supervisor_rule_views_capture_family(system,
+                (enum asteriskd_ip_family)family, tables[family],
+                system->rule_snapshot.xtables[family], filled);
+        }
+        for (size_t table = 0U; table < ASTERISKD_IP_TABLE_COUNT; ++table) {
+            if (!tables[family][table] || filled[table]) continue;
             source = asteriskd_supervisor_table_name((enum asteriskd_ip_table)table);
             exit_status = -1;
             if (system_xtables_table(system, (enum asteriskd_ip_family)family,

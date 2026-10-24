@@ -284,6 +284,75 @@ int asteriskd_xtables_private_chain_counts(
     return 0;
 }
 
+/*
+ * Extracts one table of an iptables-save document in "-S" listing form:
+ * builtin chain headers become "-P", user chains "-N", and rules are copied
+ * unchanged. Returns 1 when the document has no such table.
+ */
+int asteriskd_xtables_save_table_listing(
+    const char *bytes, size_t length, const char *table,
+    struct asteriskd_byte_buffer *listing) {
+    if (bytes == NULL || table == NULL || listing == NULL ||
+        memchr(bytes, '\0', length) != NULL ||
+        (length != 0U && bytes[length - 1U] != '\n')) return -1;
+    size_t table_length = strnlen(table, ASTERISKD_MAX_CHAIN_NAME);
+    if (table_length == 0U || table_length >= ASTERISKD_MAX_CHAIN_NAME) return -1;
+    asteriskd_byte_buffer_destroy(listing);
+
+    bool found = false;
+    bool inside = false;
+    size_t offset = 0U;
+    while (offset < length) {
+        const char *line = bytes + offset;
+        const char *newline = memchr(line, '\n', length - offset);
+        size_t line_length = (size_t)(newline - line);
+        offset = (size_t)(newline - bytes) + 1U;
+        if (line_length != 0U && line[line_length - 1U] == '\r') --line_length;
+        if (line_length == 0U || line[0] == '#') continue;
+        if (!inside) {
+            if (line[0] == '*' && line_length == table_length + 1U &&
+                memcmp(line + 1U, table, table_length) == 0) {
+                if (found) goto malformed;
+                found = true;
+                inside = true;
+            }
+            continue;
+        }
+        if (line_length == 6U && memcmp(line, "COMMIT", 6U) == 0) {
+            inside = false;
+            continue;
+        }
+        if (line[0] == ':') {
+            // ":<chain> <policy> [packets:bytes]"; user chains have policy "-".
+            const char *name = line + 1U;
+            const char *end = line + line_length;
+            const char *space = memchr(name, ' ', (size_t)(end - name));
+            if (space == NULL || space == name) goto malformed;
+            const char *policy = space + 1U;
+            const char *policy_end = memchr(policy, ' ', (size_t)(end - policy));
+            if (policy_end == NULL) policy_end = end;
+            if (policy_end == policy) goto malformed;
+            bool user_chain = policy_end - policy == 1 && policy[0] == '-';
+            if (asteriskd_byte_buffer_append(listing, user_chain ? "-N " : "-P ", 3U) != 0 ||
+                asteriskd_byte_buffer_append(listing, name, (size_t)(space - name)) != 0 ||
+                (!user_chain && (asteriskd_byte_buffer_append(listing, " ", 1U) != 0 ||
+                    asteriskd_byte_buffer_append(listing, policy,
+                        (size_t)(policy_end - policy)) != 0)) ||
+                asteriskd_byte_buffer_append(listing, "\n", 1U) != 0) goto malformed;
+            continue;
+        }
+        if (line_length < 4U || memcmp(line, "-A ", 3U) != 0 ||
+            asteriskd_byte_buffer_append(listing, line, line_length) != 0 ||
+            asteriskd_byte_buffer_append(listing, "\n", 1U) != 0) goto malformed;
+    }
+    if (inside) goto malformed;
+    return found ? 0 : 1;
+
+malformed:
+    asteriskd_byte_buffer_destroy(listing);
+    return -1;
+}
+
 bool asteriskd_xtables_private_chain_shape_valid(
     const char *bytes, size_t length, const char *chain, size_t expected_rule_count) {
     size_t declarations = 0U;

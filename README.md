@@ -22,8 +22,8 @@ every top-level `.c` file as one PIE executable.
 | `asteriskd_runtime.c` | Platform-neutral reactor, lifecycle driver and event publication |
 | `asteriskd_supervisor.c` | Linux supervisor: reactor backend, service control, children, lifecycle effects, cleanup |
 | `asteriskd_supervisor_action.c` | Short-lived root actions (iptables, tc) and rule batches committed through `iptables-restore --noflush` |
-| `asteriskd_supervisor_rtnl.c` | In-process `ip rule`/`ip route` requests and listings over rtnetlink |
-| `asteriskd_supervisor_xtables.c` | iptables rule rendering, private chains, hooks and rule snapshots |
+| `asteriskd_supervisor_rtnl.c` | In-process `ip rule`/`ip route` requests and listings, and the Android tethering offload filter probe, over rtnetlink |
+| `asteriskd_supervisor_xtables.c` | iptables rule rendering, private chains, hooks and rule snapshots (one `iptables-save` per family when a snapshot needs two or more tables) |
 | `asteriskd_supervisor_tc.c` | TC commands and netlink probes |
 | `asteriskd_supervisor_rules.c` | Routes, BPF pins, sysctl effects and the rules backend |
 | `asteriskd_supervisor_network.c` | Matcher/helper start, network open, local bypass and hotspot offload |
@@ -198,6 +198,7 @@ port, and the bpf2socks helper waits for its bridge port. Port checks
 search for the four-digit hexadecimal port
 marker in /proc/<child-pid>/net/tcp6, then tcp. They do not filter TCP state
 or local versus remote ports, and read failures remain pending until timeout.
+Checks run on every reactor event and at least every 20 ms.
 Socket ownership and process-group file descriptors are not inspected. Native TUN
 and the HEV helper wait for the named interface. BOX `ebpf` requires the core
 to survive a fixed 1000 ms window and does not wait for a shared interface.

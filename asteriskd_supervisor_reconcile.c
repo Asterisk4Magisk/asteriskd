@@ -92,16 +92,29 @@ static int system_owned_chain_presence(
     const struct asteriskd_owned_chain *, bool *);
 
 /*
- * Owned-resource reconciliation reads each table once with "-S" and answers
- * every presence probe from that listing. A mutation invalidates the table,
- * which is listed again on its next probe. Without a listing, probes use the
- * per-object commands as before.
+ * Owned-resource reconciliation reads each table once and answers every
+ * presence probe from that listing. The first probe of a family reads all of
+ * its unlisted tables from one iptables-save run. A mutation invalidates the
+ * table, which is listed again on its next probe. Without a listing, probes
+ * use the per-object commands as before.
  */
 static const struct system_rule_view *system_owned_view(
     struct asteriskd_system_supervisor *system,
     enum asteriskd_ip_family family, enum asteriskd_ip_table table) {
     if (!system->owned_snapshot_enabled) return NULL;
     struct system_rule_view *view = &system->owned_xtables[family][table];
+    if (!system->owned_xtables_valid[family][table]) {
+        bool wanted[ASTERISKD_IP_TABLE_COUNT];
+        bool filled[ASTERISKD_IP_TABLE_COUNT];
+        for (size_t other = 0U; other < ASTERISKD_IP_TABLE_COUNT; ++other) {
+            wanted[other] = !system->owned_xtables_valid[family][other];
+        }
+        asteriskd_supervisor_rule_views_capture_family(
+            system, family, wanted, system->owned_xtables[family], filled);
+        for (size_t other = 0U; other < ASTERISKD_IP_TABLE_COUNT; ++other) {
+            if (filled[other]) system->owned_xtables_valid[family][other] = true;
+        }
+    }
     if (!system->owned_xtables_valid[family][table]) {
         if (asteriskd_supervisor_rule_view_capture_table(system, family, table, view) != 0) {
             return NULL;
@@ -737,6 +750,24 @@ static int system_reconcile_tc_filters(
     }
     if (closedir(directory) != 0) result = -1;
     return result;
+}
+
+/*
+ * Detaches owned TC filters before the bpf2socks helper stops. The traffic
+ * hooks were already removed from the in-memory rule plan, so only TC state
+ * is probed here instead of the whole quiesce catalog.
+ */
+int asteriskd_supervisor_reconcile_remove_tc_filters(
+    struct asteriskd_system_supervisor *system, char *error, size_t error_size) {
+    if (system == NULL) return -1;
+    int identity = system_prepare_owned_tc_identity(system);
+    int filters = system_reconcile_tc_filters(system, true);
+    if (identity == 0 && filters == 0) return 0;
+    char detail[128U];
+    (void)snprintf(detail, sizeof(detail),
+        "tc detach incomplete: bpf-identity=%d tc-filters=%d", identity, filters);
+    asteriskd_supervisor_reconcile_error(error, error_size, detail);
+    return -1;
 }
 
 int asteriskd_supervisor_reconcile_remove_phase(

@@ -281,17 +281,19 @@ static int system_reconcile_iptables_local_family(
     return 0;
 }
 
+/* changed[family] reports whether that family's mangle bypass rules were rewritten. */
 int asteriskd_supervisor_reconcile_iptables_local_bypass(
     struct asteriskd_system_supervisor *system, bool *changed) {
-    *changed = false;
+    changed[ASTERISKD_IP_FAMILY_IPV4] = false;
+    changed[ASTERISKD_IP_FAMILY_IPV6] = false;
     if (!system_uses_iptables_local_bypass(system)) return 0;
     if (!system->local_address_snapshot_active) return -1;
     // Every bypass change of both families is committed by one restore per family.
     if (asteriskd_supervisor_rule_batch_begin(&system->rule_commands) != 0) return -1;
     int result = system_reconcile_iptables_local_family(
-            system, ASTERISKD_IP_FAMILY_IPV4, changed) == 0 &&
+            system, ASTERISKD_IP_FAMILY_IPV4, &changed[ASTERISKD_IP_FAMILY_IPV4]) == 0 &&
         (!system->loaded_config.config.enable_ipv6 || system_reconcile_iptables_local_family(
-            system, ASTERISKD_IP_FAMILY_IPV6, changed) == 0) &&
+            system, ASTERISKD_IP_FAMILY_IPV6, &changed[ASTERISKD_IP_FAMILY_IPV6]) == 0) &&
         asteriskd_supervisor_rule_batch_flush(system) == 0 ? 0 : -1;
     asteriskd_supervisor_rule_batch_destroy(&system->rule_commands);
     return result;
@@ -348,19 +350,12 @@ static bool system_hotspot_interface_selected(
 }
 
 static int system_clear_android_hotspot_offload_interface(
-    struct asteriskd_system_supervisor *system, const char *name, const char *priority) {
-    const char *show[] = {
-        "filter", "show", "dev", name, "ingress", "protocol", "ipv6", "pref", priority,
-    };
-    int exit_status = -1;
-    if (asteriskd_supervisor_tc_command(system, show, 9U, true, &exit_status) != 0 ||
-        exit_status != 0 || system->action_stdout_overflow) return -1;
-    if (!asteriskd_hotspot_tc_output_has_android_offload(
-            system->action_stdout, system->action_stdout_length)) return 0;
-    const char *remove[] = {
-        "filter", "del", "dev", name, "ingress", "protocol", "ipv6", "pref", priority,
-    };
-    return asteriskd_supervisor_tc_zero(system, remove, 9U);
+    struct asteriskd_system_supervisor *system, const char *name, uint32_t priority) {
+    // Probed and removed over rtnetlink; no tc process per interface and priority.
+    uint32_t interface_index = if_nametoindex(name);
+    bool present = false;
+    return interface_index == 0U ? -1 : asteriskd_supervisor_rtnl_tether_offload(
+        system, interface_index, priority, true, &present);
 }
 
 static void system_log_optional_hotspot_offload_cleanup_failure(
@@ -380,7 +375,8 @@ static int system_clear_android_hotspot_offload(
     struct asteriskd_system_supervisor *system,
     enum asteriskd_hotspot_ipv6_offload_policy policy) {
     bool required = policy == ASTERISKD_HOTSPOT_IPV6_OFFLOAD_REMOVE_PREF1_REQUIRED;
-    static const char *const priorities[] = {"1", "2"};
+    static const uint32_t priorities[] = {1U, 2U};
+    static const char *const priority_names[] = {"1", "2"};
     size_t priority_count = required ? 1U : 2U;
     DIR *directory = opendir("/sys/class/net");
     if (directory == NULL) {
@@ -401,7 +397,7 @@ static int system_clear_android_hotspot_offload(
                 break;
             }
             system_log_optional_hotspot_offload_cleanup_failure(
-                system, entry->d_name, priorities[priority]);
+                system, entry->d_name, priority_names[priority]);
         }
         if (result != 0) break;
     }

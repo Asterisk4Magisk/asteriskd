@@ -173,20 +173,30 @@ int asteriskd_platform_capability_ensure(
         return 0;
     }
     result->tool_found = true;
-    for (size_t index = 0U; index < sizeof(capability_rules) / sizeof(capability_rules[0]); ++index) {
-        int applied = -1;
-        if (result->tool_kind == ASTERISKD_CAPABILITY_TOOL_LIVE_POLICY) {
-            const char *const argv[] = {result->tool_path, "--live", capability_rules[index], NULL};
-            applied = execute_checked(backend, argv);
-        } else {
-            const char *const check[] = {
-                result->tool_path, "sepolicy", "check", capability_rules[index], NULL,
-            };
-            const char *const patch[] = {
-                result->tool_path, "sepolicy", "patch", capability_rules[index], NULL,
-            };
-            if (execute_checked(backend, check) == 0) applied = execute_checked(backend, patch);
+    size_t rule_count = sizeof(capability_rules) / sizeof(capability_rules[0]);
+    if (result->tool_kind == ASTERISKD_CAPABILITY_TOOL_LIVE_POLICY) {
+        // One live load patches every rule; each extra run reloads the whole policy.
+        const char *argv[sizeof(capability_rules) / sizeof(capability_rules[0]) + 3U];
+        argv[0] = result->tool_path;
+        argv[1] = "--live";
+        for (size_t index = 0U; index < rule_count; ++index) argv[index + 2U] = capability_rules[index];
+        argv[rule_count + 2U] = NULL;
+        if (execute_checked(backend, argv) != 0) {
+            asteriskd_error_copy(error, error_size, "platform capability application failed");
+            return 0;
         }
+        result->applied_rule_count = rule_count;
+        return 0;
+    }
+    for (size_t index = 0U; index < rule_count; ++index) {
+        int applied = -1;
+        const char *const check[] = {
+            result->tool_path, "sepolicy", "check", capability_rules[index], NULL,
+        };
+        const char *const patch[] = {
+            result->tool_path, "sepolicy", "patch", capability_rules[index], NULL,
+        };
+        if (execute_checked(backend, check) == 0) applied = execute_checked(backend, patch);
         if (applied != 0) {
             result->partial_application = result->applied_rule_count != 0U;
             asteriskd_error_copy(error, error_size, result->partial_application ?

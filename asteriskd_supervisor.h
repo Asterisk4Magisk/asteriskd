@@ -121,6 +121,9 @@ struct system_rule_snapshot {
     struct system_rule_view ip_rules[ASTERISKD_IP_FAMILY_COUNT];
     struct system_rule_view ip_routes[ASTERISKD_IP_FAMILY_COUNT];
     enum system_rule_snapshot_phase phase;
+    // Set by a completed quiesce: the full-plan listing is current for the
+    // rule removal that follows it. Any capture or destroy clears it.
+    bool removal_ready;
 };
 
 struct asteriskd_system_supervisor {
@@ -293,6 +296,8 @@ int asteriskd_supervisor_rtnl_ip(struct asteriskd_system_supervisor *system,
     size_t argument_count, bool capture, int *exit_status);
 int asteriskd_supervisor_rtnl_route_render(struct asteriskd_system_supervisor *system,
     enum asteriskd_ip_family family, const uint32_t *tables, size_t table_count);
+int asteriskd_supervisor_rtnl_tether_offload(struct asteriskd_system_supervisor *system,
+    uint32_t interface_index, uint32_t priority, bool remove, bool *present);
 
 /* asteriskd_supervisor_xtables.c */
 const char *asteriskd_supervisor_table_name(enum asteriskd_ip_table table);
@@ -341,6 +346,12 @@ void asteriskd_supervisor_rule_view_destroy(struct system_rule_view *view);
 int asteriskd_supervisor_rule_view_capture_table(struct asteriskd_system_supervisor *system,
     enum asteriskd_ip_family family, enum asteriskd_ip_table table,
     struct system_rule_view *view);
+void asteriskd_supervisor_rule_views_capture_family(
+    struct asteriskd_system_supervisor *system, enum asteriskd_ip_family family,
+    const bool *wanted, struct system_rule_view *views, bool *filled);
+int asteriskd_supervisor_rule_snapshot_refresh_mangle(
+    struct asteriskd_system_supervisor *system,
+    const struct asteriskd_rule_transaction_plan *plan, const bool *changed);
 int asteriskd_supervisor_rule_snapshot_capture(
     struct asteriskd_system_supervisor *system,
     const struct asteriskd_rule_transaction_plan *plan,
@@ -428,6 +439,10 @@ void asteriskd_supervisor_reconcile_error(
 int asteriskd_supervisor_reconcile_remove_phase(
     void *opaque,
     enum asteriskd_reconcile_phase phase,
+    char *error,
+    size_t error_size);
+int asteriskd_supervisor_reconcile_remove_tc_filters(
+    struct asteriskd_system_supervisor *system,
     char *error,
     size_t error_size);
 int asteriskd_supervisor_reconcile_owned_resources(

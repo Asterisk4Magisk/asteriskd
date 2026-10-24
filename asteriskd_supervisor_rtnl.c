@@ -14,6 +14,8 @@
 #if defined(__linux__) || defined(__ANDROID__)
 
 #include <linux/fib_rules.h>
+#include <linux/if_ether.h>
+#include <linux/pkt_cls.h>
 #include <stdarg.h>
 
 #define RTNL_RECEIVE_BUFFER 65536U
@@ -33,6 +35,7 @@ struct rtnl_request {
         struct rtmsg route;
         struct fib_rule_hdr rule;
         struct rtgenmsg generic;
+        struct tcmsg filter;
     } body;
     unsigned char attributes[RTNL_REQUEST_ATTRIBUTES];
 };
@@ -767,6 +770,89 @@ int asteriskd_supervisor_rtnl_route_render(struct asteriskd_system_supervisor *s
     system->action_stdout_length = output.length;
     system->action_stdout_overflow = output.overflow;
     return result == 0 && !output.overflow ? 0 : -1;
+}
+
+struct rtnl_offload_filter {
+    uint32_t interface_index;
+    uint32_t info;
+    bool present;
+};
+
+/* Flags an ingress IPv6 filter at the queried priority whose bpf program is a tether offload. */
+static int rtnl_match_offload_filter(const struct nlmsghdr *message, void *opaque) {
+    struct rtnl_offload_filter *filter = opaque;
+    if (message->nlmsg_type != RTM_NEWTFILTER) return 0;
+    if (message->nlmsg_len < NLMSG_LENGTH(sizeof(struct tcmsg))) return -1;
+    const struct tcmsg *header = NLMSG_DATA(message);
+    if (header->tcm_ifindex != (int)filter->interface_index ||
+        header->tcm_parent != ASTERISKD_TC_PARENT_CLSACT_INGRESS ||
+        header->tcm_info != filter->info) return 0;
+    int length = (int)message->nlmsg_len - (int)NLMSG_LENGTH(sizeof(*header));
+    for (const struct rtattr *attribute = (const struct rtattr *)((const unsigned char *)header +
+                NLMSG_ALIGN(sizeof(*header)));
+            RTA_OK(attribute, length); attribute = RTA_NEXT(attribute, length)) {
+        if (attribute->rta_type != TCA_OPTIONS) continue;
+        int nested_length = (int)RTA_PAYLOAD(attribute);
+        for (const struct rtattr *option = RTA_DATA(attribute); RTA_OK(option, nested_length);
+                option = RTA_NEXT(option, nested_length)) {
+            if (option->rta_type == TCA_BPF_NAME &&
+                asteriskd_hotspot_tc_output_has_android_offload(
+                    RTA_DATA(option), RTA_PAYLOAD(option))) filter->present = true;
+        }
+    }
+    return 0;
+}
+
+static void rtnl_offload_reset(void *opaque) {
+    ((struct rtnl_offload_filter *)opaque)->present = false;
+}
+
+/*
+ * In-process replacement for the hotspot offload "tc filter show/del dev <if>
+ * ingress protocol ipv6 pref <n>" pair: reports whether that ingress filter
+ * runs an Android tether offload program and, when asked, deletes the whole
+ * priority as tc would.
+ */
+int asteriskd_supervisor_rtnl_tether_offload(struct asteriskd_system_supervisor *system,
+    uint32_t interface_index, uint32_t priority, bool remove, bool *present) {
+    if (system == NULL || interface_index == 0U || priority == 0U ||
+        priority > UINT16_MAX || present == NULL) return -1;
+    struct rtnl_offload_filter filter = {
+        .interface_index = interface_index,
+        .info = TC_H_MAKE(priority << 16U, htons(ETH_P_IPV6)),
+    };
+    int fd = rtnl_open();
+    if (fd < 0) return -1;
+    int result = -1;
+    for (int attempt = 0; attempt < RTNL_DUMP_ATTEMPTS && result < 0; ++attempt) {
+        rtnl_offload_reset(&filter);
+        struct rtnl_request request;
+        memset(&request, 0, sizeof(request));
+        request.header.nlmsg_len = NLMSG_LENGTH(sizeof(struct tcmsg));
+        request.header.nlmsg_type = RTM_GETTFILTER;
+        request.header.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+        request.body.filter.tcm_family = AF_UNSPEC;
+        request.body.filter.tcm_ifindex = (int)interface_index;
+        request.body.filter.tcm_parent = ASTERISKD_TC_PARENT_CLSACT_INGRESS;
+        request.body.filter.tcm_info = filter.info;
+        result = rtnl_transact(fd, &request.header, rtnl_match_offload_filter, &filter);
+    }
+    if (result == 0 && filter.present && remove) {
+        struct rtnl_request request;
+        memset(&request, 0, sizeof(request));
+        request.header.nlmsg_len = NLMSG_LENGTH(sizeof(struct tcmsg));
+        request.header.nlmsg_type = RTM_DELTFILTER;
+        request.header.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+        request.body.filter.tcm_family = AF_UNSPEC;
+        request.body.filter.tcm_ifindex = (int)interface_index;
+        request.body.filter.tcm_parent = ASTERISKD_TC_PARENT_CLSACT_INGRESS;
+        request.body.filter.tcm_info = filter.info;
+        result = rtnl_transact(fd, &request.header, NULL, NULL);
+    }
+    (void)close(fd);
+    if (result > 0) rtnl_record_error(system, result);
+    *present = filter.present;
+    return result == 0 ? 0 : -1;
 }
 
 #endif
