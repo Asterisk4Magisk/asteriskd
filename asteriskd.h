@@ -6,8 +6,8 @@
 
 #include <stdarg.h>
 #include <stdbool.h>
-#include "asteriskd_dns.h"
-#include "asteriskd_marks.h"
+#include "network/dns.h"
+#include "rules/marks.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -214,9 +214,6 @@ void asteriskd_service_control_set_service_running(
     struct asteriskd_service_control_runtime *, bool);
 enum asteriskd_service_action asteriskd_service_control_on_keyguard(
     struct asteriskd_service_control_runtime *, bool locked, bool baseline);
-bool asteriskd_wifi_rule_matches(
-    const struct asteriskd_wifi_rule_config *,
-    const struct asteriskd_wifi_identity *);
 enum asteriskd_service_action asteriskd_service_control_on_wifi(
     struct asteriskd_service_control_runtime *,
     enum asteriskd_wifi_transition,
@@ -497,10 +494,6 @@ int asteriskd_json_parse(const char *, size_t, struct asteriskd_json_document *,
 void asteriskd_json_document_destroy(struct asteriskd_json_document *);
 bool asteriskd_interface_selector_valid(const char *);
 bool asteriskd_interface_matches_selector(const char *, const char *);
-int asteriskd_config_parse(const char *, size_t, struct asteriskd_config *, char *, size_t);
-int asteriskd_config_load_direct_cidrs(
-    struct asteriskd_config *, const char *, size_t, const char *, size_t);
-void asteriskd_config_destroy(struct asteriskd_config *);
 
 struct asteriskd_runtime_directory {
     int fd;
@@ -527,8 +520,6 @@ void asteriskd_loaded_config_release(struct asteriskd_loaded_config *);
 void asteriskd_runtime_directory_release(struct asteriskd_runtime_directory *);
 int asteriskd_runtime_directory_open(
     const char *, struct asteriskd_runtime_directory *, char *, size_t);
-bool asteriskd_mode_is_readable(uint32_t);
-bool asteriskd_mode_is_writable(uint32_t);
 bool asteriskd_mode_is_executable(uint32_t);
 
 enum asteriskd_file_kind {
@@ -539,21 +530,6 @@ enum asteriskd_file_kind {
     ASTERISKD_FILE_SYMLINK,
     ASTERISKD_FILE_OTHER,
 };
-
-bool asteriskd_file_requirements_valid(
-    enum asteriskd_file_kind,
-    uint32_t,
-    enum asteriskd_file_kind,
-    bool,
-    bool,
-    bool);
-int asteriskd_file_requirements_validate(
-    enum asteriskd_file_kind,
-    uint32_t,
-    enum asteriskd_file_kind,
-    bool,
-    bool,
-    bool);
 
 enum asteriskd_process_output_mode {
     ASTERISKD_PROCESS_OUTPUT_CAPTURE,
@@ -584,7 +560,7 @@ struct asteriskd_anonymous_document {
     size_t length;
 };
 
-/* Shared helpers (asteriskd_util.c). Error writers are no-ops for NULL or empty buffers. */
+/* Shared helpers (core/util.c). Error writers are no-ops for NULL or empty buffers. */
 void asteriskd_error_copy(char *error, size_t error_size, const char *message);
 void asteriskd_error_format(char *error, size_t error_size, const char *format, ...)
     __attribute__((format(printf, 3, 4)));
@@ -595,14 +571,13 @@ size_t asteriskd_bounded_length(const char *value, size_t capacity);
 int asteriskd_copy_string(char *destination, size_t capacity, const char *source);
 int asteriskd_compare_u32(const void *left, const void *right);
 
-/* Document text writer (asteriskd_text.c). Failures latch into result. */
+/* Document text writer (core/text.c). Failures latch into result. */
 struct asteriskd_text_writer {
     unsigned char *bytes;
     size_t length;
     size_t capacity;
     int result;
 };
-void asteriskd_text_writer_bytes(struct asteriskd_text_writer *, const char *, size_t);
 void asteriskd_text_writer_literal(struct asteriskd_text_writer *, const char *);
 void asteriskd_text_writer_format(struct asteriskd_text_writer *, const char *, ...)
     __attribute__((format(printf, 2, 3)));
@@ -679,16 +654,7 @@ int asteriskd_process_argument_add(
     struct asteriskd_process_spec *, const char *);
 /* Maps an owned descriptor to a fixed child descriptor number; both must be unique. */
 int asteriskd_process_inherit_fd(struct asteriskd_process_spec *, int source, int target);
-int asteriskd_process_core_log_path(
-    const struct asteriskd_process_spec *, char *, size_t);
 int asteriskd_log_sibling_path(const char *, const char *, char *, size_t);
-int asteriskd_helper_render_documents(
-    const struct asteriskd_config *, int, int,
-    struct asteriskd_helper_documents *, char *, size_t);
-void asteriskd_helper_documents_destroy(struct asteriskd_helper_documents *);
-int asteriskd_helper_process_spec(
-    const struct asteriskd_config *, const char *const *, int, int, int,
-    struct asteriskd_process_spec *, char *, size_t);
 int asteriskd_anonymous_file_create(
     const struct asteriskd_anonymous_file_backend *, const char *,
     const struct asteriskd_anonymous_document *, struct asteriskd_anonymous_file *,
@@ -702,13 +668,6 @@ int asteriskd_helper_launch_prepare(
     struct asteriskd_helper_launch *, char *, size_t);
 int asteriskd_helper_launch_destroy(
     const struct asteriskd_anonymous_file_backend *, struct asteriskd_helper_launch *);
-int asteriskd_matcher_render_documents(
-    const struct asteriskd_config *, int, int,
-    struct asteriskd_matcher_documents *, char *, size_t);
-void asteriskd_matcher_documents_destroy(struct asteriskd_matcher_documents *);
-int asteriskd_matcher_process_spec(
-    const struct asteriskd_config *, const char *const *, int, int, int,
-    struct asteriskd_process_spec *, char *, size_t);
 int asteriskd_matcher_launch_prepare(
     const struct asteriskd_config *, const char *const *,
     const struct asteriskd_anonymous_file_backend *,
@@ -757,12 +716,6 @@ struct asteriskd_child_setup_backend {
     int (*prepare_descriptors)(void *, const struct asteriskd_process_spec *);
     int (*exec_process)(void *, const struct asteriskd_process_spec *);
 };
-
-int asteriskd_child_setup_run(
-    const struct asteriskd_process_spec *, int,
-    const struct asteriskd_child_setup_backend *, bool *, char *, size_t);
-
-void asteriskd_lifecycle_init(struct asteriskd_lifecycle *);
 int asteriskd_lifecycle_start(
     struct asteriskd_lifecycle *,
     const struct asteriskd_lifecycle_backend *,
@@ -1162,10 +1115,6 @@ struct asteriskd_reconcile_report {
     bool verified_absent;
     enum asteriskd_reconcile_phase failed_phase;
 };
-
-int asteriskd_reconcile_owned_resources(
-    const struct asteriskd_reconcile_backend *,
-    struct asteriskd_reconcile_report *, char *, size_t);
 int asteriskd_owned_policy_rule_output_count(
     const char *, size_t, const struct asteriskd_owned_policy_rule *, size_t *);
 
@@ -1576,8 +1525,6 @@ struct asteriskd_runtime_reactor_backend {
 
 struct asteriskd_runtime;
 typedef bool (*asteriskd_runtime_predicate)(void *);
-
-void asteriskd_poll_builder_init(struct asteriskd_poll_builder *);
 int asteriskd_poll_builder_add(
     struct asteriskd_poll_builder *, const struct asteriskd_poll_source *);
 bool asteriskd_process_poll_source_matches(
@@ -1693,13 +1640,8 @@ int asteriskd_state_mark_stopped(struct asteriskd_state_document *, char *, size
 bool asteriskd_state_is_stopped(const struct asteriskd_state_document *);
 const char *asteriskd_mode_name(enum asteriskd_mode);
 const char *asteriskd_failure_code_name(enum asteriskd_failure_code);
-int asteriskd_state_serialize(
-    const struct asteriskd_state_document *, char **, size_t *, char *, size_t);
 int asteriskd_state_store_init(
     struct asteriskd_state_store *, const char *, char *, size_t);
-int asteriskd_state_store_init_with_backend(
-    struct asteriskd_state_store *, int, uint64_t, uint64_t, const char *,
-    const struct asteriskd_state_file_backend *, void *, char *, size_t);
 int asteriskd_state_store_save(
     struct asteriskd_state_store *, const struct asteriskd_state_document *, char *, size_t);
 void asteriskd_state_store_close(struct asteriskd_state_store *);
@@ -1824,36 +1766,17 @@ struct asteriskd_control_event {
     bool has_details;
     struct asteriskd_control_error details;
 };
-
-int asteriskd_control_encode_request_line(
-    const struct asteriskd_control_request *, char *, size_t, size_t *);
-enum asteriskd_control_decode_outcome asteriskd_control_decode_request_payload(
-    const char *, size_t, struct asteriskd_control_request *);
-int asteriskd_control_encode_response_line(
-    const struct asteriskd_control_response *, char *, size_t, size_t *);
-int asteriskd_control_decode_response_payload(
-    const char *, size_t, struct asteriskd_control_response *);
-int asteriskd_control_encode_event_line(
-    const struct asteriskd_control_event *, char *, size_t, size_t *);
-int asteriskd_control_decode_event_payload(
-    const char *, size_t, struct asteriskd_control_event *);
 int asteriskd_control_snapshot_from_state(
     const struct asteriskd_state_document *, const struct asteriskd_control_live_context *,
     struct asteriskd_control_snapshot *);
-bool asteriskd_control_snapshot_valid(const struct asteriskd_control_snapshot *);
-bool asteriskd_control_result_valid(const struct asteriskd_control_result *);
 int asteriskd_control_result_exit_code(enum asteriskd_control_result_code);
-int asteriskd_control_error_set_message(
-    struct asteriskd_control_error *, const char *, size_t);
 int asteriskd_control_result_set_message(
     struct asteriskd_control_result *, const char *, size_t);
 int asteriskd_control_snapshot_copy(
     struct asteriskd_control_snapshot *, const struct asteriskd_control_snapshot *);
-void asteriskd_control_error_destroy(struct asteriskd_control_error *);
 void asteriskd_control_snapshot_destroy(struct asteriskd_control_snapshot *);
 void asteriskd_control_result_destroy(struct asteriskd_control_result *);
 void asteriskd_control_response_destroy(struct asteriskd_control_response *);
-void asteriskd_control_event_destroy(struct asteriskd_control_event *);
 
 struct asteriskd_runtime_effect_backend {
     void *context;
@@ -1925,9 +1848,6 @@ struct asteriskd_control_listener_backend {
     int (*listen_socket)(void *, int, int);
     int (*close_fd)(void *, int);
 };
-
-enum asteriskd_control_listener_result asteriskd_control_listener_open_with_backend(
-    int *, const struct asteriskd_control_listener_backend *, void *);
 enum asteriskd_control_listener_result asteriskd_control_listener_open(int *);
 
 enum asteriskd_cli_command {
@@ -1948,9 +1868,6 @@ struct asteriskd_cli_invocation {
     uint64_t instance_id, cycle_id, generation;
     char path[ASTERISKD_MAX_PATH];
 };
-
-int asteriskd_cli_parse(
-    int, const char *const *, struct asteriskd_cli_invocation *);
 
 enum asteriskd_control_connect_result {
     ASTERISKD_CONTROL_CONNECT_ERROR = -1,
@@ -1993,11 +1910,6 @@ enum asteriskd_control_sink_result {
 };
 
 typedef int (*asteriskd_control_line_sink)(void *, const char *, size_t);
-
-enum asteriskd_control_client_result asteriskd_control_client_run_with_backend(
-    enum asteriskd_control_method, const char *,
-    const struct asteriskd_control_client_backend *, void *,
-    asteriskd_control_line_sink, void *, struct asteriskd_control_response *);
 enum asteriskd_control_client_result asteriskd_control_client_run(
     enum asteriskd_control_method, const char *,
     asteriskd_control_line_sink, void *, struct asteriskd_control_response *);
@@ -2022,7 +1934,6 @@ struct asteriskd_cli_backend {
 
 int asteriskd_cli_main_with_backend(
     int, const char *const *, const struct asteriskd_cli_backend *, void *);
-int asteriskd_cli_main(int, const char *const *);
 
 struct asteriskd_control_transport_backend {
     int (*accept_client)(void *, int, int *, uint32_t *);
@@ -2046,11 +1957,6 @@ struct asteriskd_control_interest {
 };
 
 struct asteriskd_control_server;
-
-int asteriskd_control_server_create_with_backend(
-    struct asteriskd_control_server **, int,
-    const struct asteriskd_control_transport_backend *, void *,
-    const struct asteriskd_control_callbacks *);
 int asteriskd_control_server_create(
     struct asteriskd_control_server **, int,
     const struct asteriskd_control_callbacks *);
@@ -2190,9 +2096,6 @@ struct asteriskd_log_file_backend {
 
 int asteriskd_log_open_append_fd(
     const char *, int *, char *, size_t);
-int asteriskd_log_open_append_fd_with_backend(
-    const char *, const struct asteriskd_log_file_backend *, void *,
-    int *, char *, size_t);
 
 struct asteriskd_logger {
     int fd;
@@ -2214,9 +2117,6 @@ struct asteriskd_logger {
 int asteriskd_log_open(
     struct asteriskd_logger *, const char *, const unsigned char *, size_t,
     const struct asteriskd_clock_backend *, char *, size_t);
-int asteriskd_log_open_with_backend(
-    struct asteriskd_logger *, const char *, const unsigned char *, size_t,
-    const struct asteriskd_clock_backend *, const struct asteriskd_log_file_backend *, void *, char *, size_t);
 int asteriskd_log_line(
     struct asteriskd_logger *, enum asteriskd_log_level, enum asteriskd_component,
     enum asteriskd_log_event, const char *);
@@ -2475,9 +2375,6 @@ struct asteriskd_network_runtime {
 int asteriskd_network_open(
     const struct asteriskd_config *, const struct asteriskd_network_backend *,
     struct asteriskd_network_runtime *, char *, size_t);
-int asteriskd_network_note(
-    struct asteriskd_network_runtime *, const struct asteriskd_network_event *,
-    bool, uint64_t);
 int asteriskd_network_handle(
     struct asteriskd_network_runtime *, uint64_t, char *, size_t);
 bool asteriskd_network_next_deadline(
@@ -2491,8 +2388,6 @@ int asteriskd_network_set_effect_sink(
 bool asteriskd_network_has_immediate(const struct asteriskd_network_runtime *);
 int asteriskd_network_apply_immediate(
     struct asteriskd_network_runtime *, char *, size_t);
-int asteriskd_network_reopen(
-    struct asteriskd_network_runtime *, uint64_t, char *, size_t);
 /* Rebuilds the netd network set from an IPv6 rule dump and queues guard changes. */
 int asteriskd_network_sync_ipv6_guard(struct asteriskd_network_runtime *, char *, size_t);
 /* Writes "name:state" pairs (data, restricted, incomplete) for diagnostics. */

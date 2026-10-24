@@ -12,28 +12,29 @@ owned effects are cleaned in reverse order, and a non-resident supervisor exits
 nonzero. A clean explicit stop succeeds only after telemetry reaches `stopped`.
 
 The source root is build-system agnostic. The Android parent project compiles
-every top-level `.c` file as one PIE executable.
+every `.c` file under the root and its module directories as one PIE executable,
+with the source root on the include path (`-I<root>`).
 
 ## Source layout
 
-| Files | Responsibility |
+| Path | Responsibility |
 | --- | --- |
-| `asteriskd.c`, `asteriskd_control.c` | CLI entry point, control protocol and socket server |
-| `asteriskd_runtime.c` | Platform-neutral reactor, lifecycle driver and event publication |
-| `asteriskd_supervisor.c` | Linux supervisor: reactor backend, service control, children, lifecycle effects, cleanup |
-| `asteriskd_supervisor_action.c` | Short-lived root actions (iptables, tc) and rule batches committed through `iptables-restore --noflush` |
-| `asteriskd_supervisor_rtnl.c` | In-process `ip rule`/`ip route` requests and listings, and the Android tethering offload filter probe, over rtnetlink |
-| `asteriskd_supervisor_xtables.c` | iptables rule rendering, private chains, hooks and rule snapshots (one `iptables-save` per family when a snapshot needs two or more tables) |
-| `asteriskd_supervisor_tc.c` | TC commands and netlink probes |
-| `asteriskd_supervisor_rules.c` | Routes, BPF pins, sysctl effects and the rules backend |
-| `asteriskd_supervisor_network.c` | Matcher/helper start, network open, local bypass and hotspot offload |
-| `asteriskd_supervisor_reconcile.c` | Stateless owned-resource reconciliation |
-| `asteriskd_supervisor_dns.c`, `asteriskd_dns.c` | DNS enhancement transitions and the AEN1 companion client |
-| `asteriskd_util.c`, `asteriskd_text.c` | Shared error, string, text-writer and byte-buffer helpers |
+| `asteriskd.c`, `asteriskd.h` | CLI entry point; the shared module interface |
+| `runtime/` | `control.c` control protocol, socket server and CLI client; `runtime.c` platform-neutral reactor, lifecycle driver and event publication; `lifecycle.c` start, stop and pause sequencing of the core, helper and matcher |
+| `core/` | Configuration parsing, JSON, structured log, state telemetry, error/string/text helpers, platform capabilities, the Linux system backends |
+| `process/` | Core, helper and matcher process specs, child setup, readiness and stop coordination |
+| `resources/` | Owned-resource catalog, stateless reconciliation, the in-memory effect journal, BPF map/pin/matcher/bpf2socks verification |
+| `rules/` | Rule plans for TPROXY, TUN, local bypass and runtime slots, rule batches, TC install plans and netlink, TUN compatibility |
+| `network/` | Network reconciliation, hotspot offload policy, the AEN1 DNS companion client |
+| `service/` | Service control: Wi-Fi rules, schedules (cron) and the lock screen (keyguard) listener |
+| `supervisor/` | Linux supervisor: reactor backend, children, cleanup (`supervisor.c`); root actions and `iptables-restore --noflush` batches (`supervisor_action.c`); rtnetlink rules/routes and the tethering offload probe (`supervisor_rtnl.c`); iptables rendering and snapshots (`supervisor_xtables.c`); TC (`supervisor_tc.c`); routes, BPF pins and sysctl (`supervisor_rules.c`); matcher/helper start, network open and hotspot offload (`supervisor_network.c`); owned-resource reconciliation (`supervisor_reconcile.c`); DNS enhancement transitions (`supervisor_dns.c`) |
+| `shared/` | Contracts kept byte-identical with bpf2socks |
 
-`asteriskd.h` is the shared module interface. `asteriskd_supervisor.h` is private
-to the runtime and supervisor modules. Non-static functions use the
-`asteriskd_<module>_` prefix; file-local helpers in supervisor modules use
+`asteriskd.h` is the shared module interface. `supervisor/supervisor.h` is private
+to the runtime and supervisor modules. Every project include names its header from
+the source root, for example `#include "supervisor/supervisor.h"`. Non-static
+functions use the `asteriskd_<module>_` prefix; file-local helpers carry the module
+name without it (`control_`, `config_`), and those in supervisor modules use
 `system_`. `.clang-format` records the formatting baseline.
 
 ## CLI
@@ -272,7 +273,7 @@ unmarked DNS, including resolver-owned sockets, follows ordinary traffic policy.
 The DNS-specific OUTPUT rules do not
 expand the application UID list.
 
-`asteriskd_marks.h` defines the numeric marks and their xtables match strings.
+`rules/marks.h` defines the numeric marks and their xtables match strings.
 The classified bit is reserved for enhancement DNS decisions. The module sets
 proxy mark `0x21000000` before the first route lookup. OUTPUT returns both proxy
 and direct decisions through one classified-bit rule per protocol. The fixed

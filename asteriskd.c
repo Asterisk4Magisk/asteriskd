@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0
 
 #include "asteriskd.h"
-#include "asteriskd_dns.h"
+#include "network/dns.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -141,12 +141,12 @@ static const struct asteriskd_cli_backend system_cli_backend = {
     .write_stderr = system_write_stderr,
 };
 
-int asteriskd_cli_main(int argc, const char *const *argv) {
+static int cli_main(int argc, const char *const *argv) {
     if (argc == 2 && argv && argv[1] && strcmp(argv[1], "enhancement-info") == 0)
         return asteriskd_dns_info();
     return asteriskd_cli_main_with_backend(argc, argv, &system_cli_backend, NULL);
 }
 
 int main(int argc, char **argv) {
-    return asteriskd_cli_main(argc, (const char *const *)argv);
+    return cli_main(argc, (const char *const *)argv);
 }
