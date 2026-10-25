@@ -938,6 +938,12 @@ int asteriskd_supervisor_network_effect_dispatch(void *opaque,
         // The interface may disappear between the netlink event and this request.
         if (present == 1) return 0;
         int applied = asteriskd_supervisor_effect_apply_sysctl(system, sysctl, error, error_size);
+        // It may also disappear while the value is probed or written; nothing is left to guard.
+        if (applied != 0 && asteriskd_supervisor_sysctl_read(sysctl, &current) == 1) {
+            asteriskd_effect_journal_forget(&system->volatile_effects, &request->effect);
+            if (error != NULL && error_size != 0U) error[0] = '\0';
+            return 0;
+        }
         if (applied == 0 && sysctl->sysctl_id == ASTERISKD_SYSCTL_DISABLE_IPV6 &&
             snprintf(message, sizeof(message), "system IPv6 disabled: interface=%s",
                 sysctl->interface_name) > 0) {
@@ -955,6 +961,10 @@ int asteriskd_supervisor_network_effect_dispatch(void *opaque,
     char restore_error[128U] = {0};
     int restored = asteriskd_effect_journal_restore(&system->volatile_effects,
         &request->effect, &backend, restore_error, sizeof(restore_error));
+    if (restored != 0 && asteriskd_supervisor_sysctl_read(sysctl, &current) == 1) {
+        asteriskd_effect_journal_forget(&system->volatile_effects, &request->effect);
+        return 0;
+    }
     // A failed restore stays journaled; graceful cleanup retries it.
     int written = restored == 0
         ? snprintf(message, sizeof(message), "system IPv6 restored: interface=%s",

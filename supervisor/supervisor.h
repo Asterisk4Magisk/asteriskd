@@ -1,7 +1,7 @@
 // Copyright 2026, Asterisk4Magisk contributors
 // SPDX-License-Identifier: GPL-3.0
 
-/* Private interface shared by the supervisor/*.c modules. */
+/* Private interface shared by the .c modules in supervisor/. */
 #ifndef ASTERISKD_SUPERVISOR_SUPERVISOR_H
 #define ASTERISKD_SUPERVISOR_SUPERVISOR_H
 
