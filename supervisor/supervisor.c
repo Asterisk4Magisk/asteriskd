@@ -288,7 +288,9 @@ static int system_runtime_prepare(
         if (system->core_process.owns_stderr_fd &&
             system_runtime_add_source(builder, system->core_process.stderr_fd, POLLIN,
                 ASTERISKD_POLL_PROCESS_STDERR, 0U, generation) != 0) return -1;
-        if (system->core_process.owns_pidfd &&
+        // While stopping, the coordinator reaps in its predicate and SIGCHLD
+        // wakes the reactor; an exited child's pidfd stays readable and would spin.
+        if (system->core_process.owns_pidfd && !system->stopping_children &&
             system_runtime_add_source(builder, system->core_process.pidfd, POLLIN,
                 ASTERISKD_POLL_PROCESS_PIDFD, 0U, generation) != 0) return -1;
     }
@@ -303,7 +305,7 @@ static int system_runtime_prepare(
         if (system->helper_process.owns_stderr_fd &&
             system_runtime_add_source(builder, system->helper_process.stderr_fd, POLLIN,
                 ASTERISKD_POLL_PROCESS_STDERR, 1U, generation) != 0) return -1;
-        if (system->helper_process.owns_pidfd &&
+        if (system->helper_process.owns_pidfd && !system->stopping_children &&
             system_runtime_add_source(builder, system->helper_process.pidfd, POLLIN,
                 ASTERISKD_POLL_PROCESS_PIDFD, 1U, generation) != 0) return -1;
     }
@@ -319,6 +321,7 @@ static int system_runtime_prepare(
             system_runtime_add_source(builder, system->action_process.stderr_fd, POLLIN,
                 ASTERISKD_POLL_PROCESS_STDERR, 2U, generation) != 0) return -1;
         if (!system->action_reaped && system->action_process.owns_pidfd &&
+            !system->stopping_children &&
             system_runtime_add_source(builder, system->action_process.pidfd, POLLIN,
                 ASTERISKD_POLL_PROCESS_PIDFD, 2U, generation) != 0) return -1;
     }
@@ -477,6 +480,11 @@ static int system_runtime_dispatch_setup(struct asteriskd_system_supervisor *sys
                 bytes, count > 0 ? (size_t)count : 0U, eof) < ASTERISKD_CHILD_SETUP_PENDING) {
             if (slot != 2U) {
                 asteriskd_supervisor_runtime_fatal(delta, component, "child exec setup failed");
+            }
+            // A finished or unreadable stream stays ready at EOF and would spin.
+            if (count <= 0 || setup->complete) {
+                system_runtime_close_child_fd(&process->setup_status_fd,
+                    &process->owns_setup_status_fd);
             }
             return count < 0 ? -1 : 0;
         }
