@@ -266,8 +266,10 @@ int asteriskd_supervisor_runtime_request_dns(
             request->instance_id == system->dns_hot_request.instance_id &&
             request->cycle_id == system->dns_hot_request.cycle_id &&
             request->generation == system->dns_hot_request.generation;
+        // A daemon-owned rebuild already restores enhancement after its drain,
+        // so an abandoned client mutation leaves nothing withdrawn to stop for.
         if (!system->loaded_config.config.dns_enhancement || (!current && !operation) ||
-            !system->runtime || !system->runtime->supervising ||
+            system->dns_regenerating || !system->runtime || !system->runtime->supervising ||
             asteriskd_supervisor_runtime_request_stop(system) != 0)
             return -1;
         system->dns_regenerating = false;
@@ -394,6 +396,22 @@ int asteriskd_supervisor_dns_tick(
         system->dns_drain_waiting = false;
     }
     if (system->dns_hot_stage) {
+        if (now >= system->dns_hot_deadline && !system->dns_regenerating &&
+            system->dns.drain_events &&
+            (system->dns_hot_stage == SYSTEM_DNS_HOT_RELEASE ||
+                system->dns_hot_stage == SYSTEM_DNS_HOT_RELEASED) &&
+            system->dns.snapshot.phase == ASTERISKD_DNS_PHASE_DRAINING &&
+            system_dns_consumers_live(system)) {
+            // A control request that only waits for in-flight queries is not a
+            // service failure either. Answer it as failed while the policy stays
+            // withdrawn, then rebuild a fresh generation as a network-driven
+            // rebuild once the old resolver workers finish.
+            system->dns_regenerating = true;
+            system->dns_hot_completed_generation = 0;
+            memset(&system->dns_hot_request, 0, sizeof(system->dns_hot_request));
+            if (system->control && asteriskd_control_server_tick(system->control, now) != 0)
+                return -1;
+        }
         if (now >= system->dns_hot_deadline && system->dns_regenerating &&
             (system->dns_hot_stage == SYSTEM_DNS_HOT_WAIT_NETWORK ||
                 (system->dns.drain_events &&
