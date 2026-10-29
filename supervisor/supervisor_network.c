@@ -342,9 +342,9 @@ failed:
 
 static bool system_hotspot_interface_selected(
     const struct asteriskd_config *config, const char *name) {
-    for (size_t index = 0U; index < config->hotspot_interface_prefix_count; ++index) {
+    for (size_t index = 0U; index < config->hotspot_interface_count; ++index) {
         if (asteriskd_interface_matches_selector(
-                name, config->hotspot_interface_prefixes[index])) return true;
+                name, config->hotspot_interfaces[index])) return true;
     }
     return false;
 }

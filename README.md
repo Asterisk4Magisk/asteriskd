@@ -132,12 +132,13 @@ Android builds link `libdl` and `libz`; `libbinder_ndk` is loaded dynamically so
 older Android devices retain their existing runtime support. The application
 hides this control and publishes it disabled below API 33.
 
-## Configuration v4
+## Configuration v6
 
-The configuration is strict UTF-8 JSON (`schemaVersion: 4`) with a maximum size
+The configuration is strict UTF-8 JSON (`schemaVersion: 6`) with a maximum size
 of 8 MiB. Every object is closed: unknown, duplicate, or missing keys are
-invalid, including keys whose value is nullable. Validation completes before
-the logger, state, socket, child, or external network effects are created.
+invalid, including keys whose value is nullable. Other schema versions are
+rejected. Validation completes before the logger, state, socket, child, or
+external network effects are created.
 
 Top-level sections are:
 
@@ -146,7 +147,9 @@ Top-level sections are:
 - `core` for the readiness timeout and optional Mihomo AGE secret;
 - `modeOptions` for the tproxy port or TUN name;
 - `network` for IPv6 intent, DNS/fake-DNS, interface selectors, private CIDRs,
-  UID policy, and inline canonical direct CIDRs;
+  UID policy, and inline canonical direct CIDRs; `hotspotInterfaces` entries
+  are exact names such as `ap0` or prefix selectors ending in `+` such as
+  `wlan+`;
 - nullable `helper` (`hev-socks5-tunnel` or `bpf2socks`);
 - nullable `matcher`, containing only its executable path.
 

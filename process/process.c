@@ -1436,3 +1436,56 @@ int asteriskd_system_process_backends_init(
     return ASTERISKD_CONFIG_IO;
 #endif
 }
+
+#if defined(__linux__)
+static void process_wait_channel_copy(const char *source, size_t length, char *out, size_t size) {
+    size_t used = 0U;
+    while (used < length && used + 1U < size &&
+        ((source[used] >= 'a' && source[used] <= 'z') ||
+            (source[used] >= 'A' && source[used] <= 'Z') ||
+            (source[used] >= '0' && source[used] <= '9') ||
+            source[used] == '_' || source[used] == '.')) {
+        out[used] = source[used];
+        ++used;
+    }
+    out[used] = '\0';
+    if (used == 0U || strcmp(out, "0") == 0) (void)snprintf(out, size, "%s", "none");
+}
+#endif
+
+/* Describe a child that outlived the stop deadline: its scheduler state and
+ * kernel wait channel, read-only from procfs, for stop failure diagnostics. */
+int asteriskd_process_wait_state_describe(int pid, char *out, size_t size) {
+    if (out == NULL || size == 0U) return ASTERISKD_CONFIG_INVALID;
+    out[0] = '\0';
+    if (pid <= 0) return ASTERISKD_CONFIG_INVALID;
+#if defined(__linux__)
+    char path[64U];
+    char text[1024U];
+    size_t length = 0U;
+    char state = '?';
+    if (system_proc_path(path, sizeof(path), pid, "stat") == 0 &&
+        system_read_proc_file(path, (unsigned char *)text, sizeof(text) - 1U, &length) == 0) {
+        text[length] = '\0';
+        const char *comm_end = strrchr(text, ')');
+        if (comm_end != NULL && comm_end[1] == ' ' &&
+            comm_end[2] >= 'A' && comm_end[2] <= 'Z') state = comm_end[2];
+    }
+    char wait_channel[64U];
+    length = 0U;
+    if (system_proc_path(path, sizeof(path), pid, "wchan") == 0 &&
+        system_read_proc_file(path, (unsigned char *)text, sizeof(text) - 1U, &length) == 0) {
+        process_wait_channel_copy(text, length, wait_channel, sizeof(wait_channel));
+    } else {
+        (void)snprintf(wait_channel, sizeof(wait_channel), "%s", "unavailable");
+    }
+    int written = snprintf(out, size, "state=%c wchan=%s", state, wait_channel);
+    if (written < 0 || (size_t)written >= size) {
+        out[0] = '\0';
+        return ASTERISKD_CONFIG_INVALID;
+    }
+    return 0;
+#else
+    return ASTERISKD_CONFIG_IO;
+#endif
+}

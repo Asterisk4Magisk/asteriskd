@@ -16,7 +16,7 @@ uint32_t asteriskd_supervisor_rule_categories(const struct asteriskd_config *con
             ASTERISKD_RULE_CATEGORY_BIT(ASTERISKD_RULE_CATEGORY_LOCAL_BYPASS);
     } else if (config->mode == ASTERISKD_MODE_BPF2SOCKS) {
         categories |= ASTERISKD_RULE_CATEGORY_BIT(ASTERISKD_RULE_CATEGORY_BPF);
-        if (config->hotspot_interface_prefix_count != 0U) {
+        if (config->hotspot_interface_count != 0U) {
             categories |= ASTERISKD_RULE_CATEGORY_BIT(ASTERISKD_RULE_CATEGORY_TC) |
                 ASTERISKD_RULE_CATEGORY_BIT(ASTERISKD_RULE_CATEGORY_HOTSPOT);
         }
@@ -24,7 +24,7 @@ uint32_t asteriskd_supervisor_rule_categories(const struct asteriskd_config *con
     if (config->matcher.enabled) {
         categories |= ASTERISKD_RULE_CATEGORY_BIT(ASTERISKD_RULE_CATEGORY_BPF);
     }
-    if (config->hotspot_interface_prefix_count != 0U) {
+    if (config->hotspot_interface_count != 0U) {
         categories |= ASTERISKD_RULE_CATEGORY_BIT(ASTERISKD_RULE_CATEGORY_HOTSPOT);
     }
     if (config->enable_local_dns) {

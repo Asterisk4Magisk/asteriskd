@@ -597,7 +597,7 @@ static int parse_network(
     struct asteriskd_config *config) {
     static const char *const names[] = {
         "enableIpv6", "disableSystemIpv6", "enableLocalDns", "enableFakeDns", "fakeDnsIpv4Pool",
-        "ignoredInterfaces", "virtualInterfaces", "hotspotInterfacePrefixes", "proxyPrivateCidrs",
+        "ignoredInterfaces", "virtualInterfaces", "hotspotInterfaces", "proxyPrivateCidrs",
         "bypassPrivateCidrs", "appPolicy",
     };
     size_t values[11];
@@ -615,7 +615,7 @@ static int parse_network(
         if (!asteriskd_interface_selector_valid(config->ignored_interfaces[index])) return -1;
     }
     if (parse_string_array(document, values[6], (char *)config->virtual_interfaces, ASTERISKD_MAX_INTERFACE_NAME, ASTERISKD_MAX_INTERFACES, true, false, &config->virtual_interface_count) != 0 ||
-        parse_string_array(document, values[7], (char *)config->hotspot_interface_prefixes, ASTERISKD_MAX_INTERFACE_NAME, ASTERISKD_MAX_INTERFACES, true, true, &config->hotspot_interface_prefix_count) != 0 ||
+        parse_string_array(document, values[7], (char *)config->hotspot_interfaces, ASTERISKD_MAX_INTERFACE_NAME, ASTERISKD_MAX_INTERFACES, true, true, &config->hotspot_interface_count) != 0 ||
         parse_string_array(document, values[8], (char *)config->proxy_private_cidrs, ASTERISKD_MAX_CIDR, ASTERISKD_MAX_CIDRS, false, false, &config->proxy_private_cidr_count) != 0 ||
         parse_string_array(document, values[9], (char *)config->bypass_private_cidrs, ASTERISKD_MAX_CIDR, ASTERISKD_MAX_CIDRS, false, false, &config->bypass_private_cidr_count) != 0 ||
         config->proxy_private_cidr_count + config->bypass_private_cidr_count > ASTERISKD_MAX_CIDRS ||
@@ -800,16 +800,16 @@ static int parse_keyguard_control(const struct asteriskd_json_document *document
 static int parse_service_control(
     const struct asteriskd_json_document *document,
     size_t object,
-    struct asteriskd_service_control_config *service_control, uint32_t schema) {
+    struct asteriskd_service_control_config *service_control) {
     static const char *const names[] = {"enabled", "schedule", "wifi", "keyguard"};
     size_t values[4];
-    if (object_fields(document, object, names, schema >= 4U ? 4U : 3U, values) != 0 ||
+    if (object_fields(document, object, names, 4U, values) != 0 ||
         parse_bool(document, values[0], &service_control->enabled) != 0 ||
         parse_schedule_control(
             document, values[1], service_control->enabled,
             &service_control->schedule) != 0 ||
         parse_wifi_control(document, values[2], &service_control->wifi) != 0 ||
-        (schema >= 4U && parse_keyguard_control(document, values[3], &service_control->keyguard) != 0)) {
+        parse_keyguard_control(document, values[3], &service_control->keyguard) != 0) {
         return -1;
     }
     return 0;
@@ -896,7 +896,7 @@ static int parse_bpf(
         "type", "executablePath", "bridgeListenAddress", "bridgePort", "socksHost", "socksPort",
         "workerCount", "tcpBufferSize", "maxTcpSessions", "connectTimeoutMilliseconds",
         "tcpIdleTimeoutMilliseconds", "udpSocketBufferSize", "udpBatchSize", "maxUdpSessions",
-        "maxUdpBindings", "udpIdleTimeoutSeconds", "maxUdpPendingBytes", "dnsTransactionTimeoutMilliseconds",
+        "maxUdpBindings", "udpIdleTimeoutMilliseconds", "maxUdpPendingBytes", "dnsTransactionTimeoutMilliseconds",
     };
     size_t values[18];
     struct asteriskd_bpf_helper_config *bpf = &config->helper.value.bpf;
@@ -917,7 +917,7 @@ static int parse_bpf(
         parse_u32(document, values[12], &bpf->udp_batch_size) != 0 || bpf->udp_batch_size < 1U || bpf->udp_batch_size > 1024U ||
         parse_u32(document, values[13], &bpf->max_udp_sessions) != 0 || bpf->max_udp_sessions < 1U || bpf->max_udp_sessions > 1048576U ||
         parse_u32(document, values[14], &bpf->max_udp_bindings) != 0 || bpf->max_udp_bindings < 1U || bpf->max_udp_bindings > 4194304U ||
-        parse_u32(document, values[15], &bpf->udp_idle_timeout_seconds) != 0 || bpf->udp_idle_timeout_seconds < 1U || bpf->udp_idle_timeout_seconds > 86400U ||
+        parse_u32(document, values[15], &bpf->udp_idle_timeout_milliseconds) != 0 || bpf->udp_idle_timeout_milliseconds < 1000U || bpf->udp_idle_timeout_milliseconds > 86400000U ||
         parse_u32(document, values[16], &bpf->max_udp_pending_bytes) != 0 || bpf->max_udp_pending_bytes < 65536U || bpf->max_udp_pending_bytes > 1073741824U ||
         parse_u32(document, values[17], &bpf->dns_transaction_timeout_milliseconds) != 0 || bpf->dns_transaction_timeout_milliseconds < 100U || bpf->dns_transaction_timeout_milliseconds > 60000U) return -1;
     config->helper.type = ASTERISKD_HELPER_BPF2SOCKS;
@@ -966,7 +966,7 @@ static int validate_cross_fields(struct asteriskd_config *config) {
     if (asteriskd_mode_core_managed(config->mode) &&
         (config->enable_local_dns || config->enable_fake_dns || config->has_fake_dns_ipv4_pool ||
          config->ignored_interface_count != 0U || config->virtual_interface_count != 0U ||
-         (config->mode == ASTERISKD_MODE_EBPF && config->hotspot_interface_prefix_count != 0U) ||
+         (config->mode == ASTERISKD_MODE_EBPF && config->hotspot_interface_count != 0U) ||
          config->proxy_private_cidr_count != 0U ||
          config->bypass_private_cidr_count != 0U || config->app_policy_mode != ASTERISKD_APP_POLICY_GLOBAL ||
          config->uid_count != 0U || config->bypass_uid_count != 0U || config->has_direct_cidr_paths ||
@@ -1020,15 +1020,7 @@ static int config_parse(
     struct asteriskd_json_document document;
     int result = asteriskd_json_parse(json, length, &document, message, message_size);
     if (result != 0) return result;
-    static const char *const root_names_v2[] = {
-        "schemaVersion", "owner", "coreType", "coreExecutablePath", "coreConfigPath", "statePath",
-        "logPath", "mode", "core", "network", "modeOptions", "matcher", "helper",
-    };
-    static const char *const root_names_v3[] = {
-        "schemaVersion", "owner", "coreType", "coreExecutablePath", "coreConfigPath", "statePath",
-        "logPath", "mode", "core", "network", "modeOptions", "matcher", "helper", "serviceControl",
-    };
-    static const char *const root_names_v5[] = {
+    static const char *const root_names[] = {
         "schemaVersion", "owner", "coreType", "coreExecutablePath", "coreConfigPath", "statePath",
         "logPath", "mode", "core", "network", "modeOptions", "matcher", "helper", "serviceControl", "dnsEnhancement",
     };
@@ -1042,11 +1034,8 @@ static int config_parse(
     if (document.tokens[0].type != ASTERISKD_JSON_OBJECT ||
         find_field(&document, 0U, "schemaVersion", &schema_token) != 0 ||
         parse_u32(&document, schema_token, &schema) != 0 ||
-        (schema != 2U && schema != 3U && schema != 4U && schema != ASTERISKD_CONFIG_VERSION) ||
-        (schema == 2U
-            ? object_fields(&document, 0U, root_names_v2, 13U, values)
-            : schema == 5U ? object_fields(&document, 0U, root_names_v5, 15U, values)
-            : object_fields(&document, 0U, root_names_v3, 14U, values)) != 0 ||
+        schema != ASTERISKD_CONFIG_VERSION ||
+        object_fields(&document, 0U, root_names, 15U, values) != 0 ||
         copy_string(&document, values[3], config->core_executable_path, sizeof(config->core_executable_path)) != 0 || !path_is_normal(config->core_executable_path) ||
         copy_string(&document, values[4], config->core_config_path, sizeof(config->core_config_path)) != 0 || !path_is_normal(config->core_config_path) ||
         copy_string(&document, values[5], config->state_path, sizeof(config->state_path)) != 0 || !path_is_normal(config->state_path) ||
@@ -1064,10 +1053,8 @@ static int config_parse(
     if (result == 0) result = parse_mode_options(&document, values[10], config);
     if (result == 0) result = parse_matcher(&document, values[11], config);
     if (result == 0) result = parse_helper(&document, values[12], config);
-    if (result == 0 && schema >= 3U) {
-        result = parse_service_control(&document, values[13], &config->service_control, schema);
-    }
-    if (result == 0 && schema == 5U) result = parse_dns_enhancement(&document, values[14], config);
+    if (result == 0) result = parse_service_control(&document, values[13], &config->service_control);
+    if (result == 0) result = parse_dns_enhancement(&document, values[14], config);
     if (result == ASTERISKD_CONFIG_NO_MEMORY) goto no_memory;
     if (result != 0 || validate_cross_fields(config) != 0) goto invalid;
     if (!supported(config)) {

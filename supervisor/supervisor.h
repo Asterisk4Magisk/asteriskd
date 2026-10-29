@@ -274,6 +274,7 @@ int asteriskd_supervisor_pump_condition(struct asteriskd_system_supervisor *syst
 int asteriskd_supervisor_pump_condition_periodic(struct asteriskd_system_supervisor *system,
     const struct asteriskd_deadline *deadline, uint32_t interval,
     asteriskd_runtime_predicate predicate);
+int asteriskd_supervisor_pump_stop(struct asteriskd_system_supervisor *system);
 void asteriskd_supervisor_log_failure(struct asteriskd_system_supervisor *system,
     enum asteriskd_component component, const char *message);
 void asteriskd_supervisor_action_stderr_summary(

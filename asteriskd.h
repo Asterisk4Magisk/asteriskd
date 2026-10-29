@@ -16,7 +16,7 @@
 
 struct asteriskd_resource_operation;
 
-#define ASTERISKD_CONFIG_VERSION 5U
+#define ASTERISKD_CONFIG_VERSION 6U
 #define ASTERISKD_MAX_JSON_SIZE (8U * 1024U * 1024U)
 #define ASTERISKD_JSON_MAX_TOKENS 262144U
 #define ASTERISKD_JSON_MAX_DEPTH 64U
@@ -59,7 +59,7 @@ struct asteriskd_resource_operation;
 #define ASTERISKD_PROCESS_MAX_ENV_ENTRY 8192U
 #define ASTERISKD_PROCESS_MAX_INHERITED_FDS 8U
 #define ASTERISKD_PROCESS_TERM_GRACE_MILLIS 3000U
-#define ASTERISKD_PROCESS_KILL_REAP_MILLIS 1000U
+#define ASTERISKD_PROCESS_KILL_REAP_MILLIS 5000U
 // A readiness check reads one /proc listing; a short interval keeps the
 // notice delay small for children that become ready a few hundred ms in.
 #define ASTERISKD_READINESS_POLL_INTERVAL_MILLIS 20U
@@ -337,7 +337,7 @@ struct asteriskd_bpf_helper_config {
     uint32_t udp_batch_size;
     uint32_t max_udp_sessions;
     uint32_t max_udp_bindings;
-    uint32_t udp_idle_timeout_seconds;
+    uint32_t udp_idle_timeout_milliseconds;
     uint32_t max_udp_pending_bytes;
     uint32_t dns_transaction_timeout_milliseconds;
 };
@@ -384,8 +384,8 @@ struct asteriskd_config {
     size_t ignored_interface_count;
     char virtual_interfaces[ASTERISKD_MAX_INTERFACES][ASTERISKD_MAX_INTERFACE_NAME];
     size_t virtual_interface_count;
-    char hotspot_interface_prefixes[ASTERISKD_MAX_INTERFACES][ASTERISKD_MAX_INTERFACE_NAME];
-    size_t hotspot_interface_prefix_count;
+    char hotspot_interfaces[ASTERISKD_MAX_INTERFACES][ASTERISKD_MAX_INTERFACE_NAME];
+    size_t hotspot_interface_count;
     char proxy_private_cidrs[ASTERISKD_MAX_CIDRS][ASTERISKD_MAX_CIDR];
     size_t proxy_private_cidr_count;
     char bypass_private_cidrs[ASTERISKD_MAX_CIDRS][ASTERISKD_MAX_CIDR];
@@ -966,6 +966,7 @@ int asteriskd_system_process_backends_init(
     struct asteriskd_system_process_context *, const struct asteriskd_process_spec *,
     const struct asteriskd_process_spec *, struct asteriskd_readiness_backend *,
     struct asteriskd_stop_backend *);
+int asteriskd_process_wait_state_describe(int pid, char *out, size_t size);
 
 enum asteriskd_resource_operation_kind {
     ASTERISKD_RESOURCE_OPERATION_IPTABLES_CHAIN,

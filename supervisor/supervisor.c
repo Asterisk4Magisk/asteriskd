@@ -1231,14 +1231,9 @@ static int system_effect_stop_children(
     system->stop_result = asteriskd_stop_coordinator_begin(
         &system->stop_coordinator, core, helper,
         &system->stop_backend, (uint64_t)now);
-    if (system->stop_result == ASTERISKD_STOP_PENDING) {
-        struct asteriskd_deadline deadline = {
-            .armed = true,
-            .monotonic_milliseconds = (int64_t)system->stop_coordinator.kill_deadline_milliseconds,
-        };
-        if (asteriskd_supervisor_pump_condition(system, &deadline, asteriskd_supervisor_stop_done) != 0) {
-            system->stop_result = ASTERISKD_STOP_FAILED;
-        }
+    if (system->stop_result == ASTERISKD_STOP_PENDING &&
+        asteriskd_supervisor_pump_stop(system) != 0) {
+        system->stop_result = ASTERISKD_STOP_FAILED;
     }
     system->stopping_children = false;
     bool killed = system->stop_coordinator.core.kill_sent ||
@@ -1246,17 +1241,31 @@ static int system_effect_stop_children(
     if (system->stop_result != ASTERISKD_STOP_COMPLETE || killed) {
         const struct asteriskd_stop_role_state *core_state = &system->stop_coordinator.core;
         const struct asteriskd_stop_role_state *helper_state = &system->stop_coordinator.helper;
-        char message[320U];
+        char core_wait[96U] = "";
+        char helper_wait[96U] = "";
+        if (core_state->present && !core_state->reaped &&
+            asteriskd_process_wait_state_describe(
+                core_state->identity.pid, core_wait, sizeof(core_wait)) != 0) {
+            (void)snprintf(core_wait, sizeof(core_wait), "%s", "unavailable");
+        }
+        if (helper_state->present && !helper_state->reaped &&
+            asteriskd_process_wait_state_describe(
+                helper_state->identity.pid, helper_wait, sizeof(helper_wait)) != 0) {
+            (void)snprintf(helper_wait, sizeof(helper_wait), "%s", "unavailable");
+        }
+        char message[512U];
         int written = snprintf(message, sizeof(message),
             "child stop %s: core=present:%d,term:%d,kill:%d,signalFailed:%d,reaped:%d "
-            "helper=present:%d,term:%d,kill:%d,signalFailed:%d,reaped:%d",
+            "helper=present:%d,term:%d,kill:%d,signalFailed:%d,reaped:%d%s%s%s%s",
             system->stop_result == ASTERISKD_STOP_COMPLETE ? "required SIGKILL" : "failed",
             core_state->present ? 1 : 0, core_state->term_sent ? 1 : 0,
             core_state->kill_sent ? 1 : 0, core_state->signal_failed ? 1 : 0,
             core_state->reaped ? 1 : 0,
             helper_state->present ? 1 : 0, helper_state->term_sent ? 1 : 0,
             helper_state->kill_sent ? 1 : 0, helper_state->signal_failed ? 1 : 0,
-            helper_state->reaped ? 1 : 0);
+            helper_state->reaped ? 1 : 0,
+            core_wait[0] != '\0' ? " coreWait=" : "", core_wait,
+            helper_wait[0] != '\0' ? " helperWait=" : "", helper_wait);
         if (written > 0 && (size_t)written < sizeof(message)) {
             if (system->stop_result == ASTERISKD_STOP_COMPLETE) {
                 (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_WARNING,
@@ -1278,7 +1287,14 @@ static int system_effect_stop_children(
         asteriskd_supervisor_accept_pump_delta(system, &delta) != 0) return -1;
     if (include_helper) asteriskd_child_process_close(&system->helper_process);
     if (include_core) asteriskd_child_process_close(&system->core_process);
-    return system->stop_result == ASTERISKD_STOP_COMPLETE && !killed ? 0 : -1;
+    /* A child reaped after SIGKILL leaves only supervisor-owned state, which
+     * the caller still cleans: the helper's BPF pins and cgroup hooks are
+     * reconciled by system_effect_stop_helper. A core that manages its own
+     * traffic restores system state only on a graceful exit, so killing it
+     * stays a cleanup failure. */
+    bool residue = system->stop_coordinator.core.kill_sent &&
+        asteriskd_mode_core_managed(system->loaded_config.config.mode);
+    return system->stop_result == ASTERISKD_STOP_COMPLETE && !residue ? 0 : -1;
 }
 
 static int system_effect_stop_helper(void *opaque) {

@@ -5,7 +5,7 @@
 
 enum asteriskd_hotspot_ipv6_offload_policy asteriskd_hotspot_ipv6_offload_policy_for(
     const struct asteriskd_config *config) {
-    if (config == NULL || config->hotspot_interface_prefix_count == 0U ||
+    if (config == NULL || config->hotspot_interface_count == 0U ||
         config->mode == ASTERISKD_MODE_EBPF) return ASTERISKD_HOTSPOT_IPV6_OFFLOAD_KEEP;
     if (config->mode == ASTERISKD_MODE_BPF2SOCKS) {
         return ASTERISKD_HOTSPOT_IPV6_OFFLOAD_REMOVE_PREF1_REQUIRED;

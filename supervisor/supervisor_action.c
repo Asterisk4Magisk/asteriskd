@@ -125,6 +125,29 @@ int asteriskd_supervisor_pump_condition_periodic(struct asteriskd_system_supervi
     }
 }
 
+/* Wait for a started stop coordinator. Wake at the TERM grace deadline so
+ * SIGKILL goes out on time and the reap still gets the full KILL window. */
+int asteriskd_supervisor_pump_stop(struct asteriskd_system_supervisor *system) {
+    const struct asteriskd_stop_coordinator *coordinator = &system->stop_coordinator;
+    if (coordinator->kill_deadline_milliseconds > (uint64_t)INT64_MAX) return -1;
+    const int64_t term_deadline = (int64_t)coordinator->term_deadline_milliseconds;
+    const struct asteriskd_deadline deadline = {
+        .armed = true,
+        .monotonic_milliseconds = (int64_t)coordinator->kill_deadline_milliseconds,
+    };
+    for (;;) {
+        if (asteriskd_supervisor_stop_done(system)) return 0;
+        int64_t now = 0;
+        if (asteriskd_supervisor_runtime_clock(system, &now) != 0 ||
+            now >= deadline.monotonic_milliseconds) return -1;
+        struct asteriskd_deadline iteration = deadline;
+        if (now < term_deadline) iteration.monotonic_milliseconds = term_deadline;
+        struct asteriskd_runtime_delta delta;
+        if (asteriskd_runtime_pump_once(system->runtime, &iteration, &delta) != 0) return -1;
+        if (asteriskd_supervisor_accept_pump_delta(system, &delta) != 0) return -1;
+    }
+}
+
 static int system_action_signal_unverified(
     struct asteriskd_system_supervisor *system, int signal_number) {
     pid_t pid = (pid_t)system->action_process.pid;
@@ -150,15 +173,9 @@ static int system_action_cleanup(struct asteriskd_system_supervisor *system,
         system->stop_result = asteriskd_stop_coordinator_begin(
             &system->stop_coordinator, NULL, &system->action_identity,
             &system->stop_backend, (uint64_t)now);
-        if (system->stop_result == ASTERISKD_STOP_PENDING) {
-            struct asteriskd_deadline deadline = {
-                .armed = true,
-                .monotonic_milliseconds =
-                    (int64_t)system->stop_coordinator.kill_deadline_milliseconds,
-            };
-            if (asteriskd_supervisor_pump_condition(system, &deadline, asteriskd_supervisor_stop_done) != 0) {
-                system->stop_result = ASTERISKD_STOP_FAILED;
-            }
+        if (system->stop_result == ASTERISKD_STOP_PENDING &&
+            asteriskd_supervisor_pump_stop(system) != 0) {
+            system->stop_result = ASTERISKD_STOP_FAILED;
         }
         system->stopping_children = false;
         if (system->stop_result != ASTERISKD_STOP_COMPLETE) return -1;

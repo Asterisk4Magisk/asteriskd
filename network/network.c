@@ -74,7 +74,7 @@ static uint32_t required_groups(const struct asteriskd_config *config) {
         uint32_t groups = config->disable_system_ipv6 ?
             ASTERISKD_NETWORK_GROUP_IPV6_ADDRESS | ASTERISKD_NETWORK_GROUP_LINK |
                 ASTERISKD_NETWORK_GROUP_IPV6_RULE : 0U;
-        if (config->hotspot_interface_prefix_count != 0U) {
+        if (config->hotspot_interface_count != 0U) {
             groups |= ASTERISKD_NETWORK_GROUP_LINK;
             if (config->enable_ipv6) groups |= ASTERISKD_NETWORK_GROUP_IPV6_ADDRESS;
         }
@@ -85,7 +85,7 @@ static uint32_t required_groups(const struct asteriskd_config *config) {
         groups |= ASTERISKD_NETWORK_GROUP_IPV6_ADDRESS;
     }
     if (config->disable_system_ipv6 ||
-        (config->hotspot_interface_prefix_count != 0U &&
+        (config->hotspot_interface_count != 0U &&
          (config->enable_ipv6 || config->mode == ASTERISKD_MODE_BPF2SOCKS))) {
         groups |= ASTERISKD_NETWORK_GROUP_LINK;
     }
@@ -220,9 +220,9 @@ static bool interface_name_valid(const char *name) {
 }
 
 static bool hotspot_interface(const struct asteriskd_config *config, const char *name) {
-    for (size_t index = 0U; index < config->hotspot_interface_prefix_count; ++index) {
+    for (size_t index = 0U; index < config->hotspot_interface_count; ++index) {
         if (asteriskd_interface_matches_selector(
-                name, config->hotspot_interface_prefixes[index])) return true;
+                name, config->hotspot_interfaces[index])) return true;
     }
     return false;
 }

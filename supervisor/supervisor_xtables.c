@@ -594,14 +594,14 @@ static int system_enhanced_dns_prerouting(struct asteriskd_system_supervisor *sy
             return -1;
     }
     // Hotspot DNS uses both transports; local unmarked queries already returned.
-    for (size_t i = 0; i < config->hotspot_interface_prefix_count; ++i) {
+    for (size_t i = 0; i < config->hotspot_interface_count; ++i) {
         for (unsigned protocol_index = 0; protocol_index < 2; ++protocol_index) {
             const char *protocol = protocol_index ? "tcp" : "udp";
             if (tproxy && protocol_index &&
                 system_append_established_tcp6_dns(
-                    system, family, chain, config->hotspot_interface_prefixes[i], false) != 0)
+                    system, family, chain, config->hotspot_interfaces[i], false) != 0)
                 return -1;
-            const char *args[20] = {"-i", config->hotspot_interface_prefixes[i], "-p", protocol,
+            const char *args[20] = {"-i", config->hotspot_interfaces[i], "-p", protocol,
                 "-m", protocol, "--dport", "53", "-j"};
             size_t count = 9;
             if (tproxy) {
@@ -665,9 +665,9 @@ static int system_populate_tproxy_prerouting(
     if (system_append_ipsec_udp_bypass(system, family, chain) != 0) return -1;
     if (system_append_local_bypass_interval(
             system, family, chain, local_begin, local_end) != 0) return -1;
-    for (size_t prefix_remaining = config->hotspot_interface_prefix_count;
+    for (size_t prefix_remaining = config->hotspot_interface_count;
          prefix_remaining > 0U; --prefix_remaining) {
-        const char *interface_name = config->hotspot_interface_prefixes[prefix_remaining - 1U];
+        const char *interface_name = config->hotspot_interfaces[prefix_remaining - 1U];
         for (size_t cidr_remaining = config->proxy_private_cidr_count;
              cidr_remaining > 0U; --cidr_remaining) {
             const char *cidr = config->proxy_private_cidrs[cidr_remaining - 1U];
@@ -699,8 +699,8 @@ static int system_populate_tproxy_prerouting(
             ? ASTERISKD_PIN_MATCHER_PREROUTING_V4 : ASTERISKD_PIN_MATCHER_PREROUTING_V6);
         if (matcher_path == NULL) return -1;
     }
-    for (size_t index = 0U; index < config->hotspot_interface_prefix_count; ++index) {
-        const char *interface_name = config->hotspot_interface_prefixes[index];
+    for (size_t index = 0U; index < config->hotspot_interface_count; ++index) {
+        const char *interface_name = config->hotspot_interfaces[index];
         if (system_append_tproxy(system, family, chain, "tcp", interface_name,
                 NULL, false, matcher_path) != 0 ||
             system_append_tproxy(system, family, chain, "udp", interface_name,
@@ -768,8 +768,8 @@ static int system_populate_tun_prerouting(
             ? ASTERISKD_PIN_MATCHER_PREROUTING_V4 : ASTERISKD_PIN_MATCHER_PREROUTING_V6);
         if (matcher_path == NULL) return -1;
     }
-    for (size_t index = 0U; index < config->hotspot_interface_prefix_count; ++index) {
-        const char *interface_name = config->hotspot_interface_prefixes[index];
+    for (size_t index = 0U; index < config->hotspot_interface_count; ++index) {
+        const char *interface_name = config->hotspot_interfaces[index];
         if (system_append_mark(system, family, chain, "tcp", NULL,
                 interface_name, NULL, matcher_path) != 0 ||
             system_append_mark(system, family, chain, "udp", NULL,
