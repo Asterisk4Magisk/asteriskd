@@ -19,6 +19,7 @@
 #define WIFI_NETLINK_BUFFER_SIZE 65536U
 #define WIFI_MAX_STATION_INTERFACES 16U
 #define WIFI_DEBOUNCE_MILLISECONDS 350U
+#define WIFI_ASSOCIATION_RETRY_LIMIT 3U
 #define WIFI_NLA_ALIGNTO 4U
 #define WIFI_NLA_ALIGN(length) (((length) + WIFI_NLA_ALIGNTO - 1U) & ~(WIFI_NLA_ALIGNTO - 1U))
 #define WIFI_NLA_HEADER_LENGTH WIFI_NLA_ALIGN(sizeof(struct nlattr))
@@ -53,12 +54,16 @@ static int wifi_open_socket(void) {
     memset(&address, 0, sizeof(address));
     address.nl_family = AF_NETLINK;
     if (bind(fd, (const struct sockaddr *)&address, sizeof(address)) != 0) {
+        int saved = errno;
         (void)close(fd);
+        errno = saved;
         return -1;
     }
     struct timeval timeout = { .tv_sec = 2, .tv_usec = 0 };
     if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) {
+        int saved = errno;
         (void)close(fd);
+        errno = saved;
         return -1;
     }
     return fd;
@@ -73,7 +78,9 @@ static int wifi_send_bytes(int fd, const void *bytes, size_t length) {
         sent = sendto(fd, bytes, length, 0,
             (const struct sockaddr *)&kernel, sizeof(kernel));
     } while (sent < 0 && errno == EINTR);
-    return sent == (ssize_t)length ? 0 : -1;
+    if (sent == (ssize_t)length) return 0;
+    if (sent >= 0) errno = EIO;
+    return -1;
 }
 
 static int wifi_send_family_request(int fd, uint32_t sequence) {
@@ -184,24 +191,64 @@ static int wifi_send_command(int fd, uint16_t family_id, uint8_t command,
     return wifi_send_bytes(fd, bytes, header->nlmsg_len);
 }
 
+static ssize_t wifi_receive_dump(int fd, void *bytes, size_t capacity) {
+    struct iovec vector = { .iov_base = bytes, .iov_len = capacity };
+    struct msghdr message;
+    memset(&message, 0, sizeof(message));
+    message.msg_iov = &vector;
+    message.msg_iovlen = 1U;
+    ssize_t count;
+    do {
+        count = recvmsg(fd, &message, 0);
+    } while (count < 0 && errno == EINTR);
+    if (count == 0) errno = EIO;
+    if (count <= 0) return -1;
+    if ((message.msg_flags & MSG_TRUNC) != 0) {
+        errno = ENOBUFS;
+        return -1;
+    }
+    return count;
+}
+
+/* A dump is usable only after a successful DONE, not after an ACK or a
+ * partial snapshot interrupted by an interface change. */
+static int wifi_dump_status(const struct nlmsghdr *header) {
+    if ((header->nlmsg_flags & NLM_F_DUMP_INTR) != 0) {
+        errno = EAGAIN;
+        return -1;
+    }
+    if (header->nlmsg_type == NLMSG_OVERRUN) {
+        errno = ENOBUFS;
+        return -1;
+    }
+    if (header->nlmsg_type != NLMSG_DONE && header->nlmsg_type != NLMSG_ERROR) return 0;
+    size_t payload = header->nlmsg_len - NLMSG_HDRLEN;
+    if ((header->nlmsg_type == NLMSG_ERROR && payload < sizeof(struct nlmsgerr)) ||
+        (payload != 0U && payload < sizeof(int))) {
+        errno = EPROTO;
+        return -1;
+    }
+    int result = 0;
+    if (payload >= sizeof(result)) memcpy(&result, NLMSG_DATA(header), sizeof(result));
+    if (result != 0) {
+        errno = result < 0 && result >= -4095 ? -result : EPROTO;
+        return -1;
+    }
+    return header->nlmsg_type == NLMSG_DONE ? 1 : 0;
+}
+
 static int wifi_receive_interfaces(int fd, uint16_t family_id, uint32_t sequence,
     uint32_t *interfaces, size_t *interface_count) {
     unsigned char bytes[WIFI_NETLINK_BUFFER_SIZE];
     for (;;) {
-        ssize_t count;
-        do {
-            count = recv(fd, bytes, sizeof(bytes), 0);
-        } while (count < 0 && errno == EINTR);
+        ssize_t count = wifi_receive_dump(fd, bytes, sizeof(bytes));
         if (count <= 0) return -1;
         size_t remaining = (size_t)count;
         for (struct nlmsghdr *header = (struct nlmsghdr *)bytes;
                 NLMSG_OK(header, remaining); header = NLMSG_NEXT(header, remaining)) {
             if (header->nlmsg_seq != sequence) continue;
-            if (header->nlmsg_type == NLMSG_DONE) return 0;
-            if (header->nlmsg_type == NLMSG_ERROR) {
-                const struct nlmsgerr *failure = NLMSG_DATA(header);
-                return failure->error == 0 ? 0 : -1;
-            }
+            int status = wifi_dump_status(header);
+            if (status != 0) return status > 0 ? 0 : -1;
             if (header->nlmsg_type != family_id ||
                 header->nlmsg_len < NLMSG_HDRLEN + GENL_HDRLEN) continue;
             uint32_t interface_index = 0U;
@@ -227,6 +274,10 @@ static int wifi_receive_interfaces(int fd, uint16_t family_id, uint32_t sequence
                 *interface_count < WIFI_MAX_STATION_INTERFACES) {
                 interfaces[(*interface_count)++] = interface_index;
             }
+        }
+        if (remaining != 0U) {
+            errno = EPROTO;
+            return -1;
         }
     }
 }
@@ -288,20 +339,14 @@ static int wifi_receive_scan(int fd, uint16_t family_id, uint32_t sequence,
     bool *connected, struct asteriskd_wifi_identity *identity) {
     unsigned char bytes[WIFI_NETLINK_BUFFER_SIZE];
     for (;;) {
-        ssize_t count;
-        do {
-            count = recv(fd, bytes, sizeof(bytes), 0);
-        } while (count < 0 && errno == EINTR);
+        ssize_t count = wifi_receive_dump(fd, bytes, sizeof(bytes));
         if (count <= 0) return -1;
         size_t remaining = (size_t)count;
         for (struct nlmsghdr *header = (struct nlmsghdr *)bytes;
                 NLMSG_OK(header, remaining); header = NLMSG_NEXT(header, remaining)) {
             if (header->nlmsg_seq != sequence) continue;
-            if (header->nlmsg_type == NLMSG_DONE) return 0;
-            if (header->nlmsg_type == NLMSG_ERROR) {
-                const struct nlmsgerr *failure = NLMSG_DATA(header);
-                return failure->error == 0 ? 0 : -1;
-            }
+            int status = wifi_dump_status(header);
+            if (status != 0) return status > 0 ? 0 : -1;
             if (header->nlmsg_type != family_id ||
                 header->nlmsg_len < NLMSG_HDRLEN + GENL_HDRLEN) continue;
             const struct genlmsghdr *generic = NLMSG_DATA(header);
@@ -315,6 +360,10 @@ static int wifi_receive_scan(int fd, uint16_t family_id, uint32_t sequence,
                 }
                 attribute = wifi_attr_next(attribute, &attribute_bytes);
             }
+        }
+        if (remaining != 0U) {
+            errno = EPROTO;
+            return -1;
         }
     }
 }
@@ -343,7 +392,9 @@ static int wifi_query_association(uint16_t family_id, bool *connected,
             result = wifi_receive_scan(fd, family_id, sequence, connected, identity);
         }
     }
+    int saved = errno;
     (void)close(fd);
+    errno = saved;
     return result;
 }
 
@@ -434,6 +485,11 @@ static int wifi_arm_debounce(struct asteriskd_wifi_monitor *monitor, bool integr
     return 0;
 }
 
+static bool wifi_association_error_transient(int error) {
+    return error == ENODEV || error == EAGAIN || error == EWOULDBLOCK ||
+        error == ETIMEDOUT || error == ENOBUFS || error == EBUSY;
+}
+
 int asteriskd_wifi_monitor_handle(struct asteriskd_wifi_monitor *monitor,
     enum asteriskd_wifi_transition *transition, struct asteriskd_wifi_identity *identity,
     bool *has_transition, char *error, size_t error_size) {
@@ -507,9 +563,22 @@ int asteriskd_wifi_monitor_take_reconcile(struct asteriskd_wifi_monitor *monitor
     bool connected = false;
     struct asteriskd_wifi_identity current;
     if (wifi_query_association(monitor->family_id, &connected, &current) != 0) {
-        asteriskd_error_copy(error, error_size, "nl80211 association reconcile failed");
+        int failure = errno;
+        if (wifi_association_error_transient(failure) &&
+            monitor->association_retry_count < WIFI_ASSOCIATION_RETRY_LIMIT) {
+            ++monitor->association_retry_count;
+            // Keep the last complete association. A failed snapshot is not a
+            // disconnect, and fresh events must not reset this retry budget.
+            if (wifi_arm_debounce(monitor, false) == 0) return 0;
+        }
+        if (error != NULL && error_size != 0U) {
+            (void)snprintf(error, error_size,
+                "nl80211 association reconcile failed: errno=%d retries=%u",
+                failure, monitor->association_retry_count);
+        }
         return -1;
     }
+    monitor->association_retry_count = 0U;
     bool lost = monitor->integrity_lost;
     monitor->debounce_armed = false;
     monitor->integrity_lost = false;

@@ -305,6 +305,11 @@ static int system_start_and_verify_b2s(struct asteriskd_system_supervisor *syste
     return -1;
 }
 
+static int system_sysctl_interface_state(const struct asteriskd_sysctl_resource *resource) {
+    return resource->interface_index == 0U ? 0 : asteriskd_supervisor_interface_state(
+        resource->interface_name, resource->interface_index);
+}
+
 static int system_sysctl_open(
     const struct asteriskd_sysctl_resource *resource, int flags, int *output) {
     const char *root_path = resource->sysctl_id == ASTERISKD_SYSCTL_DISABLE_IPV6
@@ -314,8 +319,8 @@ static int system_sysctl_open(
     if (resource->interface_name[0] == '\0' || strchr(resource->interface_name, '/') != NULL ||
         strcmp(resource->interface_name, ".") == 0 ||
         strcmp(resource->interface_name, "..") == 0 || output == NULL) return -1;
-    if (resource->interface_index != 0U &&
-        if_nametoindex(resource->interface_name) != resource->interface_index) return 1;
+    int interface_state = system_sysctl_interface_state(resource);
+    if (interface_state != 0) return interface_state;
     int root = open(root_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (root < 0) return errno == ENOENT || errno == ENODEV ? 1 : -1;
     int directory = openat(root, resource->interface_name,
@@ -332,6 +337,13 @@ static int system_sysctl_open(
     if (fd < 0) {
         errno = saved;
         return errno == ENOENT || errno == ENODEV ? 1 : -1;
+    }
+    // A same-name replacement between the first check and open must never
+    // receive the previous link's saved value.
+    interface_state = system_sysctl_interface_state(resource);
+    if (interface_state != 0) {
+        (void)close(fd);
+        return interface_state;
     }
     *output = fd;
     return 0;
@@ -361,7 +373,7 @@ static int system_sysctl_write(
     if (value > 1U) return -1;
     int fd = -1;
     int opened = system_sysctl_open(resource, O_WRONLY, &fd);
-    if (opened != 0) return -1;
+    if (opened != 0) return opened;
     char bytes[2U] = {(char)('0' + value), '\n'};
     ssize_t count;
     do {
@@ -426,21 +438,30 @@ static int system_effect_undo_one(
     void *opaque, const struct asteriskd_effect *effect,
     char *error, size_t error_size) {
     (void)opaque;
-    if (effect == NULL || effect->kind != ASTERISKD_EFFECT_SYSCTL ||
-        system_sysctl_write(&effect->resource.sysctl,
-            effect->resource.sysctl.original_value) != 0) {
-        asteriskd_supervisor_reconcile_error(error, error_size, "failed to restore sysctl value");
-        return -1;
+    if (effect != NULL && effect->kind == ASTERISKD_EFFECT_SYSCTL) {
+        int written = system_sysctl_write(&effect->resource.sysctl,
+            effect->resource.sysctl.original_value);
+        if (written == 0 || written == 1) return 0;
+        uint8_t value = 0U;
+        // The old link may disappear while the write is in progress.
+        if (asteriskd_supervisor_sysctl_read(&effect->resource.sysctl, &value) == 1) return 0;
     }
-    return 0;
+    asteriskd_supervisor_reconcile_error(error, error_size, "failed to restore sysctl value");
+    return -1;
 }
 
 static int system_effect_verify_restored_one(
     void *opaque, const struct asteriskd_effect *effect,
     char *error, size_t error_size) {
     (void)opaque;
-    return system_effect_verify_value(effect,
+    int result = system_effect_verify_value(effect,
         effect->resource.sysctl.original_value, error, error_size);
+    uint8_t value = 0U;
+    if (result != 0 && asteriskd_supervisor_sysctl_read(&effect->resource.sysctl, &value) == 1) {
+        if (error != NULL && error_size != 0U) error[0] = '\0';
+        return 0;
+    }
+    return result;
 }
 
 struct asteriskd_effect_backend asteriskd_supervisor_effect_backend(

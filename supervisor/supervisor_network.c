@@ -349,13 +349,32 @@ static bool system_hotspot_interface_selected(
     return false;
 }
 
+/* Links disappear normally, for example while tethering is stopped or recreated.
+ * Keep lookup failures distinct so a live link's failures remain fatal. */
+static int system_interface_index(const char *name, uint32_t *index) {
+    *index = if_nametoindex(name);
+    if (*index != 0U) return 0;
+    return errno == ENODEV || errno == ENXIO || errno == ENOENT ? 1 : -1;
+}
+
+int asteriskd_supervisor_interface_state(const char *name, uint32_t index) {
+    uint32_t current = 0U;
+    int found = system_interface_index(name, &current);
+    if (found != 0) return found;
+    return current == index ? 0 : 1;
+}
+
 static int system_clear_android_hotspot_offload_interface(
     struct asteriskd_system_supervisor *system, const char *name, uint32_t priority) {
     // Probed and removed over rtnetlink; no tc process per interface and priority.
-    uint32_t interface_index = if_nametoindex(name);
+    uint32_t interface_index = 0U;
+    int found = system_interface_index(name, &interface_index);
+    if (found != 0) return found == 1 ? 0 : -1;
     bool present = false;
-    return interface_index == 0U ? -1 : asteriskd_supervisor_rtnl_tether_offload(
+    int result = asteriskd_supervisor_rtnl_tether_offload(
         system, interface_index, priority, true, &present);
+    if (result != 0 && asteriskd_supervisor_interface_state(name, interface_index) == 1) return 0;
+    return result;
 }
 
 static void system_log_optional_hotspot_offload_cleanup_failure(
@@ -452,7 +471,7 @@ static int system_reconcile_hotspot_tc_interface(
     sysctl.sysctl_id = ASTERISKD_SYSCTL_ROUTE_LOCALNET;
     if (snprintf(sysctl.interface_name, sizeof(sysctl.interface_name), "%s", name) <= 0) return -1;
     sysctl.interface_index = index;
-    if (asteriskd_supervisor_sysctl_read(&sysctl, &probe.route_localnet_value) != 0) return -1;
+    if (asteriskd_supervisor_sysctl_read(&sysctl, &probe.route_localnet_value) != 0) goto failed;
 
     struct asteriskd_resource_operation qdisc;
     memset(&qdisc, 0, sizeof(qdisc));
@@ -461,7 +480,7 @@ static int system_reconcile_hotspot_tc_interface(
     qdisc.resource.tc_qdisc.interface_index = index;
     (void)snprintf(qdisc.resource.tc_qdisc.interface_name,
         sizeof(qdisc.resource.tc_qdisc.interface_name), "%s", name);
-    if (system_tc_slot_for_qdisc(system, &qdisc, &probe.qdisc) != 0) return -1;
+    if (system_tc_slot_for_qdisc(system, &qdisc, &probe.qdisc) != 0) goto failed;
 
     struct asteriskd_resource_operation filter;
     memset(&filter, 0, sizeof(filter));
@@ -472,20 +491,45 @@ static int system_reconcile_hotspot_tc_interface(
     filter.resource.tc_filter.filter_id = ASTERISKD_FILTER_HOTSPOT_EGRESS;
     filter.resource.tc_filter.direction = ASTERISKD_TC_DIRECTION_EGRESS;
     filter.resource.tc_filter.program_id = ASTERISKD_PROGRAM_BPF2SOCKS_EGRESS;
-    if (system_tc_slot_for_filter(system, &filter, &probe.egress) != 0) return -1;
+    if (system_tc_slot_for_filter(system, &filter, &probe.egress) != 0) goto failed;
     filter.resource.tc_filter.filter_id = ASTERISKD_FILTER_HOTSPOT_INGRESS;
     filter.resource.tc_filter.direction = ASTERISKD_TC_DIRECTION_INGRESS;
     filter.resource.tc_filter.program_id = ASTERISKD_PROGRAM_BPF2SOCKS_INGRESS;
-    if (system_tc_slot_for_filter(system, &filter, &probe.ingress) != 0) return -1;
+    if (system_tc_slot_for_filter(system, &filter, &probe.ingress) != 0) goto failed;
 
     struct asteriskd_tc_plan plan;
     char error[128U];
     if (asteriskd_tc_install_plan_build(&system->loaded_config.config,
-            &probe, &plan, error, sizeof(error)) != 0) return -1;
+            &probe, &plan, error, sizeof(error)) != 0) goto failed;
     for (size_t operation = 0U; operation < plan.operation_count; ++operation) {
-        if (system_tc_apply_record(system, &plan.operations[operation].operation) != 0) return -1;
+        if (system_tc_apply_record(system, &plan.operations[operation].operation) != 0) goto failed;
     }
     return 0;
+
+failed:
+    if (asteriskd_supervisor_interface_state(name, index) != 1) return -1;
+    // The old link's TC state vanished with it. Do not restore its sysctl to a
+    // replacement link with the same name; a later link event reconciles that link.
+    struct asteriskd_effect effect = {.kind = ASTERISKD_EFFECT_SYSCTL};
+    effect.resource.sysctl = sysctl;
+    asteriskd_effect_journal_forget(&system->volatile_effects, &effect);
+    return 0;
+}
+
+/* No event restores route_localnet for a link removed between reconciles. Retire
+ * those entries so repeated tethering cannot fill the shared volatile journal. */
+static void system_forget_gone_hotspot_sysctls(struct asteriskd_system_supervisor *system) {
+    struct asteriskd_effect_journal *journal = &system->volatile_effects;
+    for (size_t index = journal->count; index > 0U; --index) {
+        const struct asteriskd_effect *entry = &journal->entries[index - 1U];
+        if (entry->kind != ASTERISKD_EFFECT_SYSCTL ||
+            entry->resource.sysctl.sysctl_id != ASTERISKD_SYSCTL_ROUTE_LOCALNET ||
+            entry->resource.sysctl.interface_index == 0U ||
+            asteriskd_supervisor_interface_state(entry->resource.sysctl.interface_name,
+                entry->resource.sysctl.interface_index) != 1) continue;
+        struct asteriskd_effect stale = *entry;
+        asteriskd_effect_journal_forget(journal, &stale);
+    }
 }
 
 int asteriskd_supervisor_reconcile_hotspot_tc(struct asteriskd_system_supervisor *system) {
@@ -495,6 +539,7 @@ int asteriskd_supervisor_reconcile_hotspot_tc(struct asteriskd_system_supervisor
     if (offload_policy != ASTERISKD_HOTSPOT_IPV6_OFFLOAD_KEEP &&
         system_clear_android_hotspot_offload(system, offload_policy) != 0) return -1;
     if (!bpf2socks) return 0;
+    system_forget_gone_hotspot_sysctls(system);
     struct ifaddrs *addresses = NULL;
     if (getifaddrs(&addresses) != 0) return -1;
     char handled[ASTERISKD_MAX_ADDRESSES][ASTERISKD_MAX_INTERFACE_NAME];
@@ -512,8 +557,10 @@ int asteriskd_supervisor_reconcile_hotspot_tc(struct asteriskd_system_supervisor
             result = -1;
             break;
         }
-        uint32_t interface_index = if_nametoindex(entry->ifa_name);
-        if (interface_index == 0U || snprintf(handled[handled_count],
+        uint32_t interface_index = 0U;
+        int found = system_interface_index(entry->ifa_name, &interface_index);
+        if (found == 1) continue;
+        if (found != 0 || snprintf(handled[handled_count],
                 sizeof(handled[handled_count]), "%s", entry->ifa_name) <= 0 ||
             system_reconcile_hotspot_tc_interface(
                 system, entry->ifa_name, interface_index) != 0) {

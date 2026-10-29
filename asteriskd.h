@@ -227,6 +227,7 @@ struct asteriskd_wifi_monitor {
     uint32_t sequence;
     struct asteriskd_wifi_identity baseline_identity;
     uint64_t debounce_deadline_milliseconds;
+    unsigned int association_retry_count;
     bool baseline_connected;
     bool debounce_armed;
     bool integrity_lost;

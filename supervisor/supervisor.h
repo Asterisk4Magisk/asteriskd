@@ -391,6 +391,9 @@ uint64_t asteriskd_supervisor_verified_pin_id(
     const struct asteriskd_system_supervisor *system, enum asteriskd_pin_id pin_id);
 const struct asteriskd_b2s_verified_pin *asteriskd_supervisor_b2s_verified_pin(
     const struct asteriskd_system_supervisor *system, enum asteriskd_pin_id pin_id);
+/* 0: name still resolves to index; 1: that link is gone or was replaced by a
+ * same-name link; -1: the lookup itself failed, so the link may still be live. */
+int asteriskd_supervisor_interface_state(const char *name, uint32_t index);
 int asteriskd_supervisor_sysctl_read(
     const struct asteriskd_sysctl_resource *resource, uint8_t *value);
 struct asteriskd_effect_backend asteriskd_supervisor_effect_backend(

@@ -210,9 +210,13 @@ static int system_service_wifi_reconcile(
     enum asteriskd_wifi_transition transition = ASTERISKD_WIFI_TRANSITION_BASELINE_DISCONNECTED;
     struct asteriskd_wifi_identity identity;
     bool has_transition = false;
-    char error[128U];
+    char error[128U] = {0};
     if (asteriskd_wifi_monitor_take_reconcile(&system->wifi_monitor, now,
-            &transition, &identity, &has_transition, error, sizeof(error)) != 0) return -1;
+            &transition, &identity, &has_transition, error, sizeof(error)) != 0) {
+        asteriskd_supervisor_log_failure(system, ASTERISKD_COMPONENT_NETWORK,
+            error[0] ? error : "WiFi association reconcile failed");
+        return -1;
+    }
     if (has_transition) {
         system_service_apply_action(system,
             asteriskd_service_control_on_wifi(
