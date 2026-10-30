@@ -61,6 +61,13 @@ struct asteriskd_runtime {
 bool asteriskd_runtime_lifecycle_stop_requested(void *opaque);
 
 #if defined(__linux__) || defined(__ANDROID__)
+/*
+ * Captured action stdout starts at the initial size and doubles on demand.
+ * Vendor ROMs can list far more than 64 KiB of rules in one table.
+ */
+#define ASTERISKD_ACTION_STDOUT_INITIAL (64U * 1024U)
+#define ASTERISKD_ACTION_STDOUT_LIMIT (16U * 1024U * 1024U)
+
 /* Supervisor-side waits for the DNS enhancement companion. */
 #define SYSTEM_DNS_COMMAND_WAIT_MILLIS 2100
 #define SYSTEM_DNS_WITHDRAW_BUDGET_MILLIS 5000
@@ -214,7 +221,9 @@ struct asteriskd_system_supervisor {
     struct asteriskd_child_exit_status action_exit;
     bool action_capture_stdout;
     bool action_stdout_overflow;
-    char action_stdout[65536U];
+    /* Captured stdout grows on demand up to ASTERISKD_ACTION_STDOUT_LIMIT. */
+    char *action_stdout;
+    size_t action_stdout_capacity;
     size_t action_stdout_length;
     /* Leading stderr bytes, reported only when an action fails. */
     char action_stderr[512U];
@@ -279,6 +288,9 @@ void asteriskd_supervisor_log_failure(struct asteriskd_system_supervisor *system
     enum asteriskd_component component, const char *message);
 void asteriskd_supervisor_action_stderr_summary(
     const struct asteriskd_system_supervisor *system, char *out, size_t size);
+int asteriskd_supervisor_action_stdout_reserve(
+    struct asteriskd_system_supervisor *system, size_t wanted);
+void asteriskd_supervisor_action_stdout_release(struct asteriskd_system_supervisor *system);
 int asteriskd_supervisor_action_run_spec(struct asteriskd_system_supervisor *system,
     const struct asteriskd_process_spec *spec, bool capture_stdout, int *exit_status);
 int asteriskd_supervisor_action_run_argv(struct asteriskd_system_supervisor *system,

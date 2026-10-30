@@ -258,6 +258,33 @@ void asteriskd_supervisor_action_stderr_summary(
     }
 }
 
+/*
+ * Grows captured stdout to hold at least `wanted` bytes. A failed or
+ * over-limit request keeps the current buffer, so callers see overflow.
+ */
+int asteriskd_supervisor_action_stdout_reserve(
+    struct asteriskd_system_supervisor *system, size_t wanted) {
+    if (system == NULL || wanted > ASTERISKD_ACTION_STDOUT_LIMIT) return -1;
+    if (wanted <= system->action_stdout_capacity) return 0;
+    size_t capacity = system->action_stdout_capacity == 0U
+        ? ASTERISKD_ACTION_STDOUT_INITIAL : system->action_stdout_capacity;
+    while (capacity < wanted) capacity *= 2U;
+    if (capacity > ASTERISKD_ACTION_STDOUT_LIMIT) capacity = ASTERISKD_ACTION_STDOUT_LIMIT;
+    char *bytes = realloc(system->action_stdout, capacity);
+    if (bytes == NULL) return -1;
+    system->action_stdout = bytes;
+    system->action_stdout_capacity = capacity;
+    return 0;
+}
+
+void asteriskd_supervisor_action_stdout_release(struct asteriskd_system_supervisor *system) {
+    if (system == NULL) return;
+    free(system->action_stdout);
+    system->action_stdout = NULL;
+    system->action_stdout_capacity = 0U;
+    system->action_stdout_length = 0U;
+}
+
 int asteriskd_supervisor_action_run_spec(struct asteriskd_system_supervisor *system,
     const struct asteriskd_process_spec *spec, bool capture_stdout, int *exit_status) {
     if (system->action_spawned || spec == NULL || exit_status == NULL) {

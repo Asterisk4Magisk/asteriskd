@@ -683,9 +683,11 @@ int asteriskd_supervisor_rtnl_ip(struct asteriskd_system_supervisor *system,
     for (size_t index = 0U; index < argument_count; ++index) {
         if (arguments[index] == NULL || arguments[index][0] == '\0') return -1;
     }
+    // Netlink renders into a fixed slice; a failed reserve shows as overflow.
+    (void)asteriskd_supervisor_action_stdout_reserve(system, ASTERISKD_ACTION_STDOUT_INITIAL);
     struct rtnl_output output = {
         .bytes = system->action_stdout,
-        .capacity = sizeof(system->action_stdout),
+        .capacity = system->action_stdout_capacity,
     };
     system->action_stdout_length = 0U;
     system->action_stdout_overflow = false;
@@ -754,9 +756,11 @@ int asteriskd_supervisor_rtnl_route_render(struct asteriskd_system_supervisor *s
     int address_family = rtnl_address_family(family);
     if (system == NULL || address_family == AF_UNSPEC ||
         (table_count != 0U && tables == NULL)) return -1;
+    // Netlink renders into a fixed slice; a failed reserve shows as overflow.
+    (void)asteriskd_supervisor_action_stdout_reserve(system, ASTERISKD_ACTION_STDOUT_INITIAL);
     struct rtnl_output output = {
         .bytes = system->action_stdout,
-        .capacity = sizeof(system->action_stdout),
+        .capacity = system->action_stdout_capacity,
     };
     struct rtnl_route_filter filter = {
         .output = &output, .family = address_family,

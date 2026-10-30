@@ -516,9 +516,14 @@ static int system_runtime_dispatch_log(struct asteriskd_system_supervisor *syste
         if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
         if (count > 0 && slot == 2U && stream == ASTERISKD_LOG_STREAM_STDOUT &&
             system->action_capture_stdout) {
-            size_t available = sizeof(system->action_stdout) - system->action_stdout_length;
+            size_t wanted = system->action_stdout_length + (size_t)count;
+            (void)asteriskd_supervisor_action_stdout_reserve(system,
+                wanted < ASTERISKD_ACTION_STDOUT_LIMIT ? wanted : ASTERISKD_ACTION_STDOUT_LIMIT);
+            size_t available = system->action_stdout_capacity - system->action_stdout_length;
             size_t copied = (size_t)count < available ? (size_t)count : available;
-            memcpy(&system->action_stdout[system->action_stdout_length], bytes, copied);
+            if (copied != 0U) {
+                memcpy(&system->action_stdout[system->action_stdout_length], bytes, copied);
+            }
             system->action_stdout_length += copied;
             if (copied != (size_t)count) system->action_stdout_overflow = true;
         }
@@ -1611,6 +1616,7 @@ static void system_runtime_cleanup(struct asteriskd_system_supervisor *system) {
     asteriskd_state_store_close(&system->store);
     if (system->logger.opened) (void)asteriskd_log_close(&system->logger);
     asteriskd_loaded_config_release(&system->loaded_config);
+    asteriskd_supervisor_action_stdout_release(system);
 }
 
 static void system_runtime_finish_control_stop(
