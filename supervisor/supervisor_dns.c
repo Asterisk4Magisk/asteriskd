@@ -126,7 +126,7 @@ static int system_dns_startup_failed(
         stage, (int)system->dns.snapshot.phase, (unsigned)system->dns.opcode, system->dns.result,
         system->dns.snapshot.reason[0] ? system->dns.snapshot.reason
                                        : "runtime wait or command setup failed");
-    if (written > 0 && (size_t)written < sizeof(message)) {
+    if (asteriskd_supervisor_message_fit(message, sizeof(message), written)) {
         (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
             ASTERISKD_COMPONENT_NETWORK, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
     }

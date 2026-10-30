@@ -22,9 +22,9 @@
 #define RTNL_REQUEST_ATTRIBUTES 256U
 #define RTNL_DUMP_ATTEMPTS 3
 
+/* Renders into the supervisor's captured stdout, growing it on demand. */
 struct rtnl_output {
-    char *bytes;
-    size_t capacity;
+    struct asteriskd_system_supervisor *system;
     size_t length;
     bool overflow;
 };
@@ -52,11 +52,21 @@ static uint32_t rtnl_sequence;
 
 static void rtnl_printf(struct rtnl_output *output, const char *format, ...) {
     if (output == NULL || output->overflow) return;
-    size_t available = output->capacity - output->length;
+    struct asteriskd_system_supervisor *system = output->system;
     va_list arguments;
     va_start(arguments, format);
-    int written = vsnprintf(output->bytes + output->length, available, format, arguments);
+    va_list retry;
+    va_copy(retry, arguments);
+    size_t available = system->action_stdout_capacity - output->length;
+    int written = vsnprintf(available == 0U ? NULL : system->action_stdout + output->length,
+        available, format, arguments);
     va_end(arguments);
+    if (written >= 0 && (size_t)written >= available &&
+        asteriskd_supervisor_action_stdout_reserve(system, output->length + (size_t)written + 1U) == 0) {
+        available = system->action_stdout_capacity - output->length;
+        written = vsnprintf(system->action_stdout + output->length, available, format, retry);
+    }
+    va_end(retry);
     if (written < 0 || (size_t)written >= available) {
         output->overflow = true;
         return;
@@ -683,12 +693,8 @@ int asteriskd_supervisor_rtnl_ip(struct asteriskd_system_supervisor *system,
     for (size_t index = 0U; index < argument_count; ++index) {
         if (arguments[index] == NULL || arguments[index][0] == '\0') return -1;
     }
-    // Netlink renders into a fixed slice; a failed reserve shows as overflow.
-    (void)asteriskd_supervisor_action_stdout_reserve(system, ASTERISKD_ACTION_STDOUT_INITIAL);
-    struct rtnl_output output = {
-        .bytes = system->action_stdout,
-        .capacity = system->action_stdout_capacity,
-    };
+    // Listings grow captured stdout like a child's; a failed reserve shows as overflow.
+    struct rtnl_output output = {.system = system};
     system->action_stdout_length = 0U;
     system->action_stdout_overflow = false;
     system->action_stderr_length = 0U;
@@ -756,12 +762,8 @@ int asteriskd_supervisor_rtnl_route_render(struct asteriskd_system_supervisor *s
     int address_family = rtnl_address_family(family);
     if (system == NULL || address_family == AF_UNSPEC ||
         (table_count != 0U && tables == NULL)) return -1;
-    // Netlink renders into a fixed slice; a failed reserve shows as overflow.
-    (void)asteriskd_supervisor_action_stdout_reserve(system, ASTERISKD_ACTION_STDOUT_INITIAL);
-    struct rtnl_output output = {
-        .bytes = system->action_stdout,
-        .capacity = system->action_stdout_capacity,
-    };
+    // Listings grow captured stdout like a child's; a failed reserve shows as overflow.
+    struct rtnl_output output = {.system = system};
     struct rtnl_route_filter filter = {
         .output = &output, .family = address_family,
         .tables = tables, .table_count = table_count,

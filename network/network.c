@@ -262,8 +262,15 @@ static int queue_ipv6_request(
     struct asteriskd_network_effect_request *request =
         pending_ipv6_request(runtime, interface_name, interface_index);
     if (request == NULL) {
-        if (runtime->immediate_request_count >= ASTERISKD_MAX_NETWORK_IMMEDIATE_REQUESTS) {
-            return ASTERISKD_CONFIG_INVALID;
+        if (runtime->immediate_request_count == runtime->immediate_request_capacity) {
+            size_t grown = runtime->immediate_request_capacity == 0U
+                ? 16U : runtime->immediate_request_capacity * 2U;
+            struct asteriskd_network_effect_request *resized =
+                grown > SIZE_MAX / sizeof(*resized)
+                    ? NULL : realloc(runtime->immediate_requests, grown * sizeof(*resized));
+            if (resized == NULL) return ASTERISKD_CONFIG_NO_MEMORY;
+            runtime->immediate_requests = resized;
+            runtime->immediate_request_capacity = grown;
         }
         request = &runtime->immediate_requests[runtime->immediate_request_count++];
     }
@@ -674,18 +681,28 @@ static void netd_counter_update(uint16_t *counter, bool added) {
     }
 }
 
-/* Applies one rule change to a network set; returns the affected entry or NULL. */
+/*
+ * Applies one rule change to a network set; returns the affected entry or
+ * NULL. The set grows on demand; a failed allocation is reported as overflow.
+ */
 static struct asteriskd_netd_network *netd_network_update(
-    struct asteriskd_netd_network *networks, size_t *count, bool *overflow,
+    struct asteriskd_netd_network **networks, size_t *count, size_t *capacity, bool *overflow,
     const struct netd_rule *rule, bool added) {
-    struct asteriskd_netd_network *network = netd_network_find(networks, *count, rule->table);
+    struct asteriskd_netd_network *network = netd_network_find(*networks, *count, rule->table);
     if (network == NULL) {
         if (!added) return NULL;
-        if (*count >= ASTERISKD_MAX_INTERFACES) {
-            *overflow = true;
-            return NULL;
+        if (*count == *capacity) {
+            size_t grown = *capacity == 0U ? 16U : *capacity * 2U;
+            struct asteriskd_netd_network *resized = grown > SIZE_MAX / sizeof(*resized)
+                ? NULL : realloc(*networks, grown * sizeof(*resized));
+            if (resized == NULL) {
+                *overflow = true;
+                return NULL;
+            }
+            *networks = resized;
+            *capacity = grown;
         }
-        network = &networks[(*count)++];
+        network = &(*networks)[(*count)++];
         memset(network, 0, sizeof(*network));
         network->table = rule->table;
     }
@@ -765,7 +782,7 @@ static int record_rule_message(
             message_type == ASTERISKD_RTM_NEWRULE, &changed) != 0) return ASTERISKD_CONFIG_IO;
     if (!changed) return 0;
     struct asteriskd_netd_network *network = netd_network_update(
-        runtime->netd_networks, &runtime->netd_network_count,
+        &runtime->netd_networks, &runtime->netd_network_count, &runtime->netd_network_capacity,
         &runtime->netd_network_overflow, &rule, message_type == ASTERISKD_RTM_NEWRULE);
     if (network == NULL) return 0;
     int result = netd_network_apply(runtime, network);
@@ -787,9 +804,10 @@ int asteriskd_network_sync_ipv6_guard(
         asteriskd_error_copy(error, error_size, "IPv6 rule dump unavailable");
         return ASTERISKD_CONFIG_IO;
     }
-    struct asteriskd_netd_network fresh[ASTERISKD_MAX_INTERFACES];
+    struct asteriskd_netd_network *fresh = NULL;
     struct asteriskd_netd_rule *fresh_rules = NULL;
     size_t fresh_count = 0U;
+    size_t fresh_capacity = 0U;
     bool overflow = false;
     int fd = -1;
     if (runtime->backend->dump_ipv6_rules(runtime->backend->context, &fd) != 0 || fd < 0) {
@@ -836,7 +854,8 @@ int asteriskd_network_sync_ipv6_guard(
                     if (netd_rules_update(&fresh_rules, &rule, true, &changed) != 0) {
                         malformed = true;
                     } else if (changed) {
-                        (void)netd_network_update(fresh, &fresh_count, &overflow, &rule, true);
+                        (void)netd_network_update(
+                            &fresh, &fresh_count, &fresh_capacity, &overflow, &rule, true);
                     }
                 }
             }
@@ -848,6 +867,7 @@ int asteriskd_network_sync_ipv6_guard(
     (void)runtime->backend->close(runtime->backend->context, fd);
     if (result != 0) {
         netd_rules_clear(&fresh_rules);
+        free(fresh);
         asteriskd_error_copy(error, error_size, "IPv6 rule dump failed");
         return result;
     }
@@ -860,19 +880,18 @@ int asteriskd_network_sync_ipv6_guard(
             current->ipv6_guarded = true;
         } else if (queue_ipv6_request(
                 runtime, old->interface_name, netd_network_index(old), true) != 0) {
-            asteriskd_error_copy(error, error_size, "IPv6 guard request capacity exceeded");
+            asteriskd_error_copy(error, error_size, "IPv6 guard request allocation failed");
             netd_rules_clear(&fresh_rules);
+            free(fresh);
             return ASTERISKD_CONFIG_IO;
         }
     }
     netd_rules_clear(&runtime->netd_rules);
     runtime->netd_rules = fresh_rules;
-    memcpy(runtime->netd_networks, fresh, fresh_count * sizeof(fresh[0]));
-    if (fresh_count < runtime->netd_network_count) {
-        memset(&runtime->netd_networks[fresh_count], 0,
-            (runtime->netd_network_count - fresh_count) * sizeof(fresh[0]));
-    }
+    free(runtime->netd_networks);
+    runtime->netd_networks = fresh;
     runtime->netd_network_count = fresh_count;
+    runtime->netd_network_capacity = fresh_capacity;
     runtime->netd_network_overflow = overflow;
     for (size_t index = 0U; index < runtime->netd_network_count; ++index) {
         struct asteriskd_netd_network *network = &runtime->netd_networks[index];
@@ -1106,6 +1125,8 @@ int asteriskd_network_close(struct asteriskd_network_runtime *runtime) {
     }
     free(runtime->pending_batch_storage);
     netd_rules_clear(&runtime->netd_rules);
+    free(runtime->netd_networks);
+    free(runtime->immediate_requests);
     memset(runtime, 0, sizeof(*runtime));
     return result;
 }

@@ -86,7 +86,7 @@ int asteriskd_supervisor_effect_open_network(void *opaque) {
         char message[192U];
         int written = snprintf(message, sizeof(message), "network open failed: detail=%s",
             error[0] == '\0' ? "unavailable" : error);
-        if (written > 0 && (size_t)written < sizeof(message)) {
+        if (asteriskd_supervisor_message_fit(message, sizeof(message), written)) {
             asteriskd_supervisor_log_failure(system, ASTERISKD_COMPONENT_NETWORK, message);
         }
         return -1;
@@ -232,7 +232,7 @@ static int system_reconcile_local_bypass_consumer(
         char message[256U];
         int written = snprintf(message, sizeof(message),
             "local bypass plan failed: chain=%s detail=%s", consumer_chain, error);
-        if (written > 0 && (size_t)written < sizeof(message)) {
+        if (asteriskd_supervisor_message_fit(message, sizeof(message), written)) {
             (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
                 ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
         }
@@ -333,7 +333,7 @@ failed:
             "bpf2socks local address map reconcile failed: family=%s pin=%d detail=%s",
             family, path != NULL && object_id != 0U ? 1 : 0,
             error[0] == '\0' ? "unavailable" : error);
-        if (written > 0 && (size_t)written < sizeof(message)) {
+        if (asteriskd_supervisor_message_fit(message, sizeof(message), written)) {
             asteriskd_supervisor_log_failure(system, ASTERISKD_COMPONENT_HELPER, message);
         }
     }
@@ -384,7 +384,7 @@ static void system_log_optional_hotspot_offload_cleanup_failure(
         "optional Android IPv6 tethering offload cleanup failed%s%s%s%s; continuing",
         name != NULL ? " for " : "", name != NULL ? name : "",
         priority != NULL ? " pref " : "", priority != NULL ? priority : "");
-    if (written > 0 && (size_t)written < sizeof(message)) {
+    if (asteriskd_supervisor_message_fit(message, sizeof(message), written)) {
         (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_WARNING,
             ASTERISKD_COMPONENT_RUNTIME, ASTERISKD_LOG_EVENT_CAPABILITY_ADJUSTED, message);
     }

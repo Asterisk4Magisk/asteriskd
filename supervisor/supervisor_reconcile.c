@@ -819,7 +819,7 @@ int asteriskd_supervisor_reconcile_remove_phase(
                     phase < ASTERISKD_RECONCILE_PHASE_COUNT
                 ? names[phase] : "invalid");
         asteriskd_supervisor_reconcile_error(error, error_size,
-            written > 0 && (size_t)written < sizeof(message)
+            asteriskd_supervisor_message_fit(message, sizeof(message), written)
                 ? message : "owned resource reconcile failed");
     }
     return result;

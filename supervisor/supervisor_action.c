@@ -259,6 +259,16 @@ void asteriskd_supervisor_action_stderr_summary(
 }
 
 /*
+ * Accepts an snprintf-formatted diagnostic for logging. A message longer than
+ * its buffer is kept truncated with a "..." mark rather than dropped.
+ */
+bool asteriskd_supervisor_message_fit(char *message, size_t size, int written) {
+    if (message == NULL || size < 4U || written <= 0) return false;
+    if ((size_t)written >= size) memcpy(&message[size - 4U], "...", 4U);
+    return true;
+}
+
+/*
  * Grows captured stdout to hold at least `wanted` bytes. A failed or
  * over-limit request keeps the current buffer, so callers see overflow.
  */
@@ -294,7 +304,7 @@ int asteriskd_supervisor_action_run_spec(struct asteriskd_system_supervisor *sys
                 "action execution rejected: busy=%d spec=%d exitStatus=%d",
                 system->action_spawned ? 1 : 0, spec != NULL ? 1 : 0,
                 exit_status != NULL ? 1 : 0);
-            if (written > 0 && (size_t)written < sizeof(message)) {
+            if (asteriskd_supervisor_message_fit(message, sizeof(message), written)) {
                 (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
                     ASTERISKD_COMPONENT_RUNTIME, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
             }
@@ -323,7 +333,7 @@ int asteriskd_supervisor_action_run_spec(struct asteriskd_system_supervisor *sys
         int written = snprintf(message, sizeof(message),
             "action execution failed: phase=spawn detail=%s",
             error[0] == '\0' ? "unavailable" : error);
-        if (written > 0 && (size_t)written < sizeof(message)) {
+        if (asteriskd_supervisor_message_fit(message, sizeof(message), written)) {
             (void)asteriskd_log_line(&system->logger,
                 system->owned_cleanup_in_progress ? ASTERISKD_LOG_LEVEL_WARNING : ASTERISKD_LOG_LEVEL_ERROR,
                 ASTERISKD_COMPONENT_RUNTIME, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
@@ -431,7 +441,7 @@ failed:
             system->action_setup.complete ? 1 : 0,
             system->action_setup.fatal ? 1 : 0,
             error[0] == '\0' ? "unavailable" : error, stderr_summary);
-        if (written > 0 && (size_t)written < sizeof(message)) {
+        if (asteriskd_supervisor_message_fit(message, sizeof(message), written)) {
             asteriskd_supervisor_log_failure(system, ASTERISKD_COMPONENT_RUNTIME, message);
         }
     }
@@ -570,7 +580,7 @@ static void system_rule_batch_log_failure(struct asteriskd_system_supervisor *sy
     int written = snprintf(message, sizeof(message),
         "rule batch commit failed: phase=%s family=%s exitStatus=%d stderr=%s",
         phase, family, exit_status, stderr_summary);
-    if (written > 0 && (size_t)written < sizeof(message)) {
+    if (asteriskd_supervisor_message_fit(message, sizeof(message), written)) {
         asteriskd_supervisor_log_failure(system, ASTERISKD_COMPONENT_RULES, message);
     }
 }
@@ -735,7 +745,7 @@ int asteriskd_supervisor_effect_capability(void *opaque) {
         char message[320U];
         int written = snprintf(message, sizeof(message),
             "optional SELinux policy setup incomplete; continuing: %s", error);
-        if (written > 0 && (size_t)written < sizeof(message)) {
+        if (asteriskd_supervisor_message_fit(message, sizeof(message), written)) {
             (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_WARNING,
                 ASTERISKD_COMPONENT_RUNTIME, ASTERISKD_LOG_EVENT_CAPABILITY_ADJUSTED, message);
         }

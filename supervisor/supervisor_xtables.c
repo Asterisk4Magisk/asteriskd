@@ -125,7 +125,7 @@ int asteriskd_supervisor_xtables_zero(struct asteriskd_system_supervisor *system
             family == ASTERISKD_IP_FAMILY_IPV6 ? "ipv6" : "ipv4",
             table_name == NULL ? "invalid" : table_name, effective_operation, chain,
             run_result, exit_status, run_result == 0 ? stderr_summary : "none");
-        if (written > 0 && (size_t)written < sizeof(message)) {
+        if (asteriskd_supervisor_message_fit(message, sizeof(message), written)) {
             asteriskd_supervisor_log_failure(system, ASTERISKD_COMPONENT_RULES, message);
         }
     }
@@ -932,7 +932,7 @@ static int system_verify_private_chain_contents(
     int written = snprintf(message, sizeof(message),
         "private chain shape mismatch: chain=%s expectedRules=%zu outputBytes=%zu",
         chain, expected_rule_count, observed_length);
-    if (written > 0 && (size_t)written < sizeof(message)) {
+    if (asteriskd_supervisor_message_fit(message, sizeof(message), written)) {
         (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
             ASTERISKD_COMPONENT_RULES, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
     }
@@ -1380,7 +1380,7 @@ failed:
             source == NULL ? "unknown" : source,
             failed_family == ASTERISKD_IP_FAMILY_IPV6 ? "ipv6" : "ipv4",
             exit_status, system->action_stdout_overflow ? 1 : 0, stderr_summary);
-        if (written > 0 && (size_t)written < sizeof(message)) {
+        if (asteriskd_supervisor_message_fit(message, sizeof(message), written)) {
             asteriskd_supervisor_log_failure(system, ASTERISKD_COMPONENT_RULES, message);
         }
     }

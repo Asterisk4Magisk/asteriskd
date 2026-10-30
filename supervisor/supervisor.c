@@ -759,7 +759,7 @@ static int system_effect_event(void *opaque, enum asteriskd_control_event_type t
             details->message == NULL ? 0 : (int)(details->message_length < 256U
                 ? details->message_length : 256U),
             details->message == NULL ? "" : details->message);
-        if (written > 0 && (size_t)written < sizeof(message)) {
+        if (asteriskd_supervisor_message_fit(message, sizeof(message), written)) {
             (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
                 details->component, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
         }
@@ -928,7 +928,7 @@ static void system_log_readiness_failure(struct asteriskd_system_supervisor *sys
         system_readiness_result_name(result),
         asteriskd_mode_name(system->loaded_config.config.mode), target,
         system->loaded_config.config.readiness_timeout_milliseconds);
-    if (written > 0 && (size_t)written < sizeof(message)) {
+    if (asteriskd_supervisor_message_fit(message, sizeof(message), written)) {
         asteriskd_supervisor_log_failure(system,
             role == ASTERISKD_CHILD_CORE ? ASTERISKD_COMPONENT_CORE : ASTERISKD_COMPONENT_HELPER,
             message);
@@ -969,7 +969,7 @@ static int system_tun_compatibility_log(
     int written = snprintf(message, sizeof(message),
         "TUN compatibility path %s failed: %s", operation,
         detail != NULL && detail[0] != '\0' ? detail : "unknown error");
-    if (written > 0 && (size_t)written < sizeof(message)) {
+    if (asteriskd_supervisor_message_fit(message, sizeof(message), written)) {
         (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_ERROR,
             ASTERISKD_COMPONENT_HELPER, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
     }
@@ -1148,7 +1148,7 @@ static int system_effect_reconcile(void *opaque, bool *active,
         char message[160U];
         int written = snprintf(message, sizeof(message),
             "rules reconcile failed: stage=%s", failed_stage);
-        if (written > 0 && (size_t)written < sizeof(message)) {
+        if (asteriskd_supervisor_message_fit(message, sizeof(message), written)) {
             asteriskd_supervisor_log_failure(system, ASTERISKD_COMPONENT_RULES, message);
         }
         return -1;
@@ -1224,7 +1224,7 @@ static int system_effect_stop_children(
             "child stop failed: stage=prepare coreIdentity=%d helperIdentity=%d",
             core == NULL ? -1 : system->core_identity_ready ? 1 : 0,
             helper == NULL ? -1 : system->helper_identity_ready ? 1 : 0);
-        if (written > 0 && (size_t)written < sizeof(message)) {
+        if (asteriskd_supervisor_message_fit(message, sizeof(message), written)) {
             asteriskd_supervisor_log_failure(system, ASTERISKD_COMPONENT_RUNTIME, message);
         }
         return -1;
@@ -1271,7 +1271,7 @@ static int system_effect_stop_children(
             helper_state->reaped ? 1 : 0,
             core_wait[0] != '\0' ? " coreWait=" : "", core_wait,
             helper_wait[0] != '\0' ? " helperWait=" : "", helper_wait);
-        if (written > 0 && (size_t)written < sizeof(message)) {
+        if (asteriskd_supervisor_message_fit(message, sizeof(message), written)) {
             if (system->stop_result == ASTERISKD_STOP_COMPLETE) {
                 (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_WARNING,
                     ASTERISKD_COMPONENT_RUNTIME, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);

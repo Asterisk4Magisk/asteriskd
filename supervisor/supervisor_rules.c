@@ -259,7 +259,7 @@ static int system_run_matcher_loader(struct asteriskd_system_supervisor *system)
             "matcher loader failed: stage=%s exitStatus=%d detail=%s stderr=%s",
             stage, exit_status, error[0] == '\0' ? "unavailable" : error,
             strcmp(stage, "prepare") == 0 ? "none" : stderr_summary);
-        if (written > 0 && (size_t)written < sizeof(message)) {
+        if (asteriskd_supervisor_message_fit(message, sizeof(message), written)) {
             asteriskd_supervisor_log_failure(system, ASTERISKD_COMPONENT_MATCHER, message);
         }
         return -1;
@@ -299,7 +299,7 @@ static int system_start_and_verify_b2s(struct asteriskd_system_supervisor *syste
         "bpf2socks pin verification failed: helperReaped=%d timeoutMs=%" PRIu32 " detail=%s",
         system->helper_reaped ? 1 : 0, system->loaded_config.config.readiness_timeout_milliseconds,
         system->b2s_verify_error[0] == '\0' ? "unavailable" : system->b2s_verify_error);
-    if (written > 0 && (size_t)written < sizeof(message)) {
+    if (asteriskd_supervisor_message_fit(message, sizeof(message), written)) {
         asteriskd_supervisor_log_failure(system, ASTERISKD_COMPONENT_HELPER, message);
     }
     return -1;
@@ -798,7 +798,7 @@ static int system_rules_apply_plan(
     int written = snprintf(message, sizeof(message),
         "rule transaction failed: result=%d records=%zu detail=%s",
         applied, count, error[0] == '\0' ? "unavailable" : error);
-    if (written > 0 && (size_t)written < sizeof(message)) {
+    if (asteriskd_supervisor_message_fit(message, sizeof(message), written)) {
         asteriskd_supervisor_log_failure(system, ASTERISKD_COMPONENT_RULES, message);
     }
     return -1;
@@ -816,7 +816,7 @@ static int system_rules_apply_private(
     int written = snprintf(message, sizeof(message),
         "private rules apply failed: result=%d detail=%s", applied,
         error[0] == '\0' ? "unavailable" : error);
-    if (written > 0 && (size_t)written < sizeof(message)) {
+    if (asteriskd_supervisor_message_fit(message, sizeof(message), written)) {
         asteriskd_supervisor_log_failure(system, ASTERISKD_COMPONENT_RULES, message);
     }
     return -1;
@@ -839,7 +839,7 @@ static int system_rules_apply_route(
     int written = snprintf(message, sizeof(message),
         "route rules apply failed: result=%d detail=%s", applied,
         error[0] == '\0' ? "unavailable" : error);
-    if (written > 0 && (size_t)written < sizeof(message)) {
+    if (asteriskd_supervisor_message_fit(message, sizeof(message), written)) {
         asteriskd_supervisor_log_failure(system, ASTERISKD_COMPONENT_RULES, message);
     }
     return -1;
@@ -860,7 +860,7 @@ static int system_rules_apply_hook(
         applied, group->family == ASTERISKD_IP_FAMILY_IPV6 ? "ipv6" : "ipv4",
         table_name == NULL ? "invalid" : table_name,
         error[0] == '\0' ? "unavailable" : error);
-    if (written > 0 && (size_t)written < sizeof(message)) {
+    if (asteriskd_supervisor_message_fit(message, sizeof(message), written)) {
         asteriskd_supervisor_log_failure(system, ASTERISKD_COMPONENT_RULES, message);
     }
     return -1;
@@ -1061,7 +1061,7 @@ int asteriskd_supervisor_effect_rules(
         char message[160U];
         int written =
             snprintf(message, sizeof(message), "rules apply failed: stage=%s", failed_stage);
-        if (written > 0 && (size_t)written < sizeof(message)) {
+        if (asteriskd_supervisor_message_fit(message, sizeof(message), written)) {
             asteriskd_supervisor_log_failure(system, ASTERISKD_COMPONENT_RULES, message);
         }
         return -1;

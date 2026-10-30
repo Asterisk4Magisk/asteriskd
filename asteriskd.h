@@ -82,7 +82,6 @@ struct asteriskd_resource_operation;
 #define ASTERISKD_XTABLES_MAX_HOOK_ARGUMENTS 10U
 #define ASTERISKD_RULE_TRANSACTION_MAX_ROUTES 8U
 #define ASTERISKD_MAX_POLL_SOURCES 64U
-#define ASTERISKD_MAX_NETWORK_IMMEDIATE_REQUESTS 64U
 #define ASTERISKD_MAX_CRON_EXPRESSION 256U
 #define ASTERISKD_MAX_WIFI_IDENTIFIERS 64U
 #define ASTERISKD_MAX_WIFI_SSID_BYTES 32U
@@ -587,7 +586,8 @@ void asteriskd_text_writer_yaml_string(struct asteriskd_text_writer *, const cha
 int asteriskd_text_writer_take(
     struct asteriskd_text_writer *, struct asteriskd_anonymous_document *);
 
-#define ASTERISKD_BYTE_BUFFER_MAX_BYTES (8U * 1024U * 1024U)
+/* Matches captured action stdout, so a table listing fits whatever was captured. */
+#define ASTERISKD_BYTE_BUFFER_MAX_BYTES (16U * 1024U * 1024U)
 struct asteriskd_byte_buffer {
     unsigned char *bytes;
     size_t length;
@@ -2362,11 +2362,14 @@ struct asteriskd_network_runtime {
     uint64_t deadline_milliseconds;
     bool integrity_loss;
     const struct asteriskd_network_effect_sink *effect_sink;
-    struct asteriskd_network_effect_request
-        immediate_requests[ASTERISKD_MAX_NETWORK_IMMEDIATE_REQUESTS];
+    /* Grows with the netd networks; one request per guarded interface at most. */
+    struct asteriskd_network_effect_request *immediate_requests;
     size_t immediate_request_count;
-    struct asteriskd_netd_network netd_networks[ASTERISKD_MAX_INTERFACES];
+    size_t immediate_request_capacity;
+    /* Grows with the netd networks seen; overflow marks a failed allocation. */
+    struct asteriskd_netd_network *netd_networks;
     size_t netd_network_count;
+    size_t netd_network_capacity;
     struct asteriskd_netd_rule *netd_rules;
     bool netd_network_overflow;
     bool ipv6_guard_resync;
