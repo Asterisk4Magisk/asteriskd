@@ -42,6 +42,7 @@ name without it (`control_`, `config_`), and those in supervisor modules use
 ```text
 asteriskd start --config ABSOLUTE_PATH
 asteriskd monitor --config ABSOLUTE_PATH
+asteriskd boot --config ABSOLUTE_PATH
 asteriskd status
 asteriskd stop
 asteriskd shutdown
@@ -54,6 +55,11 @@ cycle while keeping the supervisor available for configured service actions;
 `shutdown` also exits the supervisor after the active service has stopped.
 `start` launches the supervisor and immediately starts a service cycle;
 `monitor` launches it idle and waits for configured service-control actions.
+`boot` is for the boot script and behaves as `start` with one exception: when
+Wi-Fi control is enabled and Wi-Fi is already connected, that connection is
+evaluated once against the connect rules, and a matching connect-stop rule keeps
+the supervisor resident and idle instead of starting a cycle. A disconnected
+boot baseline is not evaluated. `start` still ignores the Wi-Fi state at launch.
 `watch` writes an initial response and then JSON event lines until the final
 event or disconnect. CLI usage errors write only to stderr and exit 64.
 
@@ -132,9 +138,9 @@ Android builds link `libdl` and `libz`; `libbinder_ndk` is loaded dynamically so
 older Android devices retain their existing runtime support. The application
 hides this control and publishes it disabled below API 33.
 
-## Configuration v6
+## Configuration v7
 
-The configuration is strict UTF-8 JSON (`schemaVersion: 6`) with a maximum size
+The configuration is strict UTF-8 JSON (`schemaVersion: 7`) with a maximum size
 of 8 MiB. Every object is closed: unknown, duplicate, or missing keys are
 invalid, including keys whose value is nullable. Other schema versions are
 rejected. Validation completes before the logger, state, socket, child, or
@@ -152,6 +158,12 @@ Top-level sections are:
   `wlan+`;
 - nullable `helper` (`hev-socks5-tunnel` or `bpf2socks`);
 - nullable `matcher`, containing only its executable path.
+- nullable `runtimeEventReceiver`, an Android component `<package>/<class>`
+  (1-255 bytes; package `[A-Za-z0-9_.]`, class `[A-Za-z0-9_.$]`, exactly one
+  `/`). On running, paused, stopped and failed events the supervisor runs
+  `/system/bin/cmd activity broadcast -n <component>` as root without a shell
+  and without waiting; a failure only logs a warning and never changes the
+  lifecycle. A failure notifies twice: `failed`, then `stopped`.
 
 Direct CIDRs are inline immutable snapshots. The supervisor renders matcher and
 bpf2socks policy/config into sealed anonymous descriptors and passes

@@ -1009,6 +1009,35 @@ static int parse_dns_enhancement(const struct asteriskd_json_document *document,
     return 0;
 }
 
+/* `<package>/<class>`: the only argument the supervisor passes to `cmd activity broadcast -n`. */
+static bool component_name_is_valid(const char *value) {
+    size_t slash = 0U, length = 0U;
+    bool has_slash = false;
+    for (; value[length] != '\0'; ++length) {
+        char c = value[length];
+        bool word = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '_' || c == '.';
+        if (c == '/') {
+            if (has_slash) return false;
+            has_slash = true;
+            slash = length;
+        } else if (!word && !(has_slash && c == '$')) {
+            return false;
+        }
+    }
+    return has_slash && slash > 0U && slash + 1U < length && length < ASTERISKD_MAX_COMPONENT_NAME;
+}
+
+static int parse_runtime_event_receiver(const struct asteriskd_json_document *document,
+    size_t token, struct asteriskd_config *config) {
+    if (document->tokens[token].type == ASTERISKD_JSON_NULL) return 0;
+    config->has_runtime_event_receiver = true;
+    if (copy_string(document, token, config->runtime_event_receiver,
+            sizeof(config->runtime_event_receiver)) != 0 ||
+        !component_name_is_valid(config->runtime_event_receiver)) return -1;
+    return 0;
+}
+
 static int config_parse(
     const char *json,
     size_t length,
@@ -1023,11 +1052,12 @@ static int config_parse(
     static const char *const root_names[] = {
         "schemaVersion", "owner", "coreType", "coreExecutablePath", "coreConfigPath", "statePath",
         "logPath", "mode", "core", "network", "modeOptions", "matcher", "helper", "serviceControl", "dnsEnhancement",
+        "runtimeEventReceiver",
     };
     static const char *const owners[] = {"asteriskng", "asteriskbox", "asteriskmeta"};
     static const char *const cores[] = {"xray", "sing-box", "mihomo"};
     static const char *const modes[] = {"tproxy", "tun", "tun2socks", "bpf2socks", "ebpf"};
-    size_t values[15];
+    size_t values[16];
     size_t schema_token = TOKEN_NONE;
     uint32_t schema = 0U;
     int owner = 0, core = 0, mode = 0;
@@ -1035,7 +1065,7 @@ static int config_parse(
         find_field(&document, 0U, "schemaVersion", &schema_token) != 0 ||
         parse_u32(&document, schema_token, &schema) != 0 ||
         schema != ASTERISKD_CONFIG_VERSION ||
-        object_fields(&document, 0U, root_names, 15U, values) != 0 ||
+        object_fields(&document, 0U, root_names, 16U, values) != 0 ||
         copy_string(&document, values[3], config->core_executable_path, sizeof(config->core_executable_path)) != 0 || !path_is_normal(config->core_executable_path) ||
         copy_string(&document, values[4], config->core_config_path, sizeof(config->core_config_path)) != 0 || !path_is_normal(config->core_config_path) ||
         copy_string(&document, values[5], config->state_path, sizeof(config->state_path)) != 0 || !path_is_normal(config->state_path) ||
@@ -1055,6 +1085,7 @@ static int config_parse(
     if (result == 0) result = parse_helper(&document, values[12], config);
     if (result == 0) result = parse_service_control(&document, values[13], &config->service_control);
     if (result == 0) result = parse_dns_enhancement(&document, values[14], config);
+    if (result == 0) result = parse_runtime_event_receiver(&document, values[15], config);
     if (result == ASTERISKD_CONFIG_NO_MEMORY) goto no_memory;
     if (result != 0 || validate_cross_fields(config) != 0) goto invalid;
     if (!supported(config)) {

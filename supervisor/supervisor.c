@@ -764,6 +764,14 @@ static int system_effect_event(void *opaque, enum asteriskd_control_event_type t
                 details->component, ASTERISKD_LOG_EVENT_DIAGNOSTIC, message);
         }
     }
+    // CORE_EXITED and HELPER_FAILED are always followed by STOPPED, which notifies.
+    if ((type == ASTERISKD_CONTROL_EVENT_RUNNING || type == ASTERISKD_CONTROL_EVENT_PAUSED ||
+            type == ASTERISKD_CONTROL_EVENT_STOPPED || type == ASTERISKD_CONTROL_EVENT_FAILED) &&
+        asteriskd_supervisor_notify_runtime_event(&system->loaded_config.config) != 0) {
+        (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_WARNING,
+            ASTERISKD_COMPONENT_RUNTIME, ASTERISKD_LOG_EVENT_DIAGNOSTIC,
+            "runtime event receiver notify failed");
+    }
     return asteriskd_control_server_publish_event(
         system->control, type, snapshot, details,
         system_event_is_final(type), (uint64_t)now);
@@ -1643,7 +1651,7 @@ static void system_runtime_finish_control_stop(
     asteriskd_control_snapshot_destroy(&snapshot);
 }
 
-static int system_runtime_run(const char *config_path, bool initial_start,
+static int system_runtime_run(const char *config_path, bool initial_start, bool boot,
     bool *has_early_result, struct asteriskd_control_result *early_result) {
     if (has_early_result == NULL || early_result == NULL) return -1;
     *has_early_result = false;
@@ -1775,15 +1783,24 @@ static int system_runtime_run(const char *config_path, bool initial_start,
         system.wifi_monitor_opened = asteriskd_wifi_monitor_open(
             &system.wifi_monitor, error, sizeof(error)) == 0;
     }
+    bool start_now = initial_start;
     if (system.wifi_monitor_opened) {
         enum asteriskd_wifi_transition transition;
         struct asteriskd_wifi_identity identity;
         if (asteriskd_wifi_monitor_baseline(
                 &system.wifi_monitor, &transition, &identity) != 0) {
             system.wifi_monitor_opened = false;
-        } else {
+        } else if (!boot) {
             (void)asteriskd_service_control_on_wifi(
                 &system.service_control, transition, &identity);
+        } else if (asteriskd_service_control_on_boot_wifi(&system.service_control,
+                transition, &identity) == ASTERISKD_SERVICE_ACTION_STOP) {
+            // Wi-Fi is usually up before the boot script runs; stay resident as `monitor` does.
+            start_now = false;
+            system.service_running = false;
+            (void)asteriskd_log_line(&system.logger, ASTERISKD_LOG_LEVEL_INFO,
+                ASTERISKD_COMPONENT_RUNTIME, ASTERISKD_LOG_EVENT_DIAGNOSTIC,
+                "boot start skipped by Wi-Fi connect-stop rule");
         }
     }
     if (service->enabled && service->keyguard.enabled &&
@@ -1846,7 +1863,7 @@ static int system_runtime_run(const char *config_path, bool initial_start,
     asteriskd_control_server_enable_accepting(system.control, true);
     struct asteriskd_runtime_effect_backend effects = system_runtime_effects(&system);
     int status = 0;
-    bool should_start = initial_start;
+    bool should_start = start_now;
     while (!system.shutdown_requested) {
         if (should_start || system.service_start_requested) {
             if (!should_start) {
@@ -1920,12 +1937,17 @@ static int system_runtime_run(const char *config_path, bool initial_start,
 
 int asteriskd_runtime_start_system(const char *config_path,
     bool *has_early_result, struct asteriskd_control_result *early_result) {
-    return system_runtime_run(config_path, true, has_early_result, early_result);
+    return system_runtime_run(config_path, true, false, has_early_result, early_result);
 }
 
 int asteriskd_runtime_monitor_system(const char *config_path,
     bool *has_early_result, struct asteriskd_control_result *early_result) {
-    return system_runtime_run(config_path, false, has_early_result, early_result);
+    return system_runtime_run(config_path, false, false, has_early_result, early_result);
+}
+
+int asteriskd_runtime_boot_system(const char *config_path,
+    bool *has_early_result, struct asteriskd_control_result *early_result) {
+    return system_runtime_run(config_path, true, true, has_early_result, early_result);
 }
 
 #endif

@@ -201,6 +201,25 @@ enum asteriskd_service_action asteriskd_service_control_on_wifi(
         match_identity);
 }
 
+enum asteriskd_service_action asteriskd_service_control_on_boot_wifi(
+    struct asteriskd_service_control_runtime *runtime,
+    enum asteriskd_wifi_transition transition,
+    const struct asteriskd_wifi_identity *identity) {
+    // The baseline still dedups later events exactly as a manual start does. Boot has no
+    // "disconnected from a network" event, so only a connected baseline is evaluated.
+    (void)asteriskd_service_control_on_wifi(runtime, transition, identity);
+    if (runtime == NULL || transition != ASTERISKD_WIFI_TRANSITION_BASELINE_CONNECTED ||
+        runtime->config == NULL || !runtime->config->enabled ||
+        !runtime->config->wifi.enabled || !wifi_identity_valid(identity)) {
+        return ASTERISKD_SERVICE_ACTION_NONE;
+    }
+    return service_control_rules(
+        runtime,
+        &runtime->config->wifi.connect_start,
+        &runtime->config->wifi.connect_stop,
+        identity);
+}
+
 enum asteriskd_service_action asteriskd_service_control_reconcile_time(
     struct asteriskd_service_control_runtime *runtime, time_t now) {
     time_t latest_start = 0;

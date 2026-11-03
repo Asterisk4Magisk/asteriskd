@@ -105,6 +105,22 @@ static int system_run_monitor(
     return status;
 }
 
+static int system_run_boot(
+    void *context,
+    const char *config_path,
+    bool *has_early_result,
+    struct asteriskd_control_result *early_result) {
+    (void)context;
+    int session = system_prepare_session();
+    if (session != 0) return session < 0 ? -1 : 0;
+    asteriskd_log_stderr(ASTERISKD_LOG_LEVEL_INFO, ASTERISKD_COMPONENT_RUNTIME,
+        "entering supervisor runtime: mode=boot");
+    int status = asteriskd_runtime_boot_system(
+        config_path, has_early_result, early_result);
+    system_log_early_result("boot", status, *has_early_result, early_result);
+    return status;
+}
+
 static int system_write_fd(int fd, const char *bytes, size_t length) {
 #if defined(__linux__) || defined(__ANDROID__)
     size_t offset = 0U;
@@ -137,6 +153,7 @@ static const struct asteriskd_cli_backend system_cli_backend = {
     .control_client = system_control_client,
     .run_start = system_run_start,
     .run_monitor = system_run_monitor,
+    .run_boot = system_run_boot,
     .write_stdout = system_write_stdout,
     .write_stderr = system_write_stderr,
 };

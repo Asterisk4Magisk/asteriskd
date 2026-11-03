@@ -471,6 +471,8 @@ bool asteriskd_supervisor_dns_waiting_for_rules(struct asteriskd_system_supervis
 int asteriskd_supervisor_dns_verify_startup(struct asteriskd_system_supervisor *system);
 int asteriskd_supervisor_dns_tick(
     struct asteriskd_system_supervisor *system, struct asteriskd_runtime_delta *delta);
+/* Fire-and-forget `cmd activity broadcast -n` to the configured receiver; -1 only when fork fails. */
+int asteriskd_supervisor_notify_runtime_event(const struct asteriskd_config *config);
 
 #endif
 

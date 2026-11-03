@@ -16,12 +16,13 @@
 
 struct asteriskd_resource_operation;
 
-#define ASTERISKD_CONFIG_VERSION 6U
+#define ASTERISKD_CONFIG_VERSION 7U
 #define ASTERISKD_MAX_JSON_SIZE (8U * 1024U * 1024U)
 #define ASTERISKD_JSON_MAX_TOKENS 262144U
 #define ASTERISKD_JSON_MAX_DEPTH 64U
 #define ASTERISKD_MAX_PATH 512U
 #define ASTERISKD_MAX_SECRET_KEY 4096U
+#define ASTERISKD_MAX_COMPONENT_NAME 256U
 #define ASTERISKD_MAX_INTERFACES 64U
 #define ASTERISKD_MAX_INTERFACE_NAME 64U
 #define ASTERISKD_MAX_CIDRS 512U
@@ -217,6 +218,10 @@ enum asteriskd_service_action asteriskd_service_control_on_wifi(
     struct asteriskd_service_control_runtime *,
     enum asteriskd_wifi_transition,
     const struct asteriskd_wifi_identity *);
+enum asteriskd_service_action asteriskd_service_control_on_boot_wifi(
+    struct asteriskd_service_control_runtime *,
+    enum asteriskd_wifi_transition,
+    const struct asteriskd_wifi_identity *);
 enum asteriskd_service_action asteriskd_service_control_reconcile_time(
     struct asteriskd_service_control_runtime *, time_t);
 
@@ -370,6 +375,8 @@ struct asteriskd_config {
     uint32_t readiness_timeout_milliseconds;
     bool has_age_secret_key;
     char age_secret_key[ASTERISKD_MAX_SECRET_KEY];
+    bool has_runtime_event_receiver;
+    char runtime_event_receiver[ASTERISKD_MAX_COMPONENT_NAME];
 
     bool enable_ipv6;
     bool disable_system_ipv6;
@@ -1824,6 +1831,8 @@ int asteriskd_runtime_start_system(
     const char *, bool *, struct asteriskd_control_result *);
 int asteriskd_runtime_monitor_system(
     const char *, bool *, struct asteriskd_control_result *);
+int asteriskd_runtime_boot_system(
+    const char *, bool *, struct asteriskd_control_result *);
 
 enum asteriskd_control_backend_result {
     ASTERISKD_CONTROL_BACKEND_OK = 0,
@@ -1855,6 +1864,7 @@ enum asteriskd_control_listener_result asteriskd_control_listener_open(int *);
 enum asteriskd_cli_command {
     ASTERISKD_CLI_START,
     ASTERISKD_CLI_MONITOR,
+    ASTERISKD_CLI_BOOT,
     ASTERISKD_CLI_STATUS,
     ASTERISKD_CLI_STOP,
     ASTERISKD_CLI_SHUTDOWN,
@@ -1929,6 +1939,8 @@ struct asteriskd_cli_backend {
     int (*run_start)(
         void *, const char *, bool *, struct asteriskd_control_result *);
     int (*run_monitor)(
+        void *, const char *, bool *, struct asteriskd_control_result *);
+    int (*run_boot)(
         void *, const char *, bool *, struct asteriskd_control_result *);
     int (*write_stdout)(void *, const char *, size_t);
     int (*write_stderr)(void *, const char *, size_t);
