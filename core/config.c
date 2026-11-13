@@ -862,28 +862,56 @@ static int parse_hev(
     size_t object,
     struct asteriskd_config *config) {
     static const char *const names[] = {
-        "type", "executablePath", "socksHost", "socksPort", "tunnelName", "mtu", "ipv4Address",
-        "ipv6Address", "multiQueue", "tcpFastOpen", "tcpReadWriteTimeoutMilliseconds",
+        "type",
+        "executablePath",
+        "socksHost",
+        "socksPort",
+        "tunnelName",
+        "mtu",
+        "ipv4Address",
+        "ipv6Address",
+        "multiQueue",
+        "tcpFastOpen",
+        "tcpReadWriteTimeoutMilliseconds",
         "udpReadWriteTimeoutMilliseconds",
+        "flowMetadataToken",
     };
-    size_t values[12];
+    size_t values[13];
     struct asteriskd_hev_helper_config *hev = &config->helper.value.hev;
-    if (object_fields(document, object, names, 12U, values) != 0 || !token_equals(document, values[0], "hev-socks5-tunnel") ||
-        copy_string(document, values[1], hev->executable_path, sizeof(hev->executable_path)) != 0 || !path_is_normal(hev->executable_path) ||
-        copy_string(document, values[2], hev->socks_host, sizeof(hev->socks_host)) != 0 || strcmp(hev->socks_host, "127.0.0.1") != 0 ||
+    if (object_fields(document, object, names,
+            document->tokens[object].child_count == 13U ? 13U : 12U, values) != 0 ||
+        !token_equals(document, values[0], "hev-socks5-tunnel") ||
+        copy_string(document, values[1], hev->executable_path, sizeof(hev->executable_path)) != 0 ||
+        !path_is_normal(hev->executable_path) ||
+        copy_string(document, values[2], hev->socks_host, sizeof(hev->socks_host)) != 0 ||
+        strcmp(hev->socks_host, "127.0.0.1") != 0 ||
         parse_port(document, values[3], &hev->socks_port) != 0 ||
-        copy_string(document, values[4], hev->tunnel_name, sizeof(hev->tunnel_name)) != 0 || !interface_is_valid(hev->tunnel_name, false) ||
+        copy_string(document, values[4], hev->tunnel_name, sizeof(hev->tunnel_name)) != 0 ||
+        !interface_is_valid(hev->tunnel_name, false) ||
         parse_u32(document, values[5], &hev->mtu) != 0 || hev->mtu < 576U || hev->mtu > 65535U ||
-        copy_string(document, values[6], hev->ipv4_address, sizeof(hev->ipv4_address)) != 0 || strchr(hev->ipv4_address, '/') != NULL ||
+        copy_string(document, values[6], hev->ipv4_address, sizeof(hev->ipv4_address)) != 0 ||
+        strchr(hev->ipv4_address, '/') != NULL ||
         inet_pton(AF_INET, hev->ipv4_address, (unsigned char[4]){0}) != 1 ||
-        parse_bool(document, values[8], &hev->multi_queue) != 0 || parse_bool(document, values[9], &hev->tcp_fast_open) != 0 ||
-        parse_u32(document, values[10], &hev->tcp_read_write_timeout_milliseconds) != 0 || hev->tcp_read_write_timeout_milliseconds < 1000U || hev->tcp_read_write_timeout_milliseconds > 86400000U ||
-        parse_u32(document, values[11], &hev->udp_read_write_timeout_milliseconds) != 0 || hev->udp_read_write_timeout_milliseconds < 1000U || hev->udp_read_write_timeout_milliseconds > 86400000U) return -1;
+        parse_bool(document, values[8], &hev->multi_queue) != 0 ||
+        parse_bool(document, values[9], &hev->tcp_fast_open) != 0 ||
+        parse_u32(document, values[10], &hev->tcp_read_write_timeout_milliseconds) != 0 ||
+        hev->tcp_read_write_timeout_milliseconds < 1000U ||
+        hev->tcp_read_write_timeout_milliseconds > 86400000U ||
+        parse_u32(document, values[11], &hev->udp_read_write_timeout_milliseconds) != 0 ||
+        hev->udp_read_write_timeout_milliseconds < 1000U ||
+        hev->udp_read_write_timeout_milliseconds > 86400000U)
+        return -1;
     if (document->tokens[values[7]].type != ASTERISKD_JSON_NULL) {
         hev->has_ipv6_address = true;
         if (copy_string(document, values[7], hev->ipv6_address, sizeof(hev->ipv6_address)) != 0 ||
             strchr(hev->ipv6_address, '/') != NULL || inet_pton(AF_INET6, hev->ipv6_address, (unsigned char[16]){0}) != 1) return -1;
     }
+    if (document->tokens[object].child_count == 13U &&
+        (copy_string(document, values[12], hev->flow_metadata_token,
+             sizeof(hev->flow_metadata_token)) != 0 ||
+            strlen(hev->flow_metadata_token) != 32U ||
+            strspn(hev->flow_metadata_token, "0123456789abcdef") != 32U))
+        return -1;
     config->helper.type = ASTERISKD_HELPER_HEV_SOCKS5_TUNNEL;
     return 0;
 }
@@ -893,33 +921,76 @@ static int parse_bpf(
     size_t object,
     struct asteriskd_config *config) {
     static const char *const names[] = {
-        "type", "executablePath", "bridgeListenAddress", "bridgePort", "socksHost", "socksPort",
-        "workerCount", "tcpBufferSize", "maxTcpSessions", "connectTimeoutMilliseconds",
-        "tcpIdleTimeoutMilliseconds", "udpSocketBufferSize", "udpBatchSize", "maxUdpSessions",
-        "maxUdpBindings", "udpIdleTimeoutMilliseconds", "maxUdpPendingBytes", "dnsTransactionTimeoutMilliseconds",
+        "type",
+        "executablePath",
+        "bridgeListenAddress",
+        "bridgePort",
+        "socksHost",
+        "socksPort",
+        "workerCount",
+        "tcpBufferSize",
+        "maxTcpSessions",
+        "connectTimeoutMilliseconds",
+        "tcpIdleTimeoutMilliseconds",
+        "udpSocketBufferSize",
+        "udpBatchSize",
+        "maxUdpSessions",
+        "maxUdpBindings",
+        "udpIdleTimeoutMilliseconds",
+        "maxUdpPendingBytes",
+        "dnsTransactionTimeoutMilliseconds",
+        "flowMetadataToken",
     };
-    size_t values[18];
+    size_t values[19];
     struct asteriskd_bpf_helper_config *bpf = &config->helper.value.bpf;
-    if (object_fields(document, object, names, 18U, values) != 0 || !token_equals(document, values[0], "bpf2socks") ||
-        copy_string(document, values[1], bpf->executable_path, sizeof(bpf->executable_path)) != 0 || !path_is_normal(bpf->executable_path) ||
-        copy_string(document, values[2], bpf->bridge_listen_address, sizeof(bpf->bridge_listen_address)) != 0 || strcmp(bpf->bridge_listen_address, "0.0.0.0") != 0 ||
-        parse_port(document, values[3], &bpf->bridge_port) != 0 || copy_string(document, values[4], bpf->socks_host, sizeof(bpf->socks_host)) != 0 || strcmp(bpf->socks_host, "127.0.0.1") != 0 ||
-        parse_port(document, values[5], &bpf->socks_port) != 0 || bpf->bridge_port == bpf->socks_port ||
+    if (object_fields(document, object, names,
+            document->tokens[object].child_count == 19U ? 19U : 18U, values) != 0 ||
+        !token_equals(document, values[0], "bpf2socks") ||
+        copy_string(document, values[1], bpf->executable_path, sizeof(bpf->executable_path)) != 0 ||
+        !path_is_normal(bpf->executable_path) ||
+        copy_string(document, values[2], bpf->bridge_listen_address,
+            sizeof(bpf->bridge_listen_address)) != 0 ||
+        strcmp(bpf->bridge_listen_address, "0.0.0.0") != 0 ||
+        parse_port(document, values[3], &bpf->bridge_port) != 0 ||
+        copy_string(document, values[4], bpf->socks_host, sizeof(bpf->socks_host)) != 0 ||
+        strcmp(bpf->socks_host, "127.0.0.1") != 0 ||
+        parse_port(document, values[5], &bpf->socks_port) != 0 ||
+        bpf->bridge_port == bpf->socks_port ||
         parse_u32(document, values[6], &bpf->worker_count) != 0 || bpf->worker_count > 256U ||
         parse_u32(document, values[7], &bpf->tcp_buffer_size) != 0 ||
-        (bpf->tcp_buffer_size != 0U && (bpf->tcp_buffer_size < 4096U || bpf->tcp_buffer_size > 16777216U)) ||
-        parse_u32(document, values[8], &bpf->max_tcp_sessions) != 0 || bpf->max_tcp_sessions < 1U || bpf->max_tcp_sessions > 1048576U ||
-        parse_u32(document, values[9], &bpf->connect_timeout_milliseconds) != 0 || bpf->connect_timeout_milliseconds < 100U || bpf->connect_timeout_milliseconds > 60000U ||
+        (bpf->tcp_buffer_size != 0U &&
+            (bpf->tcp_buffer_size < 4096U || bpf->tcp_buffer_size > 16777216U)) ||
+        parse_u32(document, values[8], &bpf->max_tcp_sessions) != 0 || bpf->max_tcp_sessions < 1U ||
+        bpf->max_tcp_sessions > 1048576U ||
+        parse_u32(document, values[9], &bpf->connect_timeout_milliseconds) != 0 ||
+        bpf->connect_timeout_milliseconds < 100U || bpf->connect_timeout_milliseconds > 60000U ||
         parse_u32(document, values[10], &bpf->tcp_idle_timeout_milliseconds) != 0 ||
         (bpf->tcp_idle_timeout_milliseconds != 0U &&
-            (bpf->tcp_idle_timeout_milliseconds < 1000U || bpf->tcp_idle_timeout_milliseconds > 86400000U)) ||
-        parse_u32(document, values[11], &bpf->udp_socket_buffer_size) != 0 || bpf->udp_socket_buffer_size < 4096U || bpf->udp_socket_buffer_size > 16777216U ||
-        parse_u32(document, values[12], &bpf->udp_batch_size) != 0 || bpf->udp_batch_size < 1U || bpf->udp_batch_size > 1024U ||
-        parse_u32(document, values[13], &bpf->max_udp_sessions) != 0 || bpf->max_udp_sessions < 1U || bpf->max_udp_sessions > 1048576U ||
-        parse_u32(document, values[14], &bpf->max_udp_bindings) != 0 || bpf->max_udp_bindings < 1U || bpf->max_udp_bindings > 4194304U ||
-        parse_u32(document, values[15], &bpf->udp_idle_timeout_milliseconds) != 0 || bpf->udp_idle_timeout_milliseconds < 1000U || bpf->udp_idle_timeout_milliseconds > 86400000U ||
-        parse_u32(document, values[16], &bpf->max_udp_pending_bytes) != 0 || bpf->max_udp_pending_bytes < 65536U || bpf->max_udp_pending_bytes > 1073741824U ||
-        parse_u32(document, values[17], &bpf->dns_transaction_timeout_milliseconds) != 0 || bpf->dns_transaction_timeout_milliseconds < 100U || bpf->dns_transaction_timeout_milliseconds > 60000U) return -1;
+            (bpf->tcp_idle_timeout_milliseconds < 1000U ||
+                bpf->tcp_idle_timeout_milliseconds > 86400000U)) ||
+        parse_u32(document, values[11], &bpf->udp_socket_buffer_size) != 0 ||
+        bpf->udp_socket_buffer_size < 4096U || bpf->udp_socket_buffer_size > 16777216U ||
+        parse_u32(document, values[12], &bpf->udp_batch_size) != 0 || bpf->udp_batch_size < 1U ||
+        bpf->udp_batch_size > 1024U ||
+        parse_u32(document, values[13], &bpf->max_udp_sessions) != 0 ||
+        bpf->max_udp_sessions < 1U || bpf->max_udp_sessions > 1048576U ||
+        parse_u32(document, values[14], &bpf->max_udp_bindings) != 0 ||
+        bpf->max_udp_bindings < 1U || bpf->max_udp_bindings > 4194304U ||
+        parse_u32(document, values[15], &bpf->udp_idle_timeout_milliseconds) != 0 ||
+        bpf->udp_idle_timeout_milliseconds < 1000U ||
+        bpf->udp_idle_timeout_milliseconds > 86400000U ||
+        parse_u32(document, values[16], &bpf->max_udp_pending_bytes) != 0 ||
+        bpf->max_udp_pending_bytes < 65536U || bpf->max_udp_pending_bytes > 1073741824U ||
+        parse_u32(document, values[17], &bpf->dns_transaction_timeout_milliseconds) != 0 ||
+        bpf->dns_transaction_timeout_milliseconds < 100U ||
+        bpf->dns_transaction_timeout_milliseconds > 60000U)
+        return -1;
+    if (document->tokens[object].child_count == 19U &&
+        (copy_string(document, values[18], bpf->flow_metadata_token,
+             sizeof(bpf->flow_metadata_token)) != 0 ||
+            strlen(bpf->flow_metadata_token) != 32U ||
+            strspn(bpf->flow_metadata_token, "0123456789abcdef") != 32U))
+        return -1;
     config->helper.type = ASTERISKD_HELPER_BPF2SOCKS;
     return 0;
 }

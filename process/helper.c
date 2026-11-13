@@ -21,6 +21,10 @@ static int render_hev(const struct asteriskd_config *config, struct asteriskd_an
     }
     asteriskd_text_writer_format(&writer, "\nsocks5:\n  port: %u\n  address: ", (unsigned)hev->socks_port);
     asteriskd_text_writer_yaml_string(&writer, hev->socks_host);
+    if (hev->flow_metadata_token[0]) {
+        asteriskd_text_writer_literal(&writer, "\n  username: '__asterisk_flow_v1'\n  password: ");
+        asteriskd_text_writer_yaml_string(&writer, hev->flow_metadata_token);
+    }
     asteriskd_text_writer_format(&writer,
         "\n  udp: 'udp'\n  tcp-fastopen: %s\nmisc:\n"
         "  tcp-read-write-timeout: %u\n  udp-read-write-timeout: %u\n"
@@ -142,6 +146,10 @@ static int render_bpf(const struct asteriskd_config *config, int direct_ipv4_fd,
         bpf->dns_transaction_timeout_milliseconds);
     asteriskd_text_writer_literal(&writer, ",\"socksHost\":");
     asteriskd_text_writer_json_string(&writer, bpf->socks_host);
+    if (bpf->flow_metadata_token[0]) {
+        asteriskd_text_writer_literal(&writer, ",\"flowMetadataToken\":");
+        asteriskd_text_writer_json_string(&writer, bpf->flow_metadata_token);
+    }
     asteriskd_text_writer_format(&writer, ",\"socksPort\":%u,\"enableIpv6\":%s,\"enableDnsHijack\":%s",
         (unsigned)bpf->socks_port, config->enable_ipv6 ? "true" : "false", config->enable_local_dns ? "true" : "false");
     asteriskd_text_writer_literal(&writer, ",\"hotspotInterfaces\":");

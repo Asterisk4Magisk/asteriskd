@@ -315,6 +315,7 @@ struct asteriskd_hev_helper_config {
     char executable_path[ASTERISKD_MAX_PATH];
     char socks_host[ASTERISKD_MAX_HOST];
     uint16_t socks_port;
+    char flow_metadata_token[33];
     char tunnel_name[ASTERISKD_MAX_TUNNEL_NAME];
     uint32_t mtu;
     char ipv4_address[ASTERISKD_MAX_CIDR];
@@ -332,6 +333,7 @@ struct asteriskd_bpf_helper_config {
     uint16_t bridge_port;
     char socks_host[ASTERISKD_MAX_HOST];
     uint16_t socks_port;
+    char flow_metadata_token[33];
     uint32_t worker_count;
     uint32_t tcp_buffer_size;
     uint32_t max_tcp_sessions;
