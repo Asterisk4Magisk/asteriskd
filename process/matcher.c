@@ -144,7 +144,7 @@ static int matcher_process_spec(
         asteriskd_process_inherit_fd(spec, policy_fd, 3) != 0) goto invalid;
     spec->uid = 0U;
     spec->gid = 0U;
-    spec->output_mode = ASTERISKD_PROCESS_OUTPUT_DISCARD;
+    spec->output_mode = ASTERISKD_PROCESS_OUTPUT_CAPTURE;
     spec->unlimited_locked_memory = true;
     if (config->direct_cidrs != NULL &&
         (asteriskd_process_inherit_fd(spec, direct_ipv4_fd, 4) != 0 ||
