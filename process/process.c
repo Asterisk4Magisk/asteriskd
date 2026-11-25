@@ -36,10 +36,17 @@ static bool process_env_key_equals(const char *entry, size_t key_length, const c
 
 static bool process_env_blocked(const char *entry, size_t key_length) {
     static const char *const blocked[] = {
-        "XRAY_LOCATION_ASSET", "SING_BOX_LOCATION_ASSET", "MIHOMO_LOCATION_ASSET",
-        "CLASH_AGE_SECRET_KEY", "BPF2SOCKS_DEBUG_STATS",
-        "LD_PRELOAD", "LD_LIBRARY_PATH",
-        "ANDROID_XRAY_LIBRARY", "ANDROID_MIHOMO_LIBRARY", "ANDROID_BOX_LIBRARY",
+        "XRAY_LOCATION_ASSET",
+        "SING_BOX_LOCATION_ASSET",
+        "MIHOMO_LOCATION_ASSET",
+        "CLASH_AGE_SECRET_KEY",
+        "BPF2SOCKS_DEBUG_STATS",
+        "ASTERISK_DNS_OBSERVATION_FDS",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "ANDROID_XRAY_LIBRARY",
+        "ANDROID_MIHOMO_LIBRARY",
+        "ANDROID_BOX_LIBRARY",
     };
     for (size_t index = 0U; index < sizeof(blocked) / sizeof(blocked[0]); ++index) {
         if (process_env_key_equals(entry, key_length, blocked[index])) return true;

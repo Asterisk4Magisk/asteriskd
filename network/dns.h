@@ -25,6 +25,7 @@ enum asteriskd_dns_opcode {
     ASTERISKD_DNS_OP_INFO = 10,
     ASTERISKD_DNS_OP_INFO_RESPONSE = 11,
     ASTERISKD_DNS_OP_NETWORK_CHANGED = 12,
+    ASTERISKD_DNS_OP_UID_OBSERVATION = 14,
 };
 enum asteriskd_dns_result {
     ASTERISKD_DNS_RESULT_OK = 0,
@@ -97,4 +98,5 @@ int asteriskd_dns_step(struct asteriskd_dns_client *, uint64_t);
 void asteriskd_dns_fail(struct asteriskd_dns_client *, const char *);
 uint64_t asteriskd_dns_monotime(void);
 int asteriskd_dns_info(void);
+bool asteriskd_dns_uid_observation(int descriptors[2]);
 #endif
