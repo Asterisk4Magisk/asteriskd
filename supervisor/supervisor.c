@@ -846,34 +846,8 @@ static int system_effect_start_core(
             ASTERISKD_CORE_START_FAILURE_READINESS_PREFLIGHT,
             "readiness preflight failed");
     }
-    int uid_observation[2] = {-1, -1};
-    const struct asteriskd_config *config = &system->loaded_config.config;
-    struct asteriskd_process_spec *core_spec = &system->core_spec;
-    const size_t inherited_count = core_spec->inherited_fd_count;
-    const size_t environment_count = core_spec->environment_count;
-    if (config->dns_enhancement && config->core_type != ASTERISKD_CORE_XRAY) {
-        if (!asteriskd_dns_uid_observation(uid_observation) ||
-            asteriskd_process_inherit_fd(core_spec, uid_observation[0], 3) != 0 ||
-            asteriskd_process_inherit_fd(core_spec, uid_observation[1], 4) != 0 ||
-            asteriskd_process_environment_add(core_spec, "ASTERISK_DNS_OBSERVATION_FDS", "3:4") !=
-                0) {
-            core_spec->inherited_fd_count = inherited_count;
-            (void)asteriskd_log_line(&system->logger, ASTERISKD_LOG_LEVEL_WARNING,
-                ASTERISKD_COMPONENT_NETWORK, ASTERISKD_LOG_EVENT_DIAGNOSTIC,
-                "DNS observation unavailable: could not prepare shared descriptors");
-        }
-    }
-    int spawned =
-        asteriskd_process_spawn_system(core_spec, &system->core_process, error, sizeof(error));
-    core_spec->inherited_fd_count = inherited_count;
-    if (core_spec->environment_count > environment_count) {
-        free(core_spec->environment[environment_count]);
-        core_spec->environment[environment_count] = NULL;
-        core_spec->environment_count = environment_count;
-    }
-    if (uid_observation[0] >= 0) close(uid_observation[0]);
-    if (uid_observation[1] >= 0) close(uid_observation[1]);
-    if (spawned != 0) {
+    if (asteriskd_process_spawn_system(
+            &system->core_spec, &system->core_process, error, sizeof(error)) != 0) {
         return system_core_start_failed(system, ASTERISKD_CORE_START_FAILURE_SPAWN,
             error[0] == '\0' ? "process spawn failed" : error);
     }

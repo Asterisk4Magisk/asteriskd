@@ -11,9 +11,6 @@
 #include <string.h>
 #if defined(__linux__) || defined(__ANDROID__)
 #include <sys/socket.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
 #include <poll.h>
 #include <sys/un.h>
 #include <time.h>
@@ -450,7 +447,7 @@ io_error: {
 #endif
 }
 
-/* One-shot broker I/O for INFO and observation descriptor handoff. */
+/* One-shot read-only broker probe for INFO. */
 #if defined(__linux__) || defined(__ANDROID__)
 static bool dns_probe_ready(int fd, short events, uint64_t deadline) {
     for (;;) {
@@ -496,77 +493,7 @@ static int dns_probe_connect(uint64_t deadline) {
     return -1;
 }
 
-static int dns_observation_fd(int fd, int access, uint64_t deadline) {
-    unsigned char present = 0;
-    struct iovec payload = {.iov_base = &present, .iov_len = sizeof(present)};
-    union {
-        struct cmsghdr alignment;
-        unsigned char data[CMSG_SPACE(sizeof(int))];
-    } control = {0};
-    struct msghdr message = {
-        .msg_iov = &payload,
-        .msg_iovlen = 1,
-        .msg_control = control.data,
-        .msg_controllen = CMSG_LEN(sizeof(int)),
-    };
-    ssize_t count;
-    for (;;) {
-        if (!dns_probe_ready(fd, POLLIN, deadline)) return -1;
-        message.msg_controllen = CMSG_LEN(sizeof(int));
-        count = recvmsg(fd, &message, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
-        if (count >= 0) break;
-        if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) return -1;
-    }
-    const struct cmsghdr *rights = CMSG_FIRSTHDR(&message);
-    if (rights == NULL || rights->cmsg_level != SOL_SOCKET || rights->cmsg_type != SCM_RIGHTS ||
-        rights->cmsg_len != CMSG_LEN(sizeof(int)))
-        return -1;
-    int descriptor;
-    memcpy(&descriptor, CMSG_DATA(rights), sizeof(descriptor));
-    const int flags = fcntl(descriptor, F_GETFL);
-    if (count != 1 || present != 1 || (message.msg_flags & MSG_CTRUNC) || flags < 0 ||
-        (flags & O_ACCMODE) != access) {
-        close(descriptor);
-        return -1;
-    }
-    return descriptor;
-}
 #endif
-
-bool asteriskd_dns_uid_observation(int descriptors[2]) {
-    descriptors[0] = descriptors[1] = -1;
-#if defined(__linux__) || defined(__ANDROID__)
-    const uint64_t deadline = asteriskd_dns_monotime() + 150U;
-    const int fd = dns_probe_connect(deadline);
-    if (fd < 0) return false;
-    unsigned char frame[ASTERISKD_DNS_HEADER_SIZE] = {0};
-    dns_write_le(frame, ASTERISKD_DNS_FRAME_MAGIC, 4);
-    dns_write_le(frame + 4, ASTERISKD_DNS_FRAME_VERSION, 2);
-    dns_write_le(frame + 6, ASTERISKD_DNS_OP_UID_OBSERVATION, 2);
-    dns_write_le(frame + 12, 1, 4);
-    if (!dns_probe_transfer(fd, frame, sizeof(frame), true, deadline)) {
-        descriptors[0] = dns_observation_fd(fd, O_RDONLY, deadline);
-        if (descriptors[0] >= 0) descriptors[1] = dns_observation_fd(fd, O_RDWR, deadline);
-    }
-    close(fd);
-    if (descriptors[1] >= 0) {
-        struct stat info;
-        if (fstat(descriptors[1], &info) == 0 && info.st_size == sizeof(uint32_t)) {
-            void *demand =
-                mmap(NULL, sizeof(uint32_t), PROT_READ | PROT_WRITE, MAP_SHARED, descriptors[1], 0);
-            if (demand != MAP_FAILED) {
-                __atomic_store_n((uint32_t *)demand, 0, __ATOMIC_RELAXED);
-                munmap(demand, sizeof(uint32_t));
-                return true;
-            }
-        }
-        close(descriptors[1]);
-    }
-    if (descriptors[0] >= 0) close(descriptors[0]);
-    descriptors[0] = descriptors[1] = -1;
-#endif
-    return false;
-}
 
 int asteriskd_dns_info(void) {
 #if defined(__linux__) || defined(__ANDROID__)
